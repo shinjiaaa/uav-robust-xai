@@ -20,16 +20,19 @@ def load_metrics(config):
     # Dataset-wide metrics
     metrics_csv = results_root / "metrics_dataset.csv"
     if metrics_csv.exists():
-        metrics['dataset'] = pd.read_csv(metrics_csv).to_dict('records')
+        df = pd.read_csv(metrics_csv)
+        # Fill NaN with 0.0 (empty predictions -> 0 metrics, not missing)
+        df = df.fillna(0.0)
+        metrics['dataset'] = df.to_dict('records')
     else:
         metrics['dataset'] = []
     
-    # Time-series records
+    # Detection records
     timeseries_csv = results_root / "tiny_records_timeseries.csv"
     if timeseries_csv.exists():
-        metrics['timeseries'] = pd.read_csv(timeseries_csv).to_dict('records')
+        metrics['detection_records'] = pd.read_csv(timeseries_csv).to_dict('records')
     else:
-        metrics['timeseries'] = []
+        metrics['detection_records'] = []
     
     # Tiny object curves
     tiny_curves_csv = results_root / "tiny_curves.csv"
@@ -88,7 +91,7 @@ def main():
     try:
         metrics = load_metrics(config)
         print(f"  Dataset metrics: {len(metrics['dataset'])} records")
-        print(f"  Time-series records: {len(metrics['timeseries'])} records")
+        print(f"  Detection records: {len(metrics['detection_records'])} records")
         print(f"  Tiny curves: {len(metrics['tiny_curves'])} records")
         print(f"  Failure events: {len(metrics['failure_events'])} events")
         print(f"  Risk regions: {len(metrics['risk_regions'])} regions")

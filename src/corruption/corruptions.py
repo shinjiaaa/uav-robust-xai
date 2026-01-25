@@ -16,7 +16,7 @@ def apply_fog(image: np.ndarray, severity: int, seed: int = 42) -> np.ndarray:
     
     Args:
         image: Input image (H, W, C) in [0, 255] range
-        severity: Severity level 0-4
+        severity: Severity level 0-4 (or extreme values like 50)
         seed: Random seed for reproducibility
         
     Returns:
@@ -27,7 +27,13 @@ def apply_fog(image: np.ndarray, severity: int, seed: int = 42) -> np.ndarray:
     
     # Fog parameters
     alpha_values = [0.0, 0.15, 0.30, 0.45, 0.60]
-    alpha = alpha_values[severity]
+    
+    # Handle extreme severity (e.g., 50)
+    if severity >= len(alpha_values):
+        # Extreme severity: use maximum alpha (0.95)
+        alpha = 0.95
+    else:
+        alpha = alpha_values[severity]
     
     # Create fog veil (white overlay)
     fog_veil = np.ones_like(image, dtype=np.float32) * 255.0
@@ -50,7 +56,7 @@ def apply_lowlight(image: np.ndarray, severity: int, seed: int = 42) -> np.ndarr
     
     Args:
         image: Input image (H, W, C) in [0, 255] range
-        severity: Severity level 0-4
+        severity: Severity level 0-4 (or extreme values like 50)
         seed: Random seed for reproducibility
         
     Returns:
@@ -63,8 +69,14 @@ def apply_lowlight(image: np.ndarray, severity: int, seed: int = 42) -> np.ndarr
     gamma_values = [1.0, 1.4, 1.8, 2.2, 2.6]
     brightness_scale_values = [1.0, 0.85, 0.70, 0.55, 0.40]
     
-    gamma = gamma_values[severity]
-    brightness_scale = brightness_scale_values[severity]
+    # Handle extreme severity (e.g., 50)
+    if severity >= len(gamma_values):
+        # Extreme severity: gamma = 5.0, brightness_scale = 0.1
+        gamma = 5.0
+        brightness_scale = 0.1
+    else:
+        gamma = gamma_values[severity]
+        brightness_scale = brightness_scale_values[severity]
     
     # Normalize to [0, 1]
     image_norm = image.astype(np.float32) / 255.0
@@ -89,7 +101,7 @@ def apply_motion_blur(image: np.ndarray, severity: int, seed: int = 42, image_id
     
     Args:
         image: Input image (H, W, C) in [0, 255] range
-        severity: Severity level 0-4
+        severity: Severity level 0-4 (or extreme values like 50)
         seed: Random seed for reproducibility
         image_id: Image identifier for deterministic angle selection
         
@@ -101,7 +113,13 @@ def apply_motion_blur(image: np.ndarray, severity: int, seed: int = 42, image_id
     
     # Motion blur parameters
     kernel_lengths = [0, 7, 13, 19, 25]
-    kernel_length = kernel_lengths[severity]
+    
+    # Handle extreme severity (e.g., 50)
+    if severity >= len(kernel_lengths):
+        # Extreme severity: kernel_length = 100
+        kernel_length = 100
+    else:
+        kernel_length = kernel_lengths[severity]
     
     if kernel_length == 0:
         return image.copy()

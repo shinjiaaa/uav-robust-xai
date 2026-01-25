@@ -99,7 +99,8 @@ def find_tiny_object_clips(
     annotations_dir: Path,
     tiny_config: Dict,
     sample_size: int = 500,
-    seed: int = 42
+    seed: int = 42,
+    one_per_image: bool = False
 ) -> Tuple[List[Dict], List[Dict]]:
     """Find clips containing tiny objects.
     
@@ -109,6 +110,7 @@ def find_tiny_object_clips(
         tiny_config: Tiny object configuration (area_threshold, width_threshold, height_threshold)
         sample_size: Number of tiny objects to sample
         seed: Random seed
+        one_per_image: If True, sample only one tiny bbox per image (avoid duplicate images)
         
     Returns:
         List of clips with tiny object information
@@ -121,6 +123,7 @@ def find_tiny_object_clips(
     
     tiny_clips = []
     tiny_objects_found = []
+    image_tiny_objects = {}  # Track tiny objects per image
     
     for clip in clips:
         clip_tiny_objects = []
@@ -139,6 +142,9 @@ def find_tiny_object_clips(
                 img_width, img_height = img.size
             except:
                 continue
+            
+            # Track tiny objects for this image
+            image_tiny_list = []
             
             # Load annotations
             with open(ann_file, 'r') as f:
@@ -163,19 +169,22 @@ def find_tiny_object_clips(
                         
                         area = bbox_width * bbox_height
                         
-                        # Check if tiny object
-                        is_tiny = (
-                            area <= tiny_config['area_threshold'] and
-                            bbox_width <= tiny_config['width_threshold'] and
-                            bbox_height <= tiny_config['height_threshold']
-                        )
+                        # Check if tiny object (detectable small object)
+                        # Must be: area >= area_threshold AND (width >= width_threshold OR height >= height_threshold)
+                        area_ok = area >= tiny_config['area_threshold']
+                        size_ok = bbox_width >= tiny_config['width_threshold'] or bbox_height >= tiny_config['height_threshold']
+                        max_area = tiny_config.get('max_area_threshold', 20000)
+                        area_not_too_large = area <= max_area
+                        is_tiny = area_ok and size_ok and area_not_too_large
                         
                         if is_tiny:
                             # frame_path is Path object from clip['frames']
                             frame_idx = clip['frames'].index(frame_path) if frame_path in clip['frames'] else 0
                             # Store as string (will be converted to relative path in script)
                             frame_path_str = str(frame_path)
-                            clip_tiny_objects.append({
+                            
+                            tiny_obj = {
+                                'clip_id': clip['clip_id'],
                                 'frame_path': frame_path_str,
                                 'frame_idx': frame_idx,
                                 'bbox': (bbox_left, bbox_top, bbox_width, bbox_height),
@@ -183,17 +192,33 @@ def find_tiny_object_clips(
                                 'area': area,
                                 'img_width': img_width,
                                 'img_height': img_height
-                            })
-                            tiny_objects_found.append({
-                                'clip_id': clip['clip_id'],
-                                'frame_path': frame_path_str,
-                                'bbox': (bbox_left, bbox_top, bbox_width, bbox_height),
-                                'class_id': object_category,
-                                'img_width': img_width,
-                                'img_height': img_height
-                            })
+                            }
+                            
+                            clip_tiny_objects.append(tiny_obj)
+                            image_tiny_list.append(tiny_obj)
                     except (ValueError, IndexError):
                         continue
+            
+            # If one_per_image, select only one tiny object per image
+            if one_per_image and len(image_tiny_list) > 0:
+                # Use image path as key (normalize to handle Path vs string)
+                image_key = str(frame_path)
+                if image_key not in image_tiny_objects:
+                    # Randomly select one tiny object from this image
+                    selected = random.choice(image_tiny_list)
+                    image_tiny_objects[image_key] = selected
+                    tiny_objects_found.append(selected)
+            else:
+                # Add all tiny objects from this image
+                for tiny_obj in image_tiny_list:
+                    tiny_objects_found.append({
+                        'clip_id': tiny_obj['clip_id'],
+                        'frame_path': tiny_obj['frame_path'],
+                        'bbox': tiny_obj['bbox'],
+                        'class_id': tiny_obj['class_id'],
+                        'img_width': tiny_obj['img_width'],
+                        'img_height': tiny_obj['img_height']
+                    })
         
         if clip_tiny_objects:
             clip['tiny_objects'] = clip_tiny_objects

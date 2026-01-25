@@ -13,7 +13,7 @@ def detect_failure_events(
     """Detect failure events (first miss, score/IoU drop) for each tiny object.
     
     Args:
-        records_df: DataFrame with columns: model, corruption, severity, frame_idx, 
+        records_df: DataFrame with columns: model, corruption, severity, 
                    image_id, class_id, score, iou, miss
         config: Configuration dictionary
         
@@ -28,8 +28,8 @@ def detect_failure_events(
     groups = records_df.groupby(['model', 'corruption', 'image_id', 'class_id'])
     
     for (model, corruption, image_id, class_id), group in groups:
-        # Sort by severity and frame_idx
-        group = group.sort_values(['severity', 'frame_idx'])
+        # Sort by severity
+        group = group.sort_values(['severity'])
         
         # Baseline (severity 0)
         baseline = group[group['severity'] == 0]
@@ -63,7 +63,7 @@ def detect_failure_events(
                 missed = severity_group[severity_group['miss'] == 1]
                 if len(missed) > 0:
                     first_miss_severity = severity
-                    first_miss_frame = missed.iloc[0]['frame_idx']
+                    first_miss_frame = 0  # Single image, no frame index
             
             # Check for score drop
             if score_drop_severity is None:
@@ -72,7 +72,7 @@ def detect_failure_events(
                     avg_score = matched['score'].mean()
                     if baseline_score - avg_score >= risk_config['score_drop_threshold']:
                         score_drop_severity = severity
-                        score_drop_frame = matched.iloc[0]['frame_idx']
+                        score_drop_frame = 0  # Single image, no frame index
             
             # Check for IoU drop
             if iou_drop_severity is None:
@@ -81,7 +81,7 @@ def detect_failure_events(
                     avg_iou = matched['iou'].mean()
                     if baseline_iou - avg_iou >= risk_config['iou_drop_threshold']:
                         iou_drop_severity = severity
-                        iou_drop_frame = matched.iloc[0]['frame_idx']
+                        iou_drop_frame = 0  # Single image, no frame index
         
         # Determine failure event (earliest)
         failure_severity = None
@@ -197,10 +197,14 @@ def identify_risk_regions(
                         break
             
             # Count failure events
-            model_corr_failures = failure_events_df[
-                (failure_events_df['model'] == model) &
-                (failure_events_df['corruption'] == corruption)
-            ]
+            if len(failure_events_df) > 0 and 'model' in failure_events_df.columns:
+                model_corr_failures = failure_events_df[
+                    (failure_events_df['model'] == model) &
+                    (failure_events_df['corruption'] == corruption)
+                ]
+                failure_count = len(model_corr_failures)
+            else:
+                failure_count = 0
             
             risk_regions.append({
                 'model': model,
@@ -208,7 +212,7 @@ def identify_risk_regions(
                 'risk_severity_map': risk_severity_map,
                 'risk_severity_miss': risk_severity_miss,
                 'risk_severity': min([s for s in [risk_severity_map, risk_severity_miss] if s is not None], default=None),
-                'failure_count': len(model_corr_failures),
+                'failure_count': failure_count,
                 'baseline_map50': baseline_map
             })
     
@@ -222,9 +226,11 @@ def detect_instability(
 ) -> pd.DataFrame:
     """Detect instability regions (high variance in score/IoU).
     
+    Note: For single images, instability is detected across severity levels, not frames.
+    
     Args:
         records_df: DataFrame with detection records
-        window_size: Window size for variance calculation
+        window_size: Window size for variance calculation (across severities)
         threshold: Variance threshold
         
     Returns:
@@ -232,24 +238,25 @@ def detect_instability(
     """
     instability_regions = []
     
-    # Group by model, corruption, severity, image_id, class_id
-    groups = records_df.groupby(['model', 'corruption', 'severity', 'image_id', 'class_id'])
+    # Group by model, corruption, image_id, class_id
+    groups = records_df.groupby(['model', 'corruption', 'image_id', 'class_id'])
     
-    for (model, corruption, severity, image_id, class_id), group in groups:
-        group = group.sort_values('frame_idx')
+    for (model, corruption, image_id, class_id), group in groups:
+        group = group.sort_values('severity')
         
         if len(group) < window_size:
             continue
         
-        # Calculate rolling variance
+        # Calculate rolling variance across severities
         matched = group[group['miss'] == 0]
         if len(matched) < window_size:
             continue
         
         scores = matched['score'].values
         ious = matched['iou'].values
+        severities = matched['severity'].values
         
-        # Rolling variance
+        # Rolling variance across severities
         for i in range(len(scores) - window_size + 1):
             score_window = scores[i:i+window_size]
             iou_window = ious[i:i+window_size]
@@ -261,11 +268,10 @@ def detect_instability(
                 instability_regions.append({
                     'model': model,
                     'corruption': corruption,
-                    'severity': severity,
                     'image_id': image_id,
                     'class_id': class_id,
-                    'start_frame': matched.iloc[i]['frame_idx'],
-                    'end_frame': matched.iloc[i+window_size-1]['frame_idx'],
+                    'start_severity': int(severities[i]),
+                    'end_severity': int(severities[i+window_size-1]),
                     'score_variance': score_var,
                     'iou_variance': iou_var
                 })

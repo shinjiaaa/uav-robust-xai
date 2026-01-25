@@ -17,29 +17,45 @@ visdrone:
   val_url: "http://aiskyeye.com/download/object-detection-2/VisDrone2019-DET-val.zip"
   test_url: "http://aiskyeye.com/download/object-detection-2/VisDrone2019-DET-test-dev.zip"
   
+# Experiment mode
+experiment:
+  pilot_mode: false  # Full experiment mode: use standard severities [0,1,2,3,4]
+  sample_size: 100  # Number of tiny objects to sample
+  one_per_image: true  # Sample only one tiny bbox per image (avoid duplicate images)
+  
 # Tiny object definition
-# Based on statistical analysis: 10th percentile of bbox areas in VisDrone dataset
-# See tiny_object_recommendation.md for detailed analysis and rationale
+# Based on empirical testing: YOLO can detect 2500+ px² objects with >50% rate
+# Tested with same_class=False (class mismatch is common with COCO pretrained model)
 tiny_objects:
-  area_threshold: 60  # pixels^2 (10th percentile, covers 10.26% of bboxes)
-  width_threshold: 6  # pixels (10th percentile)
-  height_threshold: 9  # pixels (10th percentile)
-  sample_size: 500  # number of GT boxes to sample
+  area_threshold: 2500  # pixels^2 (minimum area - 50x50 pixels, 63.8% detection rate)
+  width_threshold: 50  # pixels (minimum width OR height must be >= this)
+  height_threshold: 50  # pixels (minimum height OR width must be >= this)
+  max_area_threshold: 20000  # pixels^2 (maximum area to keep them "small")
+  sample_size: 100  # number of GT boxes to sample
   
 # Corruptions
 corruptions:
   types: ["fog", "lowlight", "motion_blur"]
-  severities: [0, 1, 2, 3, 4]
+  # Full experiment: use standard severities [0, 1, 2, 3, 4]
+  severities: [0, 1, 2, 3, 4]  # Standard severity levels
+  # Dynamic refinement: if failure detected between severities, subdivide into 10 steps
+  dynamic_refinement:
+    enabled: true
+    subdivision_steps: 10  # Number of steps to subdivide failure region
+    failure_threshold: 0.5  # Miss rate threshold to trigger refinement
+  
+  # Standard severity parameters (severity 0-4)
   fog:
-    alpha: [0.0, 0.15, 0.30, 0.45, 0.60]  # fog strength
+    alpha: [0.0, 0.15, 0.30, 0.45, 0.60]  # fog strength for severities [0, 1, 2, 3, 4]
   lowlight:
-    gamma: [1.0, 1.4, 1.8, 2.2, 2.6]
-    brightness_scale: [1.0, 0.85, 0.70, 0.55, 0.40]
+    gamma: [1.0, 1.4, 1.8, 2.2, 2.6]  # gamma correction for severities [0, 1, 2, 3, 4]
+    brightness_scale: [1.0, 0.85, 0.70, 0.55, 0.40]  # brightness scaling for severities [0, 1, 2, 3, 4]
   motion_blur:
-    kernel_length: [0, 7, 13, 19, 25]
+    kernel_length: [0, 7, 13, 19, 25]  # kernel length for severities [0, 1, 2, 3, 4]
     angle: 0  # degrees, or use hash-based per image
     
 # Models
+# Full experiment: can enable all models
 models:
   yolo_generic:
     type: "yolo"
@@ -47,61 +63,63 @@ models:
     pretrained: "yolov8s.pt"
     fine_tuned: false
     checkpoint: null
-    
-  yolo_ft:
-    type: "yolo"
-    architecture: "yolov8s"
-    pretrained: "yolov8s.pt"
-    fine_tuned: true
-    checkpoint: "results/models/yolo_ft_visdrone.pt"
-    train_epochs: 100
-    train_imgsz: 640
-    train_batch: 16
-    
-  rt_detr:
-    type: "rtdetr"
-    architecture: "rtdetr-l"
-    pretrained: "rtdetr-l.pt"
-    fine_tuned: false
-    checkpoint: null
+  
+  # Disabled for pilot experiment
+  # yolo_ft:
+  #   type: "yolo"
+  #   architecture: "yolov8s"
+  #   pretrained: "yolov8s.pt"
+  #   fine_tuned: true
+  #   checkpoint: "results/models/yolo_ft_visdrone.pt"
+  #   train_epochs: 100
+  #   train_imgsz: 640
+  #   train_batch: 16
+  # 
+  # rt_detr:
+  #   type: "rtdetr"
+  #   architecture: "rtdetr-l"
+  #   pretrained: "rtdetr-l.pt"
+  #   fine_tuned: false
+  #   checkpoint: null
     
 # Inference settings
 inference:
   imgsz: 640
-  conf_thres: 0.25
+  conf_thres: 0.01  # Lowered for tiny object detection (was 0.25)
   iou_thres: 0.45
   
-# Frame sequence settings
-frame_sequences:
-  min_clip_length: 5  # minimum frames per clip
-  max_clip_length: 30  # maximum frames per clip
-  clip_stride: 5  # stride for extracting clips
+# Single image mode (no frame sequences)
+# Frame sequence settings removed - using single images only
   
 # Evaluation
 evaluation:
   splits: ["val"]  # primary split
   iou_thresholds: [0.5, 0.5, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]  # for mAP@0.5:0.95
-  tiny_match_iou_threshold: 0.5
-  tiny_match_same_class: true
+  tiny_match_iou_threshold: 0.3  # Relaxed for tiny objects (was 0.5) - IoU >= 0.3 for match
+  tiny_match_same_class: false  # Set to false: COCO pretrained YOLO has class mismatch with VisDrone
   
 # Risk region detection (automatic identification)
 risk_detection:
   map_drop_threshold: 0.15  # absolute drop from severity 0
-  miss_rate_threshold: 0.5  # miss rate threshold for risk region
+  miss_rate_threshold: 0.25  # miss rate threshold for risk region (25% - realistic for tiny objects)
   score_drop_threshold: 0.2  # score drop threshold
   iou_drop_threshold: 0.2  # IoU drop threshold
-  instability_threshold: 0.3  # variance threshold for instability detection
-  window_size: 5  # frames before failure event for CAM analysis
+  instability_threshold: 0.3  # variance threshold for instability detection (across severities)
   
 # Grad-CAM (failure-event based)
 gradcam:
   enabled: true
-  target_layer: "model.model[-2]"  # last conv layer in YOLO
+  target_layer: "model.18.cv2.conv"  # Backbone last C2f block's cv2 conv (stable single feature map, avoids concat)
   top_k_percent: 10
   save_samples: true
   max_samples: 20
-  failure_window: 5  # W frames before failure event
   metrics: ["energy_in_bbox", "activation_spread", "entropy", "center_shift"]  # CAM distribution metrics
+  # Dynamic refinement: analyze failure region in detail
+  dynamic_refinement:
+    enabled: true
+    detect_failure_region: true  # Detect "explosive" failure region (e.g., severity 2-3)
+    subdivision_steps: 10  # Subdivide failure region into N steps
+    failure_detection_threshold: 0.3  # CAM metric change threshold to detect failure
   
 # Results paths
 results:

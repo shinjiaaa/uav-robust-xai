@@ -25,26 +25,24 @@ def main():
     set_seed(config['seed'])
     
     print("=" * 60)
-    print("Tiny Object Detection (Time-series)")
+    print("Tiny Object Detection")
     print("=" * 60)
     print()
     
-    # Load clips and tiny objects
+    # Load tiny objects
     results_dir = Path(config['results']['root'])
-    clips_file = results_dir / "frame_clips.json"
     tiny_objects_file = results_dir / "tiny_objects_samples.json"
     
-    if not clips_file.exists() or not tiny_objects_file.exists():
-        print("Error: Frame clips or tiny objects not found. Run previous scripts first.")
+    if not tiny_objects_file.exists():
+        print("Error: Tiny objects not found. Run scripts/01_sample_tiny_objects.py first.")
         sys.exit(1)
     
-    clips = load_json(clips_file)
     tiny_objects = load_json(tiny_objects_file)
     
-    print(f"Loaded {len(clips)} clips, {len(tiny_objects)} tiny objects")
+    print(f"Loaded {len(tiny_objects)} tiny objects")
     
-    # Process each model
-    models = list(config['models'].keys())
+    # Process each model (only yolo_generic for pilot)
+    models = ['yolo_generic']  # Only Generic YOLO
     corruptions = config['corruptions']['types']
     severities = config['corruptions']['severities']
     
@@ -69,23 +67,15 @@ def main():
                 print(f"  {corruption} severity {severity}...")
                 
                 for tiny_obj in tqdm(tiny_objects, desc=f"    {model_name}-{corruption}-{severity}", leave=False):
-                    clip_id = tiny_obj['clip_id']
+                    image_id = tiny_obj['image_id']
                     frame_rel_path = tiny_obj['frame_path']
-                    
-                    # Find frame index in clip
-                    clip = next((c for c in clips if c['clip_id'] == clip_id), None)
-                    if not clip:
-                        continue
-                    
-                    frame_idx = next((i for i, f in enumerate(clip['frames']) if f == frame_rel_path), None)
-                    if frame_idx is None:
-                        continue
                     
                     # Get image path
                     if severity == 0:
                         image_path = visdrone_root / frame_rel_path
                     else:
-                        image_path = corruptions_root / "sequences" / clip_id / corruption / str(severity) / "images" / Path(frame_rel_path).name
+                        # New structure: corruptions_root / corruption / severity / images
+                        image_path = corruptions_root / corruption / str(severity) / "images" / Path(frame_rel_path).name
                     
                     if not image_path.exists():
                         continue
@@ -111,7 +101,11 @@ def main():
                     # Convert VisDrone bbox to YOLO format
                     img_width, img_height = get_image_dimensions(image_path)
                     visdrone_bbox = tiny_obj['bbox']  # (left, top, width, height) in pixels
-                    gt_box = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
+                    yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
+                    
+                    # GT box format: (class_id, x_center, y_center, width, height)
+                    class_id = tiny_obj['class_id']
+                    gt_box = (class_id, yolo_bbox[0], yolo_bbox[1], yolo_bbox[2], yolo_bbox[3])
                     
                     match_result = match_prediction_to_gt(
                         pred_boxes,
@@ -131,24 +125,22 @@ def main():
                         'model': model_name,
                         'corruption': corruption,
                         'severity': severity,
-                        'clip_id': clip_id,
-                        'frame_idx': frame_idx,
-                        'image_id': Path(frame_rel_path).stem,
-                        'class_id': tiny_obj['class_id'],
+                        'image_id': image_id,
+                        'class_id': class_id,
                         'score': score,
                         'iou': iou,
                         'miss': miss
                     })
     
     # Save records
-    print("\nSaving time-series records...")
+    print("\nSaving detection records...")
     records_df = pd.DataFrame(records)
     records_csv = results_dir / "tiny_records_timeseries.csv"
     records_df.to_csv(records_csv, index=False)
     print(f"  Saved to {records_csv}")
     print(f"  Total records: {len(records)}")
     
-    print("\n[OK] Time-series detection complete!")
+    print("\n[OK] Detection complete!")
 
 
 if __name__ == "__main__":

@@ -29,14 +29,14 @@ def main():
     
     results_dir = Path(config['results']['root'])
     
-    # Load time-series records
+    # Load detection records
     records_csv = results_dir / "tiny_records_timeseries.csv"
     if not records_csv.exists():
-        print("Error: Time-series records not found. Run scripts/03_detect_tiny_objects_timeseries.py first")
+        print("Error: Detection records not found. Run scripts/03_detect_tiny_objects_timeseries.py first")
         sys.exit(1)
     
     records_df = pd.read_csv(records_csv)
-    print(f"Loaded {len(records_df)} time-series records")
+    print(f"Loaded {len(records_df)} detection records")
     
     # Detect failure events
     print("\n1. Detecting failure events...")
@@ -47,11 +47,11 @@ def main():
     failure_events_df.to_csv(failure_events_csv, index=False)
     print(f"   Saved to {failure_events_csv}")
     
-    # Detect instability
+    # Detect instability (across severities for single images)
     print("\n2. Detecting instability regions...")
     instability_df = detect_instability(
         records_df,
-        window_size=5,
+        window_size=3,  # Reduced for single images (severity-based)
         threshold=config['risk_detection']['instability_threshold']
     )
     print(f"   Found {len(instability_df)} instability regions")
@@ -67,7 +67,7 @@ def main():
         print("\n3. Computing dataset-wide metrics...")
         evaluate_all_models(
             config,
-            models=list(config['models'].keys()),
+            models=['yolo_generic'],  # Only Generic YOLO
             splits=config['evaluation']['splits'],
             corruption_types=config['corruptions']['types'],
             severities=config['corruptions']['severities'],

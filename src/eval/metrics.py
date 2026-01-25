@@ -101,13 +101,30 @@ def evaluate_model_dataset_wide(
         verbose=False
     )
     
-    # Extract metrics
+    # Extract metrics with NaN handling (empty predictions -> 0.0)
+    def safe_float(value, default=0.0):
+        """Convert to float, handling NaN and None."""
+        if value is None:
+            return default
+        try:
+            val = float(value)
+            # Check for NaN
+            if val != val:  # NaN check (NaN != NaN)
+                return default
+            return val
+        except (ValueError, TypeError):
+            return default
+    
     metrics = {
-        'map50': float(results.box.map50) if hasattr(results.box, 'map50') else 0.0,
-        'map5095': float(results.box.map) if hasattr(results.box, 'map') else 0.0,
-        'precision': float(results.box.mp) if hasattr(results.box, 'mp') else 0.0,
-        'recall': float(results.box.mr) if hasattr(results.box, 'mr') else 0.0,
+        'map50': safe_float(results.box.map50 if hasattr(results.box, 'map50') else None),
+        'map5095': safe_float(results.box.map if hasattr(results.box, 'map') else None),
+        'precision': safe_float(results.box.mp if hasattr(results.box, 'mp') else None),
+        'recall': safe_float(results.box.mr if hasattr(results.box, 'mr') else None),
     }
+    
+    # Additional info for debugging
+    metrics['pred_count'] = getattr(results.box, 'nc', 0)  # Number of classes (proxy for predictions)
+    metrics['eval_status'] = 'ok'
     
     return metrics
 
@@ -188,15 +205,40 @@ def evaluate_all_models(
                             'map5095': metrics['map5095'],
                             'precision': metrics['precision'],
                             'recall': metrics['recall'],
+                            'pred_count': metrics.get('pred_count', 0),
+                            'eval_status': metrics.get('eval_status', 'ok'),
                             'run_id': run_id,
                             'timestamp': timestamp
                         })
                     except Exception as e:
                         print(f"Error evaluating {model_name} on {corruption} severity {severity}: {e}")
+                        # Record error case with 0 metrics
+                        results.append({
+                            'model': model_name,
+                            'split': split,
+                            'corruption': corruption,
+                            'severity': severity,
+                            'map50': 0.0,
+                            'map5095': 0.0,
+                            'precision': 0.0,
+                            'recall': 0.0,
+                            'pred_count': 0,
+                            'eval_status': 'error',
+                            'run_id': run_id,
+                            'timestamp': timestamp
+                        })
                         continue
     
-    # Save to CSV
+    # Save to CSV with NaN handling
     df = pd.DataFrame(results)
+    # Fill NaN values with 0.0 (empty predictions -> 0 metrics)
+    df = df.fillna(0.0)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False)
     print(f"Saved metrics to {output_csv}")
+    
+    # Print summary of empty predictions
+    if 'eval_status' in df.columns:
+        error_count = (df['eval_status'] == 'error').sum()
+        if error_count > 0:
+            print(f"Warning: {error_count} evaluations had errors (recorded as 0.0 metrics)")

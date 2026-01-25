@@ -85,7 +85,7 @@ def compute_iou(box1: Tuple[float, float, float, float], box2: Tuple[float, floa
 
 
 def is_tiny_box(box: Tuple[float, float, float, float], img_width: int, img_height: int, config: Dict) -> bool:
-    """Check if a box is considered tiny.
+    """Check if a box is considered tiny (small but detectable).
     
     Args:
         box: Box in (x_center, y_center, width, height) normalized format
@@ -94,22 +94,25 @@ def is_tiny_box(box: Tuple[float, float, float, float], img_width: int, img_heig
         config: Configuration dictionary
         
     Returns:
-        True if box is tiny
+        True if box is tiny (within size range for detection)
     """
     tiny_config = config['tiny_objects']
     width_px = box[2] * img_width
     height_px = box[3] * img_height
     area_px = width_px * height_px
     
-    # Check area threshold
-    if area_px < tiny_config['area_threshold']:
-        return True
+    # Check if box is within detectable size range
+    # Must be: area >= area_threshold AND (width >= width_threshold OR height >= height_threshold)
+    # This ensures objects are large enough to be detected by COCO pretrained YOLO
+    area_ok = area_px >= tiny_config['area_threshold']
+    size_ok = width_px >= tiny_config['width_threshold'] or height_px >= tiny_config['height_threshold']
     
-    # Check width/height thresholds
-    if width_px < tiny_config['width_threshold'] and height_px < tiny_config['height_threshold']:
-        return True
+    # Also check upper bound to keep them "small" (not too large)
+    # Use a reasonable upper bound (e.g., 100x100 = 10000 px²)
+    max_area = tiny_config.get('max_area_threshold', 10000)
+    area_not_too_large = area_px <= max_area
     
-    return False
+    return area_ok and size_ok and area_not_too_large
 
 
 def sample_tiny_objects(config: Dict, split: str = 'val') -> List[Dict]:
