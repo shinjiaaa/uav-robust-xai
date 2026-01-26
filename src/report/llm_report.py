@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 import pandas as pd
-import numpy as np
+# import numpy as np
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
@@ -191,11 +191,23 @@ def summarize_metrics(metrics: Dict) -> Dict:
         Summarized metrics dictionary
     """
     summarized: Dict = {}
+    
+    # CRITICAL: Load detection_records once at the beginning for data consistency checks
+    detection_records = metrics.get('detection_records', [])
+    detection_records_df = pd.DataFrame(detection_records) if detection_records else pd.DataFrame()
+    
+    # Get corruptions that actually have detection records (data consistency check)
+    # This is used throughout summarize_metrics to ensure all tables use the same data source
+    available_corruptions_from_det = set()
+    if len(detection_records_df) > 0 and 'corruption' in detection_records_df.columns:
+        available_corruptions_from_det = set(detection_records_df['corruption'].unique())
 
     # ----------------------------
     # Dataset metrics (Table 1)
+    # CRITICAL: Only include corruptions that have actual detection records
     # ----------------------------
     dataset_metrics = metrics.get('dataset', [])
+    
     if dataset_metrics:
         dataset_df = pd.DataFrame(dataset_metrics)
 
@@ -204,6 +216,23 @@ def summarize_metrics(metrics: Dict) -> Dict:
         all_severities = [0, 1, 2, 3, 4]
 
         for corruption in all_expected_corruptions:
+            # CRITICAL: Only process corruptions that have actual detection records
+            # If dataset metrics exist but no detection records, mark as "no data"
+            if corruption not in available_corruptions_from_det:
+                # No detection records for this corruption - mark all severities as "no data"
+                for severity in all_severities:
+                    dataset_by_corruption_severity.setdefault(corruption, {})[severity] = {
+                        'map50': None,
+                        'map5095': None,
+                        'precision': None,
+                        'recall': None,
+                        'n_frames_total': 0,
+                        'n_frames_valid': 0,
+                        'valid_ratio': 0.0,
+                        'status': 'N/A (no detection records - data inconsistency)',
+                        'evaluation_failed': False
+                    }
+                continue
             dataset_by_corruption_severity[corruption] = {}
             corr_df = dataset_df[dataset_df['corruption'] == corruption].copy() if 'corruption' in dataset_df.columns else pd.DataFrame()
 
@@ -219,8 +248,11 @@ def summarize_metrics(metrics: Dict) -> Dict:
 
                     if 'pred_count' in sev_df.columns and 'eval_status' in sev_df.columns:
                         valid_df = sev_df[(sev_df['pred_count'] > 0) & (sev_df['eval_status'] != 'error')]
-                        n_frames_total = len(sev_df)
-                        n_frames_valid = len(valid_df)
+                        # CRITICAL: n_frames_total should use pred_count (actual frames evaluated)
+                        # not len(sev_df) which is just the number of CSV rows
+                        # If metrics_dataset.csv has only 1 row per severity, pred_count indicates actual dataset size
+                        n_frames_total = int(sev_df['pred_count'].iloc[0]) if len(sev_df) > 0 and pd.notna(sev_df['pred_count'].iloc[0]) else len(sev_df)
+                        n_frames_valid = len(valid_df)  # Number of valid CSV rows (usually 1 if subset evaluation)
                         valid_ratio = float(n_frames_valid / n_frames_total) if n_frames_total > 0 else 0.0
                     else:
                         n_frames_total = len(sev_df)
@@ -228,7 +260,24 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         valid_ratio = 1.0 if not eval_failed else 0.0
                         valid_df = sev_df.copy() if n_frames_valid > 0 else pd.DataFrame()
 
-                    if n_frames_valid < 10:
+                    # CRITICAL: If metrics_dataset.csv has only 1 row per severity, it's likely a subset/sample evaluation
+                    # not a full dataset-wide evaluation. Mark this clearly.
+                    # n_frames_total now uses pred_count (actual frames), so compare against that
+                    if len(sev_df) == 1 and n_frames_total < 100:
+                        # Likely subset evaluation - metrics_dataset.csv structure suggests this
+                        # Still output the mAP values even if it's a subset
+                        dataset_by_corruption_severity[corruption][severity] = {
+                            'map50': float(valid_df['map50'].iloc[0]) if 'map50' in valid_df.columns and len(valid_df) > 0 else None,
+                            'map5095': float(valid_df['map5095'].iloc[0]) if 'map5095' in valid_df.columns and len(valid_df) > 0 else None,
+                            'precision': float(valid_df['precision'].iloc[0]) if 'precision' in valid_df.columns and len(valid_df) > 0 else None,
+                            'recall': float(valid_df['recall'].iloc[0]) if 'recall' in valid_df.columns and len(valid_df) > 0 else None,
+                            'n_frames_total': n_frames_total,
+                            'n_frames_valid': n_frames_valid,
+                            'valid_ratio': valid_ratio,
+                            'status': f'Subset evaluation (n_frames_total={n_frames_total} from pred_count, CSV rows={len(sev_df)})',
+                            'evaluation_failed': bool(eval_failed)
+                        }
+                    elif n_frames_total < 10:
                         dataset_by_corruption_severity[corruption][severity] = {
                             'map50': None,
                             'map5095': None,
@@ -276,17 +325,33 @@ def summarize_metrics(metrics: Dict) -> Dict:
         summarized['dataset_by_corruption_severity'] = {}
 
     # ----------------------------
-    # Detection records summary
+    # Detection records summary (Table 2)
+    # NOTE: detection_records is already loaded at the beginning of summarize_metrics
+    # CRITICAL: This is from tiny_records_timeseries.csv (per-object per-severity records)
+    # NOT from metrics_dataset.csv (dataset-wide mAP)
     # ----------------------------
-    detection_records = metrics.get('detection_records', [])
+    # detection_records is already available from metrics.get('detection_records', []) at function start
     if detection_records:
         df = pd.DataFrame(detection_records)
 
+        # CRITICAL: Calculate actual object counts per corruption/severity
+        # This is the actual number of tiny objects evaluated, not from metrics_dataset.csv
+        n_objects_by_corruption_severity = {}
+        if 'corruption' in df.columns and 'severity' in df.columns:
+            for corruption in df['corruption'].unique():
+                n_objects_by_corruption_severity[corruption] = {}
+                corr_df = df[df['corruption'] == corruption]
+                for severity in corr_df['severity'].unique():
+                    sev_df = corr_df[corr_df['severity'] == severity]
+                    n_objects_by_corruption_severity[corruption][severity] = len(sev_df)
+
         overall_summary = {
             'total_records': len(detection_records),
+            'n_objects_total': len(detection_records),  # Total detection records (objects × severities)
             'by_model': df.groupby('model').size().to_dict() if 'model' in df.columns else {},
             'by_corruption': df.groupby('corruption').size().to_dict() if 'corruption' in df.columns else {},
             'by_severity': df.groupby('severity').size().to_dict() if 'severity' in df.columns else {},
+            'n_objects_by_corruption_severity': n_objects_by_corruption_severity,
             'miss_rate_by_severity': df.groupby('severity')['miss'].mean().to_dict() if 'miss' in df.columns else {},
             'avg_score_by_severity': df.groupby('severity')['score'].mean().to_dict() if 'score' in df.columns else {},
             'avg_iou_by_severity': df.groupby('severity')['iou'].mean().to_dict() if 'iou' in df.columns else {},
@@ -321,6 +386,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
 
     # ----------------------------
     # Failure events summary (Table 3)
+    # CRITICAL: Only include corruptions that have actual detection records
     # ----------------------------
     failure_events = metrics.get('failure_events', [])
     det_df_for_failure = pd.DataFrame(detection_records) if detection_records else pd.DataFrame()
@@ -328,14 +394,30 @@ def summarize_metrics(metrics: Dict) -> Dict:
     if failure_events:
         df = pd.DataFrame(failure_events)
         fail_df_for_unified = df.copy()
-
+        
+        # Use the same available_corruptions_from_det from the beginning of summarize_metrics
+        # (already computed from detection_records_df)
+        
         failure_summary_by_corruption = {}
         for corruption in (df['corruption'].unique() if 'corruption' in df.columns else []):
+            # CRITICAL: Only process corruptions that have actual detection records
+            if corruption not in available_corruptions_from_det:
+                # Skip corruptions without detection data (data inconsistency)
+                continue
+            
             corr_df = df[df['corruption'] == corruption].copy()
             unified_failure_sev = get_failure_severity_for_corruption(fail_df_for_unified, corruption, det_df_for_failure)
 
+            # Count event types from failure_events.csv
+            miss_events = len(corr_df[corr_df['failure_type'] == 'miss']) if 'failure_type' in corr_df.columns else 0
+            score_drop_events = len(corr_df[corr_df['failure_type'] == 'score_drop']) if 'failure_type' in corr_df.columns else 0
+            iou_drop_events = len(corr_df[corr_df['failure_type'] == 'iou_drop']) if 'failure_type' in corr_df.columns else 0
+
             failure_summary_by_corruption[corruption] = {
                 'total_events': len(corr_df),
+                'miss_events': int(miss_events),
+                'score_drop_events': int(score_drop_events),
+                'iou_drop_events': int(iou_drop_events),
                 'unified_failure_severity': unified_failure_sev,
                 'failure_severity_definition': 'First miss occurrence severity (minimum first_miss_severity)',
                 'first_miss_severity': {
@@ -361,12 +443,20 @@ def summarize_metrics(metrics: Dict) -> Dict:
         # event_type vs failure_type naming compatibility
         event_col = 'event_type' if 'event_type' in df.columns else ('failure_type' if 'failure_type' in df.columns else None)
 
+        # CRITICAL: Filter failure events to only include corruptions with actual detection records
+        # Use the same available_corruptions_from_det from the beginning of summarize_metrics
+        if available_corruptions_from_det:
+            df_filtered = df[df['corruption'].isin(available_corruptions_from_det)].copy() if 'corruption' in df.columns else df
+        else:
+            df_filtered = df.copy()
+
         summarized['failure_summary'] = {
-            'total_events': len(failure_events),
-            'by_model': df.groupby('model').size().to_dict() if 'model' in df.columns else {},
-            'by_corruption': df.groupby('corruption').size().to_dict() if 'corruption' in df.columns else {},
-            'by_event_type': df.groupby(event_col).size().to_dict() if event_col else {},
+            'total_events': len(df_filtered),  # Only count events from available corruptions
+            'by_model': df_filtered.groupby('model').size().to_dict() if 'model' in df_filtered.columns else {},
+            'by_corruption': df_filtered.groupby('corruption').size().to_dict() if 'corruption' in df_filtered.columns else {},
+            'by_event_type': df_filtered.groupby(event_col).size().to_dict() if event_col and event_col in df_filtered.columns else {},
             'by_corruption_detail': failure_summary_by_corruption,
+            'data_consistency_note': f'Only corruptions with detection records are included. Available: {sorted(available_corruptions_from_det)}' if available_corruptions_from_det else 'No detection records available for consistency check'
         }
     else:
         summarized['failure_summary'] = {}
@@ -409,6 +499,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
 
     # ----------------------------
     # CAM metrics + pattern analyses
+    # CRITICAL: Only include corruptions that have actual detection records
     # ----------------------------
     cam_metrics = metrics.get('cam_metrics', [])
     det_df = pd.DataFrame(detection_records) if detection_records else pd.DataFrame()
@@ -422,9 +513,28 @@ def summarize_metrics(metrics: Dict) -> Dict:
         all_severities = [0, 1, 2, 3, 4]
 
         # ---- Table 4: CAM metrics by corruption x severity
+        # CRITICAL: Only include corruptions that have actual detection records
         cam_metrics_by_corruption_severity: Dict[str, Dict[int, Dict]] = {}
+        
+        # Get corruptions that actually have detection records (data consistency check)
+        # Use the same available_corruptions_from_det from dataset metrics section
+        # (already computed at the beginning of summarize_metrics)
 
         for corruption in all_expected_corruptions:
+            # CRITICAL: Only process corruptions that have actual detection records
+            if corruption not in available_corruptions_from_det:
+                # No detection records for this corruption - mark all severities as "no data"
+                for sev in all_severities:
+                    cam_metrics_by_corruption_severity.setdefault(corruption, {})[sev] = {
+                        'energy_in_bbox_mean': None,
+                        'activation_spread_mean': None,
+                        'entropy_mean': None,
+                        'center_shift_mean': None,
+                        'n_cam_frames': 0,
+                        'note': 'N/A (no detection records - data inconsistency)'
+                    }
+                continue
+            
             corr_cam = cam_df[cam_df['corruption'] == corruption].copy() if 'corruption' in cam_df.columns and corruption in cam_df['corruption'].unique() else pd.DataFrame()
             cam_metrics_by_corruption_severity[corruption] = {}
 
@@ -464,10 +574,16 @@ def summarize_metrics(metrics: Dict) -> Dict:
         summarized['cam_metrics_by_corruption_severity'] = cam_metrics_by_corruption_severity
 
         # ---- cam_pattern_summary (Table 5)
+        # CRITICAL: Only include corruptions that have actual detection records
         cam_pattern_summary: Dict[str, Dict] = {}
         available_corruptions = cam_df['corruption'].unique().tolist() if 'corruption' in cam_df.columns else []
 
         for corruption in all_expected_corruptions:
+            # CRITICAL: Only process corruptions that have actual detection records
+            if corruption not in available_corruptions_from_det:
+                cam_pattern_summary[corruption] = {'note': 'No detection records for this corruption (data inconsistency)', 'all_metrics_missing': True}
+                continue
+            
             if corruption not in available_corruptions:
                 cam_pattern_summary[corruption] = {'note': 'CAM data not available for this corruption', 'all_metrics_missing': True}
                 continue
@@ -533,9 +649,14 @@ def summarize_metrics(metrics: Dict) -> Dict:
         summarized['cam_pattern_summary'] = cam_pattern_summary
 
         # ---- performance_cam_alignment (Table 6)
+        # CRITICAL: Only include corruptions that have actual detection records
         performance_cam_alignment: Dict[str, Dict] = {}
 
         for corruption in all_expected_corruptions:
+            # CRITICAL: Only process corruptions that have actual detection records
+            if corruption not in available_corruptions_from_det:
+                continue  # Skip corruptions without detection data
+            
             corr_cam = cam_df[cam_df['corruption'] == corruption].copy() if 'corruption' in cam_df.columns else pd.DataFrame()
             corr_det = det_df[det_df['corruption'] == corruption].copy() if len(det_df) > 0 and 'corruption' in det_df.columns else pd.DataFrame()
 
@@ -635,6 +756,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
         summarized['performance_cam_alignment'] = performance_cam_alignment
 
         # ---- lead_lag_analysis (Table 7) (FIXED dict init + indentation)
+        # CRITICAL: Only include corruptions that have actual detection records
         lead_lag_analysis: Dict[str, Dict] = {}
 
         CAM_CHANGE_THRESHOLDS = {
@@ -645,6 +767,10 @@ def summarize_metrics(metrics: Dict) -> Dict:
         }
 
         for corruption in all_expected_corruptions:
+            # CRITICAL: Only process corruptions that have actual detection records
+            if corruption not in available_corruptions_from_det:
+                continue  # Skip corruptions without detection data
+            
             corr_cam = cam_df[cam_df['corruption'] == corruption].copy() if 'corruption' in cam_df.columns else pd.DataFrame()
             if len(corr_cam) == 0 or 'severity' not in corr_cam.columns:
                 continue
@@ -720,10 +846,16 @@ def summarize_metrics(metrics: Dict) -> Dict:
         summarized['lead_lag_analysis'] = lead_lag_analysis
 
         # ---- cross_corruption_pattern (Table 8)
+        # CRITICAL: Only include corruptions that have actual detection records
         cross_corruption_pattern: Dict[str, Dict] = {m: {} for m in cam_metrics_list}
 
         for metric_name in cam_metrics_list:
             for corruption in all_expected_corruptions:
+                # CRITICAL: Only process corruptions that have actual detection records
+                if corruption not in available_corruptions_from_det:
+                    cross_corruption_pattern[metric_name][corruption] = "no_data"
+                    continue
+                
                 corr_info = cam_pattern_summary.get(corruption, {})
                 if corr_info.get('all_metrics_missing', False):
                     cross_corruption_pattern[metric_name][corruption] = "no_data"
@@ -756,6 +888,11 @@ def summarize_metrics(metrics: Dict) -> Dict:
         }
 
         for corruption in all_expected_corruptions:
+            # CRITICAL: Only process corruptions that have actual detection records
+            if corruption not in available_corruptions_from_det:
+                rq1_evidence['corruptions_without_data'].append(corruption)
+                continue
+            
             corr_info = cam_pattern_summary.get(corruption, {})
             if corr_info.get('all_metrics_missing', False) or len(corr_info) == 0:
                 rq1_evidence['corruptions_without_data'].append(corruption)
@@ -811,6 +948,28 @@ def summarize_metrics(metrics: Dict) -> Dict:
 
     return summarized
 
+import numpy as np
+
+def normalize_for_json(obj):
+    """
+    Recursively convert dictionary keys to str
+    and numpy types to native Python types.
+    """
+    if isinstance(obj, dict):
+        return {
+            str(k): normalize_for_json(v)
+            for k, v in obj.items()
+        }
+
+    elif isinstance(obj, (list, tuple)):
+        return [normalize_for_json(v) for v in obj]
+
+    elif isinstance(obj, np.generic):
+        return obj.item()
+
+    else:
+        return obj
+
 
 def generate_report_with_llm(config: Dict, metrics: Dict) -> str:
     """Generate report using LLM.
@@ -829,7 +988,7 @@ def generate_report_with_llm(config: Dict, metrics: Dict) -> str:
 
     client = OpenAI(api_key=api_key)
 
-    summarized_metrics = summarize_metrics(metrics)
+    summarized_metrics = normalize_for_json(summarize_metrics(metrics))
 
     prompt = f"""You are a research assistant writing an experiment report. Generate a comprehensive markdown report based on the provided metrics data.
 
@@ -845,6 +1004,32 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
 8. CRITICAL: Performance values in Table 6 must EXACTLY match Table 2 (same corruption, same severity).
 9. CRITICAL: Report aggregation scope in notes (e.g., "avg_score/avg_iou from matched cases only").
 10. CRITICAL: For mAP, report valid subset statistics (n_frames_valid, valid_ratio) and mark as "N/A (insufficient valid frames)" if n_frames_valid < 10.
+11. CRITICAL: Table 4 (Failure Summary) must show corruption-specific event counts:
+    - Each corruption (fog, lowlight, motion_blur) has DIFFERENT event counts
+    - DO NOT sum across corruptions - report by_corruption_detail values for each corruption separately
+    - miss_events, score_drop_events, iou_drop_events are per-corruption, NOT totals
+12. CRITICAL: Table 2 (Detection Summary) n_objects_total comes from detection_records (tiny_records_timeseries.csv):
+    - Total should be sum of all detection records (typically 1500 for 100 objects × 5 severities × 3 corruptions)
+    - NOT from metrics_dataset.csv pred_count
+    - Report n_objects_by_corruption_severity if available
+13. CRITICAL: Grad-CAM Analysis Scope (Methods/Limitations):
+    - CAM computation is performed only for failure events that satisfy:
+      1) Detection records exist (tiny_records_timeseries.csv)
+      2) Failure event detected (failure_events.csv)
+      3) Successful CAM generation (no shape/device errors)
+    - If a corruption has failure_events but 0 CAM records, explicitly state:
+      "CAM generation failed for this corruption (see gradcam_errors.csv for details)"
+    - Do NOT claim "no failure events" if failure_events exist but CAM records are 0
+14. CRITICAL: Score/IoU Drop Definition (Methods):
+    - Baseline: severity 0 for EACH corruption (corruption-specific baseline)
+    - Threshold: score_drop_threshold and iou_drop_threshold (common across corruptions)
+    - Detection: First severity where (baseline_score - current_score) >= threshold
+    - This ensures fair comparison across different corruption types
+15. CRITICAL: Failure Severity Range for CAM (Methods):
+    - CAM is computed for severity 0 (baseline) through failure_severity (inclusive)
+    - Each severity's CAM is computed INDEPENDENTLY (not cumulative)
+    - CAM metrics compare each severity's CAM to baseline (severity 0)
+    - This tracks CAM distribution changes as corruption severity increases up to failure point
 
 Experiment Configuration:
 - Seed: {config['seed']}

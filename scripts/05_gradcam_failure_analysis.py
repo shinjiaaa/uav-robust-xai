@@ -89,8 +89,14 @@ def main():
     print(sample_events["corruption"].value_counts())
     print(f"\nProcessing {len(sample_events)} failure events...")
     
+    # Track CAM generation success/failure by corruption
+    corruption_cam_stats = {corr: {'success': 0, 'failed': 0} for corr in sample_events['corruption'].unique()}
+    
     for _, event in tqdm(sample_events.iterrows(), total=len(sample_events), desc="Processing events"):
         model_name = event['model']
+        # print("*"*100)
+        # print(event)
+        # print("*"*100)
         
         # Only process yolo_generic
         if model_name != 'yolo_generic':
@@ -115,7 +121,7 @@ def main():
         # Load model and setup Grad-CAM with fallback layers
         yolo = YOLO(model_path)
         torch_model = yolo.model
-        
+                
         # Fallback layer candidates (most stable first)
         target_layer_candidates = [
             gradcam_config['target_layer'],  # Primary: model.18.cv2.conv
@@ -183,19 +189,21 @@ def main():
             cam = None
             visdrone_bbox = tiny_obj['bbox']  # (left, top, width, height) in pixels
             yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
-            
+
+            # print(gradcam is None) = False
             # Try primary layer first
             for layer_name in target_layer_candidates:
                 try:
                     # Recreate gradcam with fallback layer if needed
                     if layer_name != gradcam_config['target_layer']:
                         gradcam = YOLOGradCAM(torch_model, target_layer_name=layer_name)
-                    
+                    # print(gradcam.model)
                     cam = gradcam.generate_cam(
                         image,
                         yolo_bbox,
                         class_id
                     )
+                    # exit()
                     break  # Success, exit retry loop
                 except (RuntimeError, ValueError) as e:
                     print(f"[DBG] err_msg={str(e)[:120]}")
@@ -223,7 +231,6 @@ def main():
                         'target_layer': layer_name
                     })
                     break  # Exit retry loop
-            
             if cam is None:
                 continue  # Skip this severity if all layers failed
             
@@ -256,6 +263,17 @@ def main():
                     'center_shift': float(metrics['center_shift']),
                 }
                 cam_metrics_records.append(record)
+                corruption_cam_stats[corruption]['success'] += 1
+            
+            if cam is None:
+                corruption_cam_stats[corruption]['failed'] += 1
+    
+    # Print CAM generation statistics by corruption
+    print("\n[DBG] CAM generation statistics by corruption:")
+    for corr, stats in corruption_cam_stats.items():
+        total = stats['success'] + stats['failed']
+        if total > 0:
+            print(f"  {corr}: {stats['success']} success, {stats['failed']} failed (total attempts: {total})")
     
     # Save initial CAM metrics
     if len(cam_metrics_records) > 0:

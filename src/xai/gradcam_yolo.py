@@ -16,16 +16,27 @@ class YOLOGradCAM:
         self.model.train()
 
         self.target_layer = self._get_target_layer(target_layer_name)
+        # print("*"*100)
+        # print(target_layer_name)
+        # print("TARGET layer id:", id(self.target_layer))
+        # print("*"*100)
 
         self.activations = None
         self.gradients = None
 
         def fwd_hook(m, inp, out):
+            # print("FWD hook called.")
+            # print("[FWD] out.requires_grad =", getattr(out, "requires_grad", None))
+            # print("[FWD] out.dtype =", getattr(out, "dtype", None))
+            # print("[FWD] out.is_leaf =", getattr(out, "is_leaf", None))
+            out.retain_grad()
+            # print("FWD module id:", id(m))
             self.activations = out
 
         def bwd_hook(module, grad_input, grad_output):
             # register_full_backward_hook signature: (module, grad_input, grad_output)
             # grad_output is a tuple, get first element if available
+            # print("BWD hook called. gout0 is None?", grad_output[0] is None)
             if grad_output is not None and len(grad_output) > 0 and grad_output[0] is not None:
                 self.gradients = grad_output[0]
 
@@ -94,80 +105,101 @@ class YOLOGradCAM:
         class_id: int
         """
         # 1) grad 활성화 강제 (중요)
-        torch.set_grad_enabled(True)
+        with torch.set_grad_enabled(True):
 
-        # DEBUG: Log input image shape before preprocessing
-        input_shape = image.shape[:2]
-        
-        x = self._preprocess_np_image(image, target_size=640).to(self.device)
-        # DEBUG: Log preprocessed tensor shape (should ALWAYS be 640x640 after letterbox)
-        preprocessed_shape = x.shape[-2:]  # (H, W)
-        assert preprocessed_shape == (640, 640), f"Preprocessed shape must be (640, 640), got {preprocessed_shape}. Input shape was {input_shape}"
-        
-        # CRITICAL: Input must require grad for gradient flow
-        x = x.requires_grad_(True)
+            # DEBUG: Log input image shape before preprocessing
+            input_shape = image.shape[:2]
+            
+            x = self._preprocess_np_image(image, target_size=640).to(self.device)
+            # DEBUG: Log preprocessed tensor shape (should ALWAYS be 640x640 after letterbox)
+            preprocessed_shape = x.shape[-2:]  # (H, W)
+            assert preprocessed_shape == (640, 640), f"Preprocessed shape must be (640, 640), got {preprocessed_shape}. Input shape was {input_shape}"
+            
+            # CRITICAL: Input must require grad for gradient flow
+            x = x.requires_grad_(True)
 
-        # Reset hooks
-        self.activations = None
-        self.gradients = None
-        
-        # 2) forward: no_grad / inference_mode 절대 금지
-        #    Note: YOLOv8 forward output may be detached, so we use activations from hook instead
-        _ = self.model(x)
+            # Reset hooks
+            self.activations = None
+            self.gradients = None
+            
+            # print("*"*100)
+            # print("111")
+            # print("*"*100)
+            # 2) forward: no_grad / inference_mode 절대 금지
+            #    Note: YOLOv8 forward output may be detached, so we use activations from hook instead
+            _ = self.model(x)
+            # print(_)
+            # exit()
 
-        # 3) activations hook에서 캡처한 feature map을 사용 (그래프가 살아있음)
-        if self.activations is None:
-            raise RuntimeError("Activations not captured. Check target_layer_name.")
-        
-        # activations는 (1, C, H, W) 형태
-        # activations는 그래프에 연결되어 있으므로 backward 가능
-        activations = self.activations
-        
-        # Ensure activations have gradient
-        if not activations.requires_grad:
-            # If activations don't require grad, the computation graph is broken
-            # This usually means the model forward uses torch.no_grad() or detaches
-            raise RuntimeError(f"Activations do not require grad. "
-                             f"This usually means model forward detaches outputs. "
-                             f"activations.requires_grad={activations.requires_grad}, "
-                             f"x.requires_grad={x.requires_grad}")
-        
-        # Use sum of activations (preserves gradient, more stable than max)
-        target = activations.sum()
+            # 3) activations hook에서 캡처한 feature map을 사용 (그래프가 살아있음)
+            if self.activations is None:
+                raise RuntimeError("Activations not captured. Check target_layer_name.")
+            
+            # activations는 (1, C, H, W) 형태
+            # activations는 그래프에 연결되어 있으므로 backward 가능
+            activations = self.activations
+            
+            # Ensure activations have gradient
+            if not activations.requires_grad:
+                # If activations don't require grad, the computation graph is broken
+                # This usually means the model forward uses torch.no_grad() or detaches
+                raise RuntimeError(f"Activations do not require grad. "
+                                f"This usually means model forward detaches outputs. "
+                                f"activations.requires_grad={activations.requires_grad}, "
+                                f"x.requires_grad={x.requires_grad}")
+            # print("*"*100)
+            # print("222")
+            # print("*"*100)
+            # Use sum of activations (preserves gradient, more stable than max)
+            target = activations.sum()
 
-        # ✅ 여기서 target은 반드시 grad_fn이 있어야 함
-        if (not target.requires_grad) or (target.grad_fn is None):
-            raise RuntimeError("Target score has no grad_fn (graph is detached). "
-                               "Check for torch.no_grad/inference_mode or detached outputs.")
+            # ✅ 여기서 target은 반드시 grad_fn이 있어야 함
+            if (not target.requires_grad) or (target.grad_fn is None):
+                raise RuntimeError("Target score has no grad_fn (graph is detached). "
+                                "Check for torch.no_grad/inference_mode or detached outputs.")
 
-        # 4) backward로 gradients 확보
-        self.model.zero_grad(set_to_none=True)
-        try:
-            target.backward(retain_graph=False)
-        except RuntimeError as e:
-            if "element 0 of tensors does not require grad" in str(e):
-                raise RuntimeError(f"Backward failed: {e}. "
-                                 f"target.requires_grad={target.requires_grad}, "
-                                 f"target.grad_fn={target.grad_fn}, "
-                                 f"x.requires_grad={x.requires_grad}") from e
-            raise
+            # 4) backward로 gradients 확보
+            self.model.zero_grad(set_to_none=True)
+            try:
+                # target.backward(retain_graph=False)
+                new_target = sum(o.sum() for o in _)
+                new_target.backward(retain_graph=True)
+                # print("backward called")
+            except RuntimeError as e:
+                if "element 0 of tensors does not require grad" in str(e):
+                    raise RuntimeError(f"Backward failed: {e}. "
+                                    f"target.requires_grad={target.requires_grad}, "
+                                    f"target.grad_fn={target.grad_fn}, "
+                                    f"x.requires_grad={x.requires_grad}") from e
+                raise
+            # print("after backward: act.grad is None?", self.activations.grad is None)
+            # if self.activations.grad is not None:
+            #     print("act.grad mean:", self.activations.grad.abs().mean().item())
+            # print("*"*100)
+            # print("333")
+            # print("*"*100)
+            # 5) CAM 계산
+            if self.activations is None:
+                raise RuntimeError("Activations not captured by forward hook. Check target_layer_name.")
+            if self.gradients is None:
+                raise RuntimeError(f"Gradients not captured by backward hook. "
+                                f"activations captured: {self.activations is not None}, "
+                                f"target.requires_grad={target.requires_grad}, "
+                                f"target.grad_fn={target.grad_fn}. "
+                                f"This usually means backward() was not called or hook was not triggered.")
+            # print("*"*100)
+            # print("444")
+            # print("*"*100)
+            # activations/gradients: (1,C,h,w)
+            w = self.gradients.mean(dim=(2, 3), keepdim=True)      # (1,C,1,1)
+            cam = (w * self.activations).sum(dim=1, keepdim=True)  # (1,1,h,w)
+            cam = F.relu(cam)
 
-        # 5) CAM 계산
-        if self.activations is None:
-            raise RuntimeError("Activations not captured by forward hook. Check target_layer_name.")
-        if self.gradients is None:
-            raise RuntimeError(f"Gradients not captured by backward hook. "
-                             f"activations captured: {self.activations is not None}, "
-                             f"target.requires_grad={target.requires_grad}, "
-                             f"target.grad_fn={target.grad_fn}. "
-                             f"This usually means backward() was not called or hook was not triggered.")
+            cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            cam = cam[0, 0]
+            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
 
-        # activations/gradients: (1,C,h,w)
-        w = self.gradients.mean(dim=(2, 3), keepdim=True)      # (1,C,1,1)
-        cam = (w * self.activations).sum(dim=1, keepdim=True)  # (1,1,h,w)
-        cam = F.relu(cam)
-
-        cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        cam = cam[0, 0]
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-        return cam.detach().cpu().numpy()
+            # print("*"*100)
+            # print("555")
+            # print("*"*100)
+            return cam.detach().cpu().numpy()

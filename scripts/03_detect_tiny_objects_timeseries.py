@@ -63,6 +63,9 @@ def main():
         print(f"\nProcessing model: {model_name}")
         
         for corruption in corruptions:
+            corruption_record_count = 0
+            corruption_missing_image_count = 0
+            
             for severity in severities:
                 print(f"  {corruption} severity {severity}...")
                 
@@ -78,6 +81,7 @@ def main():
                         image_path = corruptions_root / corruption / str(severity) / "images" / Path(frame_rel_path).name
                     
                     if not image_path.exists():
+                        corruption_missing_image_count += 1
                         continue
                     
                     # Get annotation
@@ -131,6 +135,10 @@ def main():
                         'iou': iou,
                         'miss': miss
                     })
+                    corruption_record_count += 1
+            
+            # Log corruption summary
+            print(f"  [{corruption}] Total records: {corruption_record_count}, Missing images: {corruption_missing_image_count}")
     
     # Save records
     print("\nSaving detection records...")
