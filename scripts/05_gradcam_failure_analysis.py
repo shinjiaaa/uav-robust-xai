@@ -80,8 +80,13 @@ def main():
     
     # Process failure events (limit to max_samples)
     max_samples = gradcam_config.get('max_samples', 20)
-    sample_events = failure_events_df.head(max_samples)
     
+    sample_events = (failure_events_df
+                 .groupby("corruption", group_keys=False)
+                 .head(max_samples//3))
+                 
+    print("\n[DBG] sample_events corruption distribution:")
+    print(sample_events["corruption"].value_counts())
     print(f"\nProcessing {len(sample_events)} failure events...")
     
     for _, event in tqdm(sample_events.iterrows(), total=len(sample_events), desc="Processing events"):
@@ -142,6 +147,7 @@ def main():
         key = (image_id, class_id)
         tiny_obj = tiny_obj_lookup.get(key)
         if not tiny_obj:
+            print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id}")
             continue
         
         frame_rel_path = tiny_obj['frame_path']
@@ -164,6 +170,15 @@ def main():
             image = np.array(Image.open(image_path))
             img_height, img_width = image.shape[:2]
             
+            # DEBUG: Check image shape consistency across severities
+            if severity == 0:
+                baseline_shape = (img_height, img_width)
+                print(f"[DBG] Baseline shape (severity 0): {baseline_shape} for {image_id}")
+            else:
+                current_shape = (img_height, img_width)
+                if current_shape != baseline_shape:
+                    print(f"[DBG] SHAPE MISMATCH: {image_id} severity {severity}: expected {baseline_shape}, got {current_shape}")
+            
             # Generate CAM with fallback layer retry
             cam = None
             visdrone_bbox = tiny_obj['bbox']  # (left, top, width, height) in pixels
@@ -183,6 +198,7 @@ def main():
                     )
                     break  # Success, exit retry loop
                 except (RuntimeError, ValueError) as e:
+                    print(f"[DBG] err_msg={str(e)[:120]}")
                     error_msg = str(e)
                     # Check if it's a shape mismatch error
                     if "Sizes of tensors must match" in error_msg or "Expected size" in error_msg:
@@ -211,29 +227,35 @@ def main():
             if cam is None:
                 continue  # Skip this severity if all layers failed
             
-            # Store baseline (severity 0)
+            # Store baseline (severity 0) - use copy to avoid reference sharing
             if severity == 0:
-                baseline_cam = cam
+                baseline_cam = cam.copy()  # CRITICAL: Copy to avoid reference sharing across corruptions
             
             # Compute metrics
             if baseline_cam is not None:
+                # CRITICAL: Create new metrics dict for each record to avoid reference sharing
                 metrics = compute_cam_metrics(
                     cam,
                     yolo_bbox,
                     img_width,
                     img_height,
-                    baseline_cam=baseline_cam
+                    baseline_cam=baseline_cam.copy()  # Copy baseline to ensure isolation
                 )
                 
-                cam_metrics_records.append({
+                # CRITICAL: Create new dict with explicit values (not references)
+                record = {
                     'model': model_name,
                     'corruption': corruption,
                     'severity': severity,
                     'image_id': image_id,
                     'class_id': class_id,
                     'failure_severity': failure_severity,
-                    **metrics
-                })
+                    'energy_in_bbox': float(metrics['energy_in_bbox']),  # Explicit conversion
+                    'activation_spread': float(metrics['activation_spread']),
+                    'entropy': float(metrics['entropy']),
+                    'center_shift': float(metrics['center_shift']),
+                }
+                cam_metrics_records.append(record)
     
     # Save initial CAM metrics
     if len(cam_metrics_records) > 0:
@@ -352,6 +374,7 @@ def main():
                 key = (image_id, class_id)
                 tiny_obj = tiny_obj_lookup.get(key)
                 if not tiny_obj:
+                    print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id}")
                     continue
                 
                 frame_rel_path = tiny_obj['frame_path']
@@ -363,11 +386,14 @@ def main():
                 
                 baseline_image = np.array(Image.open(baseline_image_path))
                 img_height, img_width = baseline_image.shape[:2]
+                baseline_shape_refined = (img_height, img_width)
+                print(f"[DBG] Refined baseline shape (severity 0): {baseline_shape_refined} for {image_id}")
                 visdrone_bbox = tiny_obj['bbox']
                 yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
                 
                 try:
                     baseline_cam = gradcam.generate_cam(baseline_image, yolo_bbox, class_id)
+                    baseline_cam = baseline_cam.copy()  # CRITICAL: Copy to avoid reference sharing
                 except:
                     continue
                 
@@ -396,6 +422,9 @@ def main():
                     
                     # Load and analyze
                     image = np.array(Image.open(image_path))
+                    current_shape_refined = image.shape[:2]
+                    if current_shape_refined != baseline_shape_refined:
+                        print(f"[DBG] REFINED SHAPE MISMATCH: {image_id} sub_severity {sub_severity}: expected {baseline_shape_refined}, got {current_shape_refined}")
                     
                     # Try CAM generation with fallback layers
                     cam = None
@@ -440,10 +469,11 @@ def main():
                             yolo_bbox,
                             img_width,
                             img_height,
-                            baseline_cam=baseline_cam
+                            baseline_cam=baseline_cam.copy()  # Copy to avoid reference sharing
                         )
                         
-                        refined_records.append({
+                        # CRITICAL: Create new dict with explicit values (not references)
+                        record = {
                             'model': model_name,
                             'corruption': corruption,
                             'severity': sub_severity,
@@ -453,8 +483,12 @@ def main():
                             'refined': True,  # Mark as refined
                             'original_start_sev': start_sev,
                             'original_end_sev': end_sev,
-                            **metrics
-                        })
+                            'energy_in_bbox': float(metrics['energy_in_bbox']),  # Explicit conversion
+                            'activation_spread': float(metrics['activation_spread']),
+                            'entropy': float(metrics['entropy']),
+                            'center_shift': float(metrics['center_shift']),
+                        }
+                        refined_records.append(record)
                     except Exception as e:
                         # Metrics computation error
                         error_records.append({

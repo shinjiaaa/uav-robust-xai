@@ -18,7 +18,7 @@ def main():
     parser.add_argument(
         "--models",
         type=str,
-        default="yolo_generic,yolo_ft,rt_detr",
+        default="yolo_generic",
         help="Models to evaluate (comma-separated)"
     )
     parser.add_argument(

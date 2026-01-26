@@ -51,7 +51,8 @@ class YOLOGradCAM:
     @staticmethod
     def _preprocess_np_image(image: np.ndarray, target_size: int = 640) -> torch.Tensor:
         """image: HxWxC uint8 RGB or BGR. Return: (1,3,H,W) float32 0~1
-        Resize to target_size with stride alignment (YOLO uses stride=32)"""
+        Resize to target_size with stride alignment (YOLO uses stride=32)
+        Uses letterbox padding to match Ultralytics YOLO preprocessing exactly."""
         if image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("Expected HxWx3 image")
         
@@ -61,20 +62,29 @@ class YOLOGradCAM:
         h, w = image.shape[:2]
         
         # Calculate scale to fit target_size while maintaining aspect ratio
+        # This matches Ultralytics YOLO preprocessing exactly
         scale = min(target_size / w, target_size / h)
         new_w = int(w * scale)
         new_h = int(h * scale)
         
-        # Align to stride=32 (YOLO default)
-        stride = 32
-        new_w = (new_w // stride) * stride
-        new_h = (new_h // stride) * stride
-        
-        # Resize image
+        # Resize image (maintain aspect ratio) - no stride alignment before resize
+        # Stride alignment happens naturally after padding to 640x640 (640 is divisible by 32)
         resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         
+        # Letterbox padding to target_size (match Ultralytics YOLO preprocessing exactly)
+        # Create padded image with target_size x target_size (always 640x640)
+        # This ensures consistent input size regardless of original image dimensions
+        padded = np.full((target_size, target_size, 3), 114, dtype=np.uint8)  # 114 = gray padding
+        # Center the resized image
+        top = (target_size - new_h) // 2
+        left = (target_size - new_w) // 2
+        padded[top:top+new_h, left:left+new_w] = resized
+        
+        # Final size is always target_size x target_size (640x640), which is divisible by stride=32
+        # This ensures consistent feature map sizes across all images
+        
         # Convert to tensor: (H, W, C) -> (C, H, W) -> (1, C, H, W)
-        x = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        x = torch.from_numpy(padded).permute(2, 0, 1).unsqueeze(0).float() / 255.0
         return x
 
     def generate_cam(self, image: np.ndarray, yolo_bbox, class_id: int):
@@ -86,7 +96,14 @@ class YOLOGradCAM:
         # 1) grad 활성화 강제 (중요)
         torch.set_grad_enabled(True)
 
+        # DEBUG: Log input image shape before preprocessing
+        input_shape = image.shape[:2]
+        
         x = self._preprocess_np_image(image, target_size=640).to(self.device)
+        # DEBUG: Log preprocessed tensor shape (should ALWAYS be 640x640 after letterbox)
+        preprocessed_shape = x.shape[-2:]  # (H, W)
+        assert preprocessed_shape == (640, 640), f"Preprocessed shape must be (640, 640), got {preprocessed_shape}. Input shape was {input_shape}"
+        
         # CRITICAL: Input must require grad for gradient flow
         x = x.requires_grad_(True)
 

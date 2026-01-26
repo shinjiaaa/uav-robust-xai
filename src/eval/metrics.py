@@ -93,13 +93,32 @@ def evaluate_model_dataset_wide(
         raise ValueError(f"Unknown model type: {model_type}")
     
     # Run validation
-    results = model.val(
-        data=str(dataset_yaml),
-        conf=conf_thres,
-        iou=iou_thres,
-        device=device,
-        verbose=False
-    )
+    # CRITICAL: Set workers=0 on Windows to avoid multiprocessing issues
+    import platform
+    workers = 0 if platform.system() == 'Windows' else 4
+    
+    try:
+        results = model.val(
+            data=str(dataset_yaml),
+            conf=conf_thres,
+            iou=iou_thres,
+            device=device,
+            verbose=False,
+            workers=workers  # Fix Windows multiprocessing issue
+        )
+    except Exception as e:
+        # If validation fails, return error status
+        print(f"ERROR in model.val(): {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'map50': 0.0,
+            'map5095': 0.0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'pred_count': 0,
+            'eval_status': 'error'
+        }
     
     # Extract metrics with NaN handling (empty predictions -> 0.0)
     def safe_float(value, default=0.0):
@@ -115,18 +134,53 @@ def evaluate_model_dataset_wide(
         except (ValueError, TypeError):
             return default
     
-    metrics = {
-        'map50': safe_float(results.box.map50 if hasattr(results.box, 'map50') else None),
-        'map5095': safe_float(results.box.map if hasattr(results.box, 'map') else None),
-        'precision': safe_float(results.box.mp if hasattr(results.box, 'mp') else None),
-        'recall': safe_float(results.box.mr if hasattr(results.box, 'mr') else None),
-    }
-    
-    # Additional info for debugging
-    metrics['pred_count'] = getattr(results.box, 'nc', 0)  # Number of classes (proxy for predictions)
-    metrics['eval_status'] = 'ok'
-    
-    return metrics
+    # Extract metrics with robust error handling
+    try:
+        # Check if results.box exists and has metrics
+        if not hasattr(results, 'box'):
+            print("WARNING: results.box does not exist")
+            return {
+                'map50': 0.0,
+                'map5095': 0.0,
+                'precision': 0.0,
+                'recall': 0.0,
+                'pred_count': 0,
+                'eval_status': 'error'
+            }
+        
+        metrics = {
+            'map50': safe_float(results.box.map50 if hasattr(results.box, 'map50') else None),
+            'map5095': safe_float(results.box.map if hasattr(results.box, 'map') else None),
+            'precision': safe_float(results.box.mp if hasattr(results.box, 'mp') else None),
+            'recall': safe_float(results.box.mr if hasattr(results.box, 'mr') else None),
+        }
+        
+        # Additional info for debugging
+        metrics['pred_count'] = getattr(results.box, 'nc', 0)  # Number of classes (proxy for predictions)
+        metrics['eval_status'] = 'ok'
+        
+        # Debug: Print actual values if they seem wrong
+        if metrics['map50'] == 0.0 and metrics['map5095'] == 0.0:
+            print(f"WARNING: mAP is 0.0. Checking results.box attributes...")
+            print(f"  results.box attributes: {dir(results.box)}")
+            if hasattr(results.box, 'map50'):
+                print(f"  results.box.map50 (raw): {results.box.map50}")
+            if hasattr(results.box, 'map'):
+                print(f"  results.box.map (raw): {results.box.map}")
+        
+        return metrics
+    except Exception as e:
+        print(f"ERROR extracting metrics: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'map50': 0.0,
+            'map5095': 0.0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'pred_count': 0,
+            'eval_status': 'error'
+        }
 
 
 def evaluate_all_models(

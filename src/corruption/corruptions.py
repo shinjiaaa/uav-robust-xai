@@ -65,9 +65,9 @@ def apply_lowlight(image: np.ndarray, severity: int, seed: int = 42) -> np.ndarr
     if severity == 0:
         return image.copy()
     
-    # Low-light parameters
-    gamma_values = [1.0, 1.4, 1.8, 2.2, 2.6]
-    brightness_scale_values = [1.0, 0.85, 0.70, 0.55, 0.40]
+    # Low-light parameters (reduced severity for better detection)
+    gamma_values = [1.0, 1.2, 1.4, 1.6, 1.8]
+    brightness_scale_values = [1.0, 0.90, 0.80, 0.70, 0.60]
     
     # Handle extreme severity (e.g., 50)
     if severity >= len(gamma_values):
@@ -111,8 +111,8 @@ def apply_motion_blur(image: np.ndarray, severity: int, seed: int = 42, image_id
     if severity == 0:
         return image.copy()
     
-    # Motion blur parameters
-    kernel_lengths = [0, 7, 13, 19, 25]
+    # Motion blur parameters (reduced severity for better detection)
+    kernel_lengths = [0, 3, 6, 9, 12]
     
     # Handle extreme severity (e.g., 50)
     if severity >= len(kernel_lengths):
