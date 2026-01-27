@@ -1166,6 +1166,40 @@ def generate_report_with_llm(config: Dict, metrics: Dict) -> str:
 
     prompt = f"""You are a research assistant writing an experiment report. Generate a comprehensive markdown report based on the provided metrics data.
 
+RESEARCH CONTEXT (CRITICAL - 이 연구의 핵심 구조):
+This research investigates whether **internal cognition (CAM) collapses before performance degradation** in object detection under image corruption.
+
+The research has TWO AXES that must be aligned on the TIME AXIS (corruption severity):
+
+1. **Performance Axis (detection_records.csv)**:
+   - detection_records.csv = "Raw evidence log proving when the model starts to become at risk"
+   - This file contains frame-level detection results (matched, is_miss, pred_score, match_iou) for each tiny object across all corruption severities
+   - From this file, we compute:
+     * mAP / Precision / Recall curves (aggregated pred vs gt)
+     * Tiny miss-rate curve (mean(is_miss) by severity)
+     * Score drop curve (mean(delta_score) by severity)
+     * IoU drop curve (mean(delta_iou) by severity)
+     * Failure start point (first is_miss occurrence or sudden drop point) = RISK REGION START
+   - This is the GROUND TRUTH for "when performance degrades"
+
+2. **Cognition Axis (cam_records.csv)**:
+   - CAM (Grad-CAM) metrics show how the model's internal attention/distribution changes
+   - CAM metrics (energy_in_bbox, activation_spread, entropy, center_shift) are computed for the same objects/frames
+   - This shows "how the model's internal cognition changes"
+
+3. **Research Goal**:
+   - Align these TWO AXES on the TIME AXIS (corruption severity 0→4)
+   - Prove: "CAM changes occur BEFORE performance collapse"
+   - This requires detection_records.csv to define the performance degradation timeline FIRST
+   - Then CAM analysis can show if CAM changes precede or co-occur with performance drops
+
+CRITICAL: Without detection_records.csv:
+- Performance degradation timeline is unknown
+- Risk region start point cannot be determined
+- CAM analysis has no reference point
+- Cannot prove "CAM changes before performance collapse"
+- Report becomes mere interpretation/speculation, not evidence-based
+
 IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
 1. DO NOT invent or make up any numbers. Only use the values provided in the metrics data.
 2. If a metric is missing, explicitly state "N/A" or "Data missing" (NOT "Not computed").
@@ -1184,29 +1218,37 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - miss_events, score_drop_events, iou_drop_events are per-corruption, NOT totals
     - DO NOT include "Unified Failure Severity" column in the Failure Summary table
     - Format: | Corruption | Total Events | Miss Events | Score Drop Events | IoU Drop Events |
-12. CRITICAL: Table 2 (Detection Summary / Performance Metrics):
+12. CRITICAL: Table 2 (Detection Summary / Performance Metrics) - THE PERFORMANCE AXIS:
     - REQUIRES detection_records.csv to exist (created by scripts/03_detect_tiny_objects_timeseries.py)
+    - detection_records.csv is the "Performance Axis" - it defines WHEN performance degrades
+    - This file contains frame-level evidence: matched, is_miss, pred_score, match_iou for each tiny object
+    - From this, we compute performance curves and identify risk region start points
     - Check detection_summary.has_data field in the metrics data
     - If detection_summary.has_data is False or missing:
       - DO NOT create Table 2 (Detection Summary / Performance Metrics)
       - DO NOT create any table with "Performance Metrics" or "Detection Summary" in the title
-      - Instead, output ONLY this warning at the top: "⚠️ PERFORMANCE METRICS TABLE SKIPPED: detection_records.csv not found or empty. Please run scripts/03_detect_tiny_objects_timeseries.py to generate this file."
+      - Instead, output ONLY this warning at the top: "⚠️ PERFORMANCE METRICS TABLE SKIPPED: detection_records.csv not found or empty. This file is CRITICAL as it defines the Performance Axis (when performance degrades). Without it, CAM analysis has no reference point. Please run scripts/03_detect_tiny_objects_timeseries.py to generate this file."
       - DO NOT create Table 6 or any other performance table if detection_summary.has_data is False
     - If detection_summary.has_data is True:
       - Create Table 2 with data from detection_records
       - n_objects_total comes from detection_records (sum of all detection records)
       - Report n_objects_by_corruption_severity if available
       - NOT from metrics_dataset.csv pred_count
+      - Emphasize that this table shows the PERFORMANCE TIMELINE (severity 0→4) which is the reference for CAM analysis
     - IMPORTANT: Table 6 (if it exists) should be from dataset metrics, NOT from detection_records. 
       - Table 6 is separate from Table 2 and should only be created if dataset metrics exist
       - If detection_summary.has_data is False, you can still create Table 6 from dataset metrics, but DO NOT call it "Performance Metrics" or "Detection Summary"
-13. CRITICAL: Grad-CAM Analysis Scope (Methods/Limitations):
+13. CRITICAL: Grad-CAM Analysis Scope (Methods/Limitations) - THE COGNITION AXIS:
     - CAM computation is performed only for failure events that satisfy:
-      1) Detection records exist (tiny_records_timeseries.csv)
-      2) Failure event detected (failure_events.csv)
+      1) Detection records exist (detection_records.csv) - THE PERFORMANCE AXIS (defines when performance degrades)
+      2) Failure event detected (failure_events.csv) - identifies which objects/frames to analyze
       3) Successful CAM generation (no shape/device errors)
+    - CAM analysis (THE COGNITION AXIS) must be aligned with detection_records.csv (THE PERFORMANCE AXIS)
+    - CAM metrics show internal cognition changes, which must be compared against performance degradation timeline
+    - The research question is: "Do CAM changes occur BEFORE performance collapse?"
+    - This requires BOTH axes: detection_records.csv (performance) AND cam_records.csv (cognition)
     - If a corruption has failure_events but 0 CAM records, explicitly state:
-      "CAM generation failed for this corruption (see gradcam_errors.csv for details)"
+      "CAM generation failed for this corruption (see gradcam_errors.csv for details). Without CAM data, we cannot compare cognition axis with performance axis."
     - Do NOT claim "no failure events" if failure_events exist but CAM records are 0
 14. CRITICAL: Score/IoU Drop Definition (Methods):
     - Baseline: severity 0 for EACH corruption (corruption-specific baseline)
@@ -1236,6 +1278,17 @@ Experiment Configuration:
 
 Metrics Data (Summarized, JSON format - compact):
 {json.dumps(summarized_metrics, indent=None, separators=(',', ':'))}
+
+REPORT STRUCTURE:
+1. Start with a brief explanation of the TWO-AXIS research structure:
+   - Performance Axis (detection_records.csv): Frame-level detection results showing WHEN performance degrades
+   - Cognition Axis (cam_records.csv): CAM metrics showing HOW internal cognition changes
+   - Research goal: Align these axes on time (severity) to prove "CAM changes before performance collapse"
+
+2. Then generate tables showing:
+   - Table 2: Performance metrics from detection_records.csv (THE PERFORMANCE AXIS)
+   - Table 7: CAM metrics from cam_records.csv (THE COGNITION AXIS)
+   - Alignment analysis: Compare CAM changes with performance degradation timeline
 
 Generate a markdown report with TABLES ONLY. All text descriptions should be commented out with <!-- -->.
 """
