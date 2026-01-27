@@ -129,33 +129,57 @@ def load_metrics(config: Dict) -> Dict:
     tiny_records_csv = results_root / "tiny_records.csv"
     metrics['tiny_records'] = _read_csv_if_exists(tiny_records_csv)
 
-    # Detection records (the name summarize_metrics() uses)
-    # Prefer explicit detection_records.csv if present; else fall back to tiny_records_timeseries.csv or tiny_records.csv.
-    det_records_csv = results_root / "detection_records.csv"
-    if det_records_csv.exists():
-        metrics['detection_records'] = _read_csv_if_exists(det_records_csv)
-    else:
-        # Try timeseries version first (actual file name)
-        timeseries_csv = results_root / "tiny_records_timeseries.csv"
-        if timeseries_csv.exists():
-            metrics['detection_records'] = _read_csv_if_exists(timeseries_csv)
+    # Detection records (prefer detection_records.csv, fallback to tiny_records_timeseries.csv)
+    det_csv = results_root / "detection_records.csv"
+    ts_csv = results_root / "tiny_records_timeseries.csv"
+    
+    if det_csv.exists() and det_csv.stat().st_size > 0:
+        metrics['detection_records'] = _read_csv_if_exists(det_csv)
+        if not metrics['detection_records'] or len(metrics['detection_records']) == 0:
+            print("[WARN] detection_records.csv exists but is empty")
+            metrics['detection_records'] = []
         else:
-            metrics['detection_records'] = metrics.get('tiny_records', [])
+            print(f"[INFO] Loaded {len(metrics['detection_records'])} records from detection_records.csv")
+    elif ts_csv.exists() and ts_csv.stat().st_size > 0:
+        print("[WARN] detection_records.csv not found, using tiny_records_timeseries.csv as fallback")
+        metrics['detection_records'] = _read_csv_if_exists(ts_csv)
+        if metrics['detection_records']:
+            print(f"[INFO] Loaded {len(metrics['detection_records'])} records from tiny_records_timeseries.csv")
+    else:
+        print("[ERROR] Neither detection_records.csv nor tiny_records_timeseries.csv found.")
+        print("[ERROR] Performance Metrics table will be skipped.")
+        metrics['detection_records'] = []
+    
+    # tiny_records_timeseries.csv is kept separately for backward compatibility/CAM analysis
+    if ts_csv.exists():
+        metrics['tiny_records_timeseries'] = _read_csv_if_exists(ts_csv)
+    else:
+        metrics['tiny_records_timeseries'] = []
 
     # Grad-CAM metrics (legacy key)
     gradcam_csv = results_root / "gradcam_metrics.csv"
     metrics['gradcam'] = _read_csv_if_exists(gradcam_csv)
 
     # CAM metrics (the name summarize_metrics() uses)
-    # Prefer cam_metrics.csv if present; else try gradcam_metrics_timeseries.csv (actual file name); else use gradcam_metrics.csv.
+    # CRITICAL: Prefer cam_records.csv (new format with cam_status) over legacy files
+    # Legacy files (gradcam_metrics_timeseries.csv) may contain stale data from previous runs
+    cam_records_csv = results_root / "cam_records.csv"
+    if cam_records_csv.exists():
+        metrics['cam_records'] = _read_csv_if_exists(cam_records_csv)
+        print(f"[INFO] Loaded {len(metrics['cam_records'])} records from cam_records.csv")
+    else:
+        metrics['cam_records'] = []
+    
+    # Legacy CAM metrics (for backward compatibility, but NOT used for Table 7)
     cam_metrics_csv = results_root / "cam_metrics.csv"
     if cam_metrics_csv.exists():
         metrics['cam_metrics'] = _read_csv_if_exists(cam_metrics_csv)
     else:
-        # Try timeseries version (actual file name)
+        # Try timeseries version (actual file name) - but this is legacy, may be stale
         timeseries_cam_csv = results_root / "gradcam_metrics_timeseries.csv"
         if timeseries_cam_csv.exists():
             metrics['cam_metrics'] = _read_csv_if_exists(timeseries_cam_csv)
+            print(f"[WARN] Using legacy gradcam_metrics_timeseries.csv (may contain stale data)")
         else:
             metrics['cam_metrics'] = metrics.get('gradcam', [])
 
@@ -268,11 +292,42 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         # not len(sev_df) which is just the number of CSV rows
                         # If metrics_dataset.csv has only 1 row per severity, pred_count indicates actual dataset size
                         n_frames_total = int(sev_df['pred_count'].iloc[0]) if len(sev_df) > 0 and pd.notna(sev_df['pred_count'].iloc[0]) else len(sev_df)
-                        n_frames_valid = len(valid_df)  # Number of valid CSV rows (usually 1 if subset evaluation)
+                        
+                        # CRITICAL: n_frames_valid should use detection_records.csv, not metrics_dataset.csv rows
+                        # metrics_dataset.csv has 1 row per severity, but detection_records.csv has actual frame-level data
+                        if detection_records_df is not None and len(detection_records_df) > 0:
+                            # Filter detection_records for this corruption/severity
+                            det_sev_df = detection_records_df[
+                                (detection_records_df['corruption'] == corruption) & 
+                                (detection_records_df['severity'] == severity)
+                            ]
+                            if 'frame_id' in det_sev_df.columns:
+                                n_frames_valid = det_sev_df['frame_id'].nunique()
+                            elif 'image_id' in det_sev_df.columns:
+                                n_frames_valid = det_sev_df['image_id'].nunique()
+                            else:
+                                n_frames_valid = len(det_sev_df)  # Fallback
+                        else:
+                            n_frames_valid = len(valid_df)  # Fallback: Number of valid CSV rows (usually 1 if subset evaluation)
+                        
                         valid_ratio = float(n_frames_valid / n_frames_total) if n_frames_total > 0 else 0.0
                     else:
                         n_frames_total = len(sev_df)
-                        n_frames_valid = n_frames_total if not eval_failed else 0
+                        # CRITICAL: n_frames_valid should use detection_records.csv, not metrics_dataset.csv rows
+                        if detection_records_df is not None and len(detection_records_df) > 0:
+                            # Filter detection_records for this corruption/severity
+                            det_sev_df = detection_records_df[
+                                (detection_records_df['corruption'] == corruption) & 
+                                (detection_records_df['severity'] == severity)
+                            ]
+                            if 'frame_id' in det_sev_df.columns:
+                                n_frames_valid = det_sev_df['frame_id'].nunique()
+                            elif 'image_id' in det_sev_df.columns:
+                                n_frames_valid = det_sev_df['image_id'].nunique()
+                            else:
+                                n_frames_valid = len(det_sev_df)  # Fallback
+                        else:
+                            n_frames_valid = n_frames_total if not eval_failed else 0
                         valid_ratio = 1.0 if not eval_failed else 0.0
                         valid_df = sev_df.copy() if n_frames_valid > 0 else pd.DataFrame()
 
@@ -342,12 +397,11 @@ def summarize_metrics(metrics: Dict) -> Dict:
 
     # ----------------------------
     # Detection records summary (Table 2)
-    # NOTE: detection_records is already loaded at the beginning of summarize_metrics
-    # CRITICAL: This is from tiny_records_timeseries.csv (per-object per-severity records)
-    # NOT from metrics_dataset.csv (dataset-wide mAP)
+    # CRITICAL: detection_records.csv MUST exist for Performance Metrics table
+    # NO FALLBACK: If missing, Table 2 will be skipped with explicit warning
     # ----------------------------
     # detection_records is already available from metrics.get('detection_records', []) at function start
-    if detection_records:
+    if detection_records and len(detection_records) > 0:
         df = pd.DataFrame(detection_records)
 
         # CRITICAL: Calculate actual object counts per corruption/severity
@@ -361,9 +415,24 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     sev_df = corr_df[corr_df['severity'] == severity]
                     n_objects_by_corruption_severity[corruption][severity] = len(sev_df)
 
+        # CRITICAL: Calculate n_frames_valid using frame_id (or image_id as fallback)
+        # This counts unique frames, not total records (objects × severities)
+        if 'frame_id' in df.columns:
+            n_frames_valid = df['frame_id'].nunique()
+            frame_count_column = 'frame_id'
+        elif 'image_id' in df.columns:
+            n_frames_valid = df['image_id'].nunique()
+            frame_count_column = 'image_id'
+        else:
+            # Fallback: if neither exists, use total records (legacy behavior)
+            n_frames_valid = len(df)
+            frame_count_column = 'total_records'
+        
         overall_summary = {
             'total_records': len(detection_records),
             'n_objects_total': len(detection_records),  # Total detection records (objects × severities)
+            'n_frames_valid': int(n_frames_valid),  # Unique frames (frame_id or image_id based)
+            'frame_count_column': frame_count_column,  # Which column was used for counting
             'by_model': df.groupby('model').size().to_dict() if 'model' in df.columns else {},
             'by_corruption': df.groupby('corruption').size().to_dict() if 'corruption' in df.columns else {},
             'by_severity': df.groupby('severity').size().to_dict() if 'severity' in df.columns else {},
@@ -384,8 +453,22 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 }
 
         summarized['detection_summary'] = {**overall_summary, 'per_corruption': per_corruption}
+        summarized['detection_summary']['has_data'] = True
     else:
-        summarized['detection_summary'] = {}
+        # CRITICAL: No detection_records - Table 2 (Performance Metrics) will be skipped
+        # But check if data actually exists (may have been loaded from fallback file)
+        if len(detection_records) == 0:
+            summarized['detection_summary'] = {
+                'has_data': False,
+                'error': 'detection_records not found or empty',
+                'message': 'Performance Metrics table (Table 2) cannot be generated without detection records. Please run scripts/03_detect_tiny_objects_timeseries.py to generate this file.'
+            }
+        else:
+            # Data exists (may be from fallback file), but mark as available
+            summarized['detection_summary'] = {
+                'has_data': True,
+                'note': 'Data loaded (may be from fallback file)'
+            }
 
     # ----------------------------
     # Tiny curves pass-through
@@ -434,7 +517,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 'miss_events': int(miss_events),
                 'score_drop_events': int(score_drop_events),
                 'iou_drop_events': int(iou_drop_events),
-                'unified_failure_severity': unified_failure_sev,
+                # Removed 'unified_failure_severity' - not shown in Failure Summary table
                 'failure_severity_definition': 'First miss occurrence severity (minimum first_miss_severity)',
                 'first_miss_severity': {
                     'min': float(corr_df['first_miss_severity'].min()) if 'first_miss_severity' in corr_df.columns and corr_df['first_miss_severity'].notna().any() else None,
@@ -517,12 +600,38 @@ def summarize_metrics(metrics: Dict) -> Dict:
     # CAM metrics + pattern analyses
     # CRITICAL: Only include corruptions that have actual detection records
     # ----------------------------
-    cam_metrics = metrics.get('cam_metrics', [])
+    # CRITICAL: Use cam_records.csv (new format) instead of legacy cam_metrics
+    cam_records = metrics.get('cam_records', [])
+    cam_metrics = metrics.get('cam_metrics', [])  # Legacy fallback
     det_df = pd.DataFrame(detection_records) if detection_records else pd.DataFrame()
     fail_df = pd.DataFrame(failure_events) if failure_events else pd.DataFrame()
 
-    if cam_metrics and detection_records:
+    # Prefer cam_records.csv if available (has cam_status and layer_role)
+    if cam_records and len(cam_records) > 0:
+        cam_records_df = pd.DataFrame(cam_records)
+        if 'cam_status' in cam_records_df.columns:
+            # Filter by cam_status='ok' AND layer_role='primary'
+            if 'layer_role' in cam_records_df.columns:
+                cam_df = cam_records_df[
+                    (cam_records_df['cam_status'] == 'ok') & 
+                    (cam_records_df['layer_role'] == 'primary')
+                ].copy()
+            else:
+                cam_df = cam_records_df[cam_records_df['cam_status'] == 'ok'].copy()
+        else:
+            cam_df = cam_records_df.copy()
+        has_cam_data = len(cam_df) > 0
+        print(f"[INFO] Using cam_records.csv for CAM analysis ({len(cam_df)} OK primary records)")
+    elif cam_metrics and len(cam_metrics) > 0:
+        # Fallback to legacy format (may contain stale data)
         cam_df = pd.DataFrame(cam_metrics)
+        has_cam_data = len(cam_df) > 0
+        print(f"[WARN] Using legacy CAM metrics format (may contain stale data)")
+    else:
+        cam_df = pd.DataFrame()
+        has_cam_data = False
+
+    if has_cam_data and detection_records:
 
         cam_metrics_list = ['energy_in_bbox', 'activation_spread', 'entropy', 'center_shift']
         all_expected_corruptions = ['fog', 'lowlight', 'motion_blur']
@@ -532,6 +641,29 @@ def summarize_metrics(metrics: Dict) -> Dict:
         # CRITICAL: Only include corruptions that have actual detection records
         cam_metrics_by_corruption_severity: Dict[str, Dict[int, Dict]] = {}
         
+        # CRITICAL: Use cam_records.csv (new format) instead of legacy gradcam_metrics_timeseries.csv
+        # cam_records.csv has cam_status and layer_role fields for accurate filtering
+        cam_records = metrics.get('cam_records', [])
+        cam_records_df = pd.DataFrame(cam_records) if cam_records else pd.DataFrame()
+        
+        # If cam_records.csv exists, use it; otherwise fall back to legacy cam_metrics
+        if len(cam_records_df) > 0 and 'cam_status' in cam_records_df.columns:
+            # Use new format: filter by cam_status='ok' AND layer_role='primary'
+            if 'layer_role' in cam_records_df.columns:
+                cam_df = cam_records_df[
+                    (cam_records_df['cam_status'] == 'ok') & 
+                    (cam_records_df['layer_role'] == 'primary')
+                ].copy()
+            else:
+                # Fallback: if layer_role doesn't exist, just filter by cam_status
+                cam_df = cam_records_df[cam_records_df['cam_status'] == 'ok'].copy()
+            print(f"[INFO] Using cam_records.csv for Table 7 ({len(cam_df)} OK primary records)")
+        else:
+            # Fallback to legacy format (may contain stale data)
+            cam_df = pd.DataFrame(cam_metrics) if cam_metrics else pd.DataFrame()
+            if len(cam_df) > 0:
+                print(f"[WARN] Using legacy CAM metrics format (may contain stale data)")
+
         # Get corruptions that actually have detection records (data consistency check)
         # Use the same available_corruptions_from_det from dataset metrics section
         # (already computed at the beginning of summarize_metrics)
@@ -559,7 +691,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     }
                 continue
             
-            corr_cam = cam_df[cam_df['corruption'] == corruption].copy() if 'corruption' in cam_df.columns and corruption in cam_df['corruption'].unique() else pd.DataFrame()
+            corr_cam = cam_df[cam_df['corruption'] == corruption].copy() if 'corruption' in cam_df.columns and len(cam_df) > 0 and corruption in cam_df['corruption'].unique() else pd.DataFrame()
             cam_metrics_by_corruption_severity[corruption] = {}
             
             # Get failure severity for this corruption
@@ -569,15 +701,27 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 for sev in all_severities:
                     sev_cam = corr_cam[corr_cam['severity'] == sev].copy()
                     if len(sev_cam) > 0:
-                        n_cam_frames = len(sev_cam)
+                        # CRITICAL: Only count cam_status == "ok" as valid CAM frames
+                        # (If using cam_records.csv, this is already filtered, but double-check for legacy data)
+                        if 'cam_status' in sev_cam.columns:
+                            sev_cam_ok = sev_cam[sev_cam['cam_status'] == 'ok'].copy()
+                            n_cam_frames = len(sev_cam_ok)
+                            # Use only OK records for metric computation
+                            metric_df = sev_cam_ok
+                        else:
+                            # Fallback: if cam_status column doesn't exist, count all (legacy data)
+                            n_cam_frames = len(sev_cam)
+                            metric_df = sev_cam
+                        
+                        # Compute metrics only from OK records
                         cam_metrics_by_corruption_severity[corruption][sev] = {
-                            'energy_in_bbox_mean': float(sev_cam['energy_in_bbox'].mean()) if 'energy_in_bbox' in sev_cam.columns else None,
-                            'activation_spread_mean': float(sev_cam['activation_spread'].mean()) if 'activation_spread' in sev_cam.columns else None,
-                            'entropy_mean': float(sev_cam['entropy'].mean()) if 'entropy' in sev_cam.columns else None,
-                            'center_shift_mean': float(sev_cam['center_shift'].mean()) if 'center_shift' in sev_cam.columns else None,
+                            'energy_in_bbox_mean': float(metric_df['energy_in_bbox'].mean()) if 'energy_in_bbox' in metric_df.columns and len(metric_df) > 0 else None,
+                            'activation_spread_mean': float(metric_df['activation_spread'].mean()) if 'activation_spread' in metric_df.columns and len(metric_df) > 0 else None,
+                            'entropy_mean': float(metric_df['entropy'].mean()) if 'entropy' in metric_df.columns and len(metric_df) > 0 else None,
+                            'center_shift_mean': float(metric_df['center_shift'].mean()) if 'center_shift' in metric_df.columns and len(metric_df) > 0 else None,
                             'n_cam_frames': int(n_cam_frames),
                             'failure_severity': unified_failure_sev,  # Add failure_severity
-                            'note': f'Computed from {n_cam_frames} CAM frames'
+                            'note': f'Computed from {n_cam_frames} CAM frames (cam_status=ok only)' if n_cam_frames > 0 else 'N/A (no valid CAM frames, all failed)'
                         }
                     else:
                         cam_metrics_by_corruption_severity[corruption][sev] = {
@@ -1038,10 +1182,24 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - Each corruption (fog, lowlight, motion_blur) has DIFFERENT event counts
     - DO NOT sum across corruptions - report by_corruption_detail values for each corruption separately
     - miss_events, score_drop_events, iou_drop_events are per-corruption, NOT totals
-12. CRITICAL: Table 2 (Detection Summary) n_objects_total comes from detection_records (tiny_records_timeseries.csv):
-    - Total should be sum of all detection records (typically 1500 for 100 objects × 5 severities × 3 corruptions)
-    - NOT from metrics_dataset.csv pred_count
-    - Report n_objects_by_corruption_severity if available
+    - DO NOT include "Unified Failure Severity" column in the Failure Summary table
+    - Format: | Corruption | Total Events | Miss Events | Score Drop Events | IoU Drop Events |
+12. CRITICAL: Table 2 (Detection Summary / Performance Metrics):
+    - REQUIRES detection_records.csv to exist (created by scripts/03_detect_tiny_objects_timeseries.py)
+    - Check detection_summary.has_data field in the metrics data
+    - If detection_summary.has_data is False or missing:
+      - DO NOT create Table 2 (Detection Summary / Performance Metrics)
+      - DO NOT create any table with "Performance Metrics" or "Detection Summary" in the title
+      - Instead, output ONLY this warning at the top: "⚠️ PERFORMANCE METRICS TABLE SKIPPED: detection_records.csv not found or empty. Please run scripts/03_detect_tiny_objects_timeseries.py to generate this file."
+      - DO NOT create Table 6 or any other performance table if detection_summary.has_data is False
+    - If detection_summary.has_data is True:
+      - Create Table 2 with data from detection_records
+      - n_objects_total comes from detection_records (sum of all detection records)
+      - Report n_objects_by_corruption_severity if available
+      - NOT from metrics_dataset.csv pred_count
+    - IMPORTANT: Table 6 (if it exists) should be from dataset metrics, NOT from detection_records. 
+      - Table 6 is separate from Table 2 and should only be created if dataset metrics exist
+      - If detection_summary.has_data is False, you can still create Table 6 from dataset metrics, but DO NOT call it "Performance Metrics" or "Detection Summary"
 13. CRITICAL: Grad-CAM Analysis Scope (Methods/Limitations):
     - CAM computation is performed only for failure events that satisfy:
       1) Detection records exist (tiny_records_timeseries.csv)
@@ -1062,7 +1220,7 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - This tracks CAM distribution changes as corruption severity increases up to failure point
 16. CRITICAL: CAM Metrics Table MUST include failure_severity column:
     - The "CAM Metrics by Corruption Severity" table MUST have a "failure_severity" column
-    - failure_severity is the unified failure severity for the ENTIRE corruption (same value for all severities of the same corruption)
+    - failure_severity is the failure severity for the ENTIRE corruption (same value for all severities of the same corruption)
     - failure_severity comes from cam_metrics_by_corruption_severity[corruption][severity]['failure_severity']
     - If n_cam_frames=0, still show failure_severity if it exists (do NOT mark as N/A)
     - Format: | Corruption | Severity | n_cam_frames | failure_severity | Energy in BBox Mean | Activation Spread Mean | Entropy Mean | Center Shift Mean |

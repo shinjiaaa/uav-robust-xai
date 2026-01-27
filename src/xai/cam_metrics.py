@@ -151,27 +151,57 @@ def compute_center_shift(
 
 def compute_cam_metrics(
     cam: np.ndarray,
-    bbox: Tuple[float, float, float, float],
-    img_width: int,
-    img_height: int,
+    bbox_xyxy: Tuple[float, float, float, float],
+    cam_shape: Tuple[int, int],
+    letterbox_meta: Dict = None,
     baseline_cam: np.ndarray = None
 ) -> Dict[str, float]:
-    """Compute all CAM distribution metrics.
+    """Compute all CAM distribution metrics (layer-invariant).
     
     Args:
         cam: Current CAM heatmap (H, W)
-        bbox: GT bbox (x_center, y_center, width, height) normalized
-        img_width: Image width
-        img_height: Image height
+        bbox_xyxy: GT bbox (x1, y1, x2, y2) in original image pixels
+        cam_shape: (cam_height, cam_width) CAM map dimensions
+        letterbox_meta: Optional dict with letterbox transformation info
+            If None, assumes CAM is same size as original image
         baseline_cam: Baseline CAM for comparison (optional)
         
     Returns:
         Dictionary of metrics
     """
+    from src.data.bbox_conversion import map_bbox_to_cam
+    
     metrics = {}
     
+    # Map bbox to CAM coordinates
+    cam_h, cam_w = cam_shape
+    if letterbox_meta is not None:
+        # Use letterbox metadata for accurate mapping
+        img_shape = (letterbox_meta.get('original_width', cam_w), 
+                     letterbox_meta.get('original_height', cam_h))
+        bbox_cam = map_bbox_to_cam(bbox_xyxy, img_shape, cam_shape, letterbox_meta)
+    else:
+        # Direct scaling (no letterbox)
+        img_w = letterbox_meta.get('original_width', cam_w) if letterbox_meta else cam_w
+        img_h = letterbox_meta.get('original_height', cam_h) if letterbox_meta else cam_h
+        scale_w = cam_w / img_w
+        scale_h = cam_h / img_h
+        x1, y1, x2, y2 = bbox_xyxy
+        bbox_cam = (x1 * scale_w, y1 * scale_h, x2 * scale_w, y2 * scale_h)
+    
+    # Convert bbox_cam (x1, y1, x2, y2) to normalized center format for energy computation
+    x1_cam, y1_cam, x2_cam, y2_cam = bbox_cam
+    x_center_cam = (x1_cam + x2_cam) / 2
+    y_center_cam = (y1_cam + y2_cam) / 2
+    width_cam = x2_cam - x1_cam
+    height_cam = y2_cam - y1_cam
+    
+    # Normalize to [0, 1] for energy computation
+    bbox_norm = (x_center_cam / cam_w, y_center_cam / cam_h, 
+                 width_cam / cam_w, height_cam / cam_h)
+    
     # Energy in bbox
-    metrics['energy_in_bbox'] = compute_energy_in_bbox(cam, bbox, img_width, img_height)
+    metrics['energy_in_bbox'] = compute_energy_in_bbox(cam, bbox_norm, cam_w, cam_h)
     
     # Activation spread
     metrics['activation_spread'] = compute_activation_spread(cam)

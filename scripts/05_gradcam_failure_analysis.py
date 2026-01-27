@@ -15,9 +15,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.xai.gradcam_yolo import YOLOGradCAM
 from src.xai.cam_metrics import compute_cam_metrics
+from src.xai.cam_qc import get_qc_status
+from src.xai.cam_extraction import extract_cam_multi_layer
+from src.xai.cam_records import create_cam_record, save_cam_records
 from src.xai.dynamic_refinement import detect_failure_region, generate_subdivided_severities
 from src.corruption.corruptions import corrupt_image
-from src.data.bbox_conversion import visdrone_to_yolo_bbox, get_image_dimensions
+from src.data.bbox_conversion import visdrone_to_yolo_bbox, get_image_dimensions, extract_letterbox_meta
 from src.utils.io import load_yaml, load_json
 from src.utils.seed import set_seed
 from ultralytics import YOLO
@@ -77,8 +80,11 @@ def main():
     corruptions_root = Path(config['dataset']['corruptions_root'])
     
     gradcam_config = config['gradcam']
+    layer_config = gradcam_config.get('layers', {})
+    qc_config = gradcam_config.get('quality_gate', {})
     
-    cam_metrics_records = []
+    # New schema: cam_records (replaces cam_metrics_records)
+    cam_records = []
     error_count = 0  # Initialize error counter
     error_records = []  # Store error details for analysis
     device_checked = False  # Flag to print device info once
@@ -111,8 +117,55 @@ def main():
         model_path = model_config['pretrained']
     
     print(f"\nLoading model: {model_path}")
-    yolo = YOLO(model_path)
-    torch_model = yolo.model
+    
+    # CRITICAL: Check file access with retry logic
+    max_retries = 3
+    retry_delay = 2.0
+    
+    for attempt in range(max_retries):
+        try:
+            # Check if model file is accessible
+            if not Path(model_path).exists():
+                print(f"[ERROR] Model file not found: {model_path}")
+                sys.exit(1)
+            
+            # Try to open file to check if it's locked
+            try:
+                with open(model_path, 'rb') as f:
+                    f.read(1)  # Try to read first byte
+            except (OSError, IOError, PermissionError) as e:
+                if attempt < max_retries - 1:
+                    import time
+                    print(f"[WARN] Model file locked (attempt {attempt+1}/{max_retries}), waiting {retry_delay}s...")
+                    print(f"[WARN] If this persists, run: python scripts/kill_python_processes.py")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                else:
+                    print(f"[ERROR] Cannot access model file (may be locked by another process): {model_path}")
+                    print(f"[ERROR] Error: {e}")
+                    print(f"[ERROR] Please run: python scripts/kill_python_processes.py")
+                    sys.exit(1)
+            
+            # Load model with explicit task specification
+            yolo = YOLO(model_path, task='detect')
+            torch_model = yolo.model
+            break  # Success
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            if attempt < max_retries - 1:
+                import time
+                print(f"[WARN] Model loading failed (attempt {attempt+1}/{max_retries}), retrying...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                if "cannot access" in error_msg or "being used" in error_msg or "locked" in error_msg or "permission" in error_msg:
+                    print(f"[ERROR] Model file access denied: {model_path}")
+                    print(f"[ERROR] Another process may be using this model file")
+                    print(f"[ERROR] Please run: python scripts/kill_python_processes.py")
+                    sys.exit(1)
+                raise
     
     # CRITICAL: Force model to GPU if available to reduce CPU RAM usage
     if torch.cuda.is_available():
@@ -124,31 +177,30 @@ def main():
         print(f"  Model on CPU (GPU not available)")
         print(f"  [WARN] CPU mode will use more RAM - ensure sufficient memory")
     
-    # Fallback layer candidates (most stable first)
-    target_layer_candidates = [
-        gradcam_config['target_layer'],  # Primary: model.18.cv2.conv
-        "model.18.cv2.conv",  # Explicit backup
-        "model.16.conv",  # Alternative backbone layer
-        "model.19.conv",  # Another backbone option
-    ]
-    
-    # Initialize Grad-CAM once with explicit device
-    gradcam = None
+    # Stage B: Initialize Grad-CAM for multiple layers (primary/secondary)
     device_str = str(device) if 'device' in locals() else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    for layer_name in target_layer_candidates:
+    gradcam_instances = {}
+    
+    for layer_role, layer_info in layer_config.items():
+        layer_name = layer_info['name']
+        required = layer_info.get('required', True)
+        
         try:
             gradcam = YOLOGradCAM(torch_model, target_layer_name=layer_name, device=device_str)
             actual_device = next(gradcam.model.parameters()).device
-            print(f"  CAM model device: {actual_device}")
-            print(f"  Using target layer: {layer_name}")
-            break
+            gradcam_instances[layer_role] = gradcam
+            print(f"  [{layer_role.upper()}] CAM model device: {actual_device}")
+            print(f"  [{layer_role.upper()}] Using target layer: {layer_name}")
         except Exception as e:
-            if layer_name == target_layer_candidates[-1]:  # Last candidate failed
-                print(f"  [ERROR] Failed to initialize Grad-CAM with all fallback layers: {e}")
+            if required:
+                print(f"  [ERROR] Failed to initialize required {layer_role} layer {layer_name}: {e}")
                 sys.exit(1)
+            else:
+                print(f"  [WARN] Failed to initialize optional {layer_role} layer {layer_name}: {e}")
+                print(f"  [WARN] Continuing without {layer_role} layer")
     
-    if gradcam is None:
-        print("[ERROR] Failed to initialize Grad-CAM")
+    if len(gradcam_instances) == 0:
+        print("[ERROR] Failed to initialize any Grad-CAM layers")
         sys.exit(1)
     
     for _, event in tqdm(sample_events.iterrows(), total=len(sample_events), desc="Processing events"):
@@ -171,7 +223,8 @@ def main():
         frame_rel_path = tiny_obj['frame_path']
         
         # Process each severity up to failure severity
-        baseline_cam = None
+        # Store baseline CAMs per layer (primary/secondary)
+        baseline_cams = {}  # {layer_role: cam}
         
         for severity in range(0, failure_severity + 1):
             # Get image path
@@ -192,8 +245,9 @@ def main():
                     w, h = pil_image.size
                     pixel_count = w * h
                     
-                    # Skip if image is too large (safety check)
-                    if pixel_count > 40_000_000:  # 40MP limit
+                    # CRITICAL: Very aggressive size limit for memory-constrained systems
+                    MAX_PIXELS = 10_000_000  # Reduced to 10MP for low-memory systems
+                    if pixel_count > MAX_PIXELS:
                         print(f"  [WARN] Image too large ({w}x{h}={pixel_count} pixels): {image_path}")
                         error_records.append({
                             'model': model_name,
@@ -203,13 +257,15 @@ def main():
                             'severity': severity,
                             'failure_severity': failure_severity,
                             'error_type': 'ImageTooLarge',
-                            'error_message': f'Image size {w}x{h} exceeds 40MP limit',
-                            'target_layer': gradcam_config['target_layer']
+                            'error_message': f'Image size {w}x{h} exceeds {MAX_PIXELS//1_000_000}MP limit',
+                            'target_layer': layer_config.get('primary', {}).get('name', 'unknown'),
+                            'exc_type': 'ImageTooLarge',
+                            'exc_msg': f'Image size {w}x{h} exceeds {MAX_PIXELS//1_000_000}MP limit'
                         })
                         continue
                     
-                    # Resize if too large (max side 1280px to reduce memory)
-                    MAX_SIDE = 1280
+                    # CRITICAL: Very aggressive resizing for memory-constrained systems
+                    MAX_SIDE = 800  # Reduced to 800px to minimize memory usage
                     scale = MAX_SIDE / max(w, h) if max(w, h) > MAX_SIDE else 1.0
                     if scale < 1.0:
                         new_w, new_h = int(w * scale), int(h * scale)
@@ -227,6 +283,8 @@ def main():
                 # PIL image is automatically closed by context manager
                 # Explicit cleanup
                 del pil_image
+                # Force immediate garbage collection
+                gc.collect()
                 
             except MemoryError as e:
                 print(f"  [ERROR] CPU Memory error loading image {image_path}: {e}")
@@ -239,7 +297,9 @@ def main():
                     'failure_severity': failure_severity,
                     'error_type': 'CPU_MemoryError',
                     'error_message': str(e)[:200],
-                    'target_layer': gradcam_config['target_layer']
+                    'target_layer': layer_config.get('primary', {}).get('name', 'unknown'),
+                    'exc_type': type(e).__name__,
+                    'exc_msg': str(e)[:200]
                 })
                 # Clean up and skip
                 gc.collect()
@@ -256,7 +316,9 @@ def main():
                     'failure_severity': failure_severity,
                     'error_type': type(e).__name__,
                     'error_message': str(e)[:200],
-                    'target_layer': gradcam_config['target_layer']
+                    'target_layer': layer_config.get('primary', {}).get('name', 'unknown'),
+                    'exc_type': type(e).__name__,
+                    'exc_msg': str(e)[:200]
                 })
                 gc.collect()
                 continue
@@ -270,149 +332,190 @@ def main():
                 if current_shape != baseline_shape:
                     print(f"[DBG] SHAPE MISMATCH: {image_id} severity {severity}: expected {baseline_shape}, got {current_shape}")
             
-            # Generate CAM with fallback layer retry
-            cam = None
+            # Stage B: Extract CAM from multiple layers (primary/secondary)
             visdrone_bbox = tiny_obj['bbox']  # (left, top, width, height) in pixels
             yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
-
-            # Try to generate CAM (gradcam is already initialized)
-            try:
-                cam = gradcam.generate_cam(
-                    image,
-                    yolo_bbox,
-                    class_id
-                )
-                # CRITICAL: Force garbage collection after CAM generation to free graph memory
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except torch.cuda.OutOfMemoryError as e:
-                # CUDA OOM
-                print(f"[DBG] CUDA OOM: {str(e)[:120]}")
-                error_msg = str(e)
-                error_count += 1
-                if error_count <= 5:
-                    print(f"  [WARN] CUDA OOM for {image_id} severity {severity}: {e}")
-                
-                error_records.append({
-                    'model': model_name,
-                    'corruption': corruption,
-                    'image_id': image_id,
-                    'class_id': class_id,
-                    'severity': severity,
-                    'failure_severity': failure_severity,
-                    'error_type': 'CUDA_OOM',
-                    'error_message': error_msg[:200],
-                    'target_layer': gradcam_config['target_layer']
-                })
-                # Clean up and continue
-                del image
-                gc.collect()
+            
+            # Extract CAMs from all configured layers
+            cam_results = extract_cam_multi_layer(
+                gradcam_instances,
+                image,
+                yolo_bbox,
+                class_id,
+                layer_config,
+                qc_config
+            )
+            
+            # CRITICAL: Force garbage collection after CAM generation
+            gc.collect()
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                continue
-            except MemoryError as e:
-                # CPU RAM OOM
-                print(f"[DBG] CPU MemoryError: {str(e)[:120]}")
-                error_msg = str(e)
-                error_count += 1
-                if error_count <= 5:
-                    print(f"  [WARN] CPU MemoryError for {image_id} severity {severity}: {e}")
+            
+            # Process each layer's CAM result
+            for layer_role, layer_result in cam_results.items():
+                cam = layer_result['cam']
+                cam_status = layer_result['cam_status']
+                fail_reason = layer_result['fail_reason']
+                letterbox_meta = layer_result['letterbox_meta']
+                cam_shape = layer_result['cam_shape']
                 
-                error_records.append({
-                    'model': model_name,
-                    'corruption': corruption,
-                    'image_id': image_id,
-                    'class_id': class_id,
-                    'severity': severity,
-                    'failure_severity': failure_severity,
-                    'error_type': 'CPU_MemoryError',
-                    'error_message': error_msg[:200],
-                    'target_layer': gradcam_config['target_layer']
-                })
-                # Clean up and continue
-                del image
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
-            except (RuntimeError, ValueError) as e:
-                # Other runtime errors
-                print(f"[DBG] RuntimeError: {str(e)[:120]}")
-                error_msg = str(e)
-                error_count += 1
-                if error_count <= 5:
-                    print(f"  [WARN] Failed to generate CAM for {image_id} severity {severity}: {e}")
+                # Extract QC diagnostic stats for debugging
+                cam_min = layer_result.get('cam_min')
+                cam_max = layer_result.get('cam_max')
+                cam_sum = layer_result.get('cam_sum')
+                cam_var = layer_result.get('cam_var')
+                cam_std = layer_result.get('cam_std')  # 추가: std for QC
+                cam_dtype = layer_result.get('cam_dtype')
+                finite_ratio = layer_result.get('finite_ratio')
+                preprocessed_shape = layer_result.get('preprocessed_shape')
                 
-                error_records.append({
-                    'model': model_name,
-                    'corruption': corruption,
-                    'image_id': image_id,
-                    'class_id': class_id,
-                    'severity': severity,
-                    'failure_severity': failure_severity,
-                    'error_type': type(e).__name__,
-                    'error_message': error_msg[:200],
-                    'target_layer': gradcam_config['target_layer']
-                })
-                # Clean up and continue
-                del image
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
-            if cam is None:
-                # Clean up memory before continuing
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue  # Skip this severity if all layers failed
-            
-            # Store baseline (severity 0) - use copy to avoid reference sharing
-            if severity == 0:
-                baseline_cam = cam.copy()  # CRITICAL: Copy to avoid reference sharing across corruptions
-                # Force garbage collection after baseline creation
-                gc.collect()
-            
-            # Compute metrics
-            metrics = None
-            if baseline_cam is not None:
-                # CRITICAL: Create new metrics dict for each record to avoid reference sharing
-                # Use baseline_cam directly (already a copy from severity 0)
-                # Only copy if we need to modify it, but compute_cam_metrics doesn't modify
-                metrics = compute_cam_metrics(
-                    cam,
-                    yolo_bbox,
-                    img_width,
-                    img_height,
-                    baseline_cam=baseline_cam  # Use directly, compute_cam_metrics doesn't modify it
-                )
+                # Stage C: Quality Gate (already done in extract_cam_multi_layer)
+                # If QC failed, record and continue
+                if cam_status == 'fail':
+                    # Extract error information from layer_result
+                    exc_type = layer_result.get('exc_type')
+                    exc_msg = layer_result.get('exc_msg')
+                    traceback_last_lines = layer_result.get('traceback_last_lines')
+                    
+                    # Parse preprocessed_shape if it's a string
+                    preprocessed_shape_tuple = None
+                    if preprocessed_shape and isinstance(preprocessed_shape, str):
+                        try:
+                            h, w = map(int, preprocessed_shape.split('x'))
+                            preprocessed_shape_tuple = (h, w)
+                        except:
+                            pass
+                    elif preprocessed_shape:
+                        preprocessed_shape_tuple = preprocessed_shape
+                    
+                    # Create fail record with detailed error information and QC diagnostics
+                    record = create_cam_record(
+                        model=model_name,
+                        corruption=corruption,
+                        severity=severity,
+                        image_id=image_id,
+                        class_id=class_id,
+                        bbox_x1=visdrone_bbox[0],
+                        bbox_y1=visdrone_bbox[1],
+                        bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
+                        bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
+                        layer_role=layer_role,
+                        layer_name=layer_config[layer_role]['name'],
+                        cam_status='fail',
+                        fail_reason=fail_reason,
+                        exc_type=exc_type,
+                        exc_msg=exc_msg,
+                        traceback_last_lines=traceback_last_lines,
+                        # QC diagnostic stats
+                        cam_min=cam_min,
+                        cam_max=cam_max,
+                        cam_sum=cam_sum,
+                        cam_var=cam_var,
+                        cam_std=cam_std,  # 추가: std for QC
+                        cam_dtype=cam_dtype,
+                        finite_ratio=finite_ratio,
+                        preprocessed_shape=preprocessed_shape_tuple,
+                        failure_severity=failure_severity
+                    )
+                    cam_records.append(record)
+                    if layer_role == 'primary':
+                        corruption_cam_stats[corruption]['failed'] += 1
+                    continue
                 
-                # CRITICAL: Create new dict with explicit values (not references)
-                record = {
-                    'model': model_name,
-                    'corruption': corruption,
-                    'severity': severity,
-                    'image_id': image_id,
-                    'class_id': class_id,
-                    'failure_severity': failure_severity,
-                    'energy_in_bbox': float(metrics['energy_in_bbox']),  # Explicit conversion
-                    'activation_spread': float(metrics['activation_spread']),
-                    'entropy': float(metrics['entropy']),
-                    'center_shift': float(metrics['center_shift']),
-                }
-                cam_metrics_records.append(record)
-                corruption_cam_stats[corruption]['success'] += 1
+                # Store baseline (severity 0) per layer
+                if severity == 0:
+                    baseline_cams[layer_role] = cam.copy() if cam is not None else None
+                
+                # Stage D: Compute metrics (layer-invariant)
+                if cam is not None and baseline_cams.get(layer_role) is not None:
+                    # Convert visdrone bbox to xyxy format
+                    bbox_xyxy = (
+                        visdrone_bbox[0],
+                        visdrone_bbox[1],
+                        visdrone_bbox[0] + visdrone_bbox[2],
+                        visdrone_bbox[1] + visdrone_bbox[3]
+                    )
+                    
+                    # Add original image dimensions to letterbox_meta
+                    if letterbox_meta is not None:
+                        letterbox_meta['original_width'] = img_width
+                        letterbox_meta['original_height'] = img_height
+                    
+                    metrics = compute_cam_metrics(
+                        cam,
+                        bbox_xyxy,
+                        cam_shape,
+                        letterbox_meta=letterbox_meta,
+                        baseline_cam=baseline_cams[layer_role]
+                    )
+                    
+                    # Extract QC diagnostic stats (even for OK records, for consistency)
+                    cam_min = layer_result.get('cam_min')
+                    cam_max = layer_result.get('cam_max')
+                    cam_sum = layer_result.get('cam_sum')
+                    cam_var = layer_result.get('cam_var')
+                    cam_std = layer_result.get('cam_std')  # 추가: std for QC
+                    cam_dtype = layer_result.get('cam_dtype')
+                    finite_ratio = layer_result.get('finite_ratio')
+                    preprocessed_shape = layer_result.get('preprocessed_shape')
+                    
+                    # Parse preprocessed_shape if it's a string
+                    preprocessed_shape_tuple = None
+                    if preprocessed_shape and isinstance(preprocessed_shape, str):
+                        try:
+                            h, w = map(int, preprocessed_shape.split('x'))
+                            preprocessed_shape_tuple = (h, w)
+                        except:
+                            pass
+                    elif preprocessed_shape:
+                        preprocessed_shape_tuple = preprocessed_shape
+                    
+                    # Create record with new schema
+                    record = create_cam_record(
+                        model=model_name,
+                        corruption=corruption,
+                        severity=severity,
+                        image_id=image_id,
+                        class_id=class_id,
+                        bbox_x1=visdrone_bbox[0],
+                        bbox_y1=visdrone_bbox[1],
+                        bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
+                        bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
+                        layer_role=layer_role,
+                        layer_name=layer_config[layer_role]['name'],
+                        cam_status='ok',
+                        fail_reason=None,
+                        cam_h=cam_shape[0] if cam_shape else None,
+                        cam_w=cam_shape[1] if cam_shape else None,
+                        entropy=float(metrics['entropy']),
+                        activation_spread=float(metrics['activation_spread']),
+                        center_shift=float(metrics['center_shift']),
+                        energy_in_bbox=float(metrics['energy_in_bbox']),
+                        letterbox_meta=letterbox_meta,
+                        # QC diagnostic stats (for consistency and debugging)
+                        cam_min=cam_min,
+                        cam_max=cam_max,
+                        cam_sum=cam_sum,
+                        cam_var=cam_var,
+                        cam_std=cam_std,  # 추가: std for QC
+                        cam_dtype=cam_dtype,
+                        finite_ratio=finite_ratio,
+                        preprocessed_shape=preprocessed_shape_tuple,
+                        failure_severity=failure_severity
+                    )
+                    cam_records.append(record)
+                    if layer_role == 'primary':
+                        corruption_cam_stats[corruption]['success'] += 1
+                
+                # Clean up CAM for this layer
+                if cam is not None:
+                    del cam
             
-            if cam is None:
-                corruption_cam_stats[corruption]['failed'] += 1
-            
-            # CRITICAL: Clean up memory after each severity
-            # Delete in order to ensure proper cleanup
+            # CRITICAL: Aggressive cleanup after processing all layers
             del image
-            if cam is not None:
-                del cam
-            if metrics is not None:
-                del metrics
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             # Force Python garbage collection
             gc.collect()
             # Force PyTorch to free unused memory
@@ -424,9 +527,7 @@ def main():
                 torch.cuda.empty_cache() if hasattr(torch.cuda, 'empty_cache') else None
         
         # CRITICAL: Clean up after each failure event (all severities processed)
-        if baseline_cam is not None:
-            del baseline_cam
-            baseline_cam = None
+        baseline_cams.clear()
         # Aggressive cleanup after each event
         gc.collect()
         if torch.cuda.is_available():
@@ -441,15 +542,20 @@ def main():
                 gc.collect()  # Second pass for stubborn references
     
     # CRITICAL: Clean up model and gradcam after all events
-    del gradcam
+    for layer_role, gradcam_instance in gradcam_instances.items():
+        if gradcam_instance is not None:
+            del gradcam_instance
+    gradcam_instances.clear()
     del torch_model
     del yolo
     # Multiple passes of garbage collection for thorough cleanup
     gc.collect()
     gc.collect()
+    gc.collect()  # Third pass for stubborn references
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()  # Second pass
         print("\n[INFO] CUDA cache cleared after all events")
     else:
         print("\n[INFO] CPU memory cleaned up after all events")
@@ -461,21 +567,80 @@ def main():
         if total > 0:
             print(f"  {corr}: {stats['success']} success, {stats['failed']} failed (total attempts: {total})")
     
-    # Save initial CAM metrics
-    if len(cam_metrics_records) > 0:
-        print("\nSaving initial CAM metrics...")
-        cam_metrics_df = pd.DataFrame(cam_metrics_records)
+    # Stage E: Save CAM records with new schema
+    if len(cam_records) > 0:
+        print("\nSaving CAM records...")
+        cam_records_csv = results_dir / "cam_records.csv"
+        save_cam_records(cam_records, cam_records_csv)
+        
+        # Also save legacy format for backward compatibility
+        # CRITICAL: Use primary ok → secondary ok → any ok fallback strategy
+        # 1) Collect all OK records
+        ok_recs = [r for r in cam_records if r.get('cam_status') == 'ok']
+        
+        # 2) Priority-based layer selection (primary → secondary → any)
+        prefer_roles = ['primary', 'secondary']
+        picked = []
+        for role in prefer_roles:
+            picked = [r for r in ok_recs if r.get('layer_role') == role]
+            if len(picked) > 0:
+                break
+        
+        # 3) Fallback: if no primary/secondary, use any OK record
+        if len(picked) == 0:
+            picked = ok_recs
+        
+        # 4) Build legacy records from picked records
+        legacy_records = []
+        for rec in picked:
+            legacy_records.append({
+                'model': rec['model'],
+                'corruption': rec['corruption'],
+                'severity': rec['severity'],
+                'image_id': rec['image_id'],
+                'class_id': rec['class_id'],
+                'failure_severity': rec['failure_severity'],
+                'energy_in_bbox': rec['energy_in_bbox'],
+                'activation_spread': rec['activation_spread'],
+                'entropy': rec['entropy'],
+                'center_shift': rec['center_shift'],
+            })
+        
+        # Initialize cam_metrics_df for dynamic refinement (even if empty)
+        cam_metrics_df = None
         cam_metrics_csv = results_dir / "gradcam_metrics_timeseries.csv"
-        cam_metrics_df.to_csv(cam_metrics_csv, index=False)
-        print(f"  Saved to {cam_metrics_csv}")
-        print(f"  Total CAM metrics: {len(cam_metrics_records)}")
+        
+        if len(legacy_records) > 0:
+            cam_metrics_df = pd.DataFrame(legacy_records)
+            cam_metrics_df.to_csv(cam_metrics_csv, index=False)
+            layer_used = picked[0].get('layer_role', 'unknown') if len(picked) > 0 else 'unknown'
+            print(f"  Saved legacy format to {cam_metrics_csv} ({len(legacy_records)} {layer_used} layer records)")
+        else:
+            # CRITICAL: legacy_records가 0일 때도 "빈 CSV로 덮어쓰기" 해야 함
+            # 이렇게 해야 예전 실행 결과가 남아있지 않고, 리포트가 현재 상태(0/N/A)를 반영함
+            cam_metrics_df = pd.DataFrame(columns=[
+                'model', 'corruption', 'severity', 'image_id', 'class_id',
+                'failure_severity', 'energy_in_bbox', 'activation_spread',
+                'entropy', 'center_shift'
+            ])
+            cam_metrics_df.to_csv(cam_metrics_csv, index=False)  # << 이 줄이 핵심 (덮어쓰기)
+            print(f"  [WARN] No legacy records to save; wrote empty {cam_metrics_csv}")
+        
         if error_count > 0:
             print(f"  [WARN] Skipped {error_count} CAM generations due to errors")
     else:
-        print("\nNo CAM metrics computed")
+        print("\nNo CAM records computed")
         if error_count > 0:
             print(f"  [ERROR] All {error_count} CAM generations failed")
-        return
+        # CRITICAL: Initialize empty DataFrame and overwrite CSV to clear old data
+        cam_metrics_df = pd.DataFrame(columns=[
+            'model', 'corruption', 'severity', 'image_id', 'class_id',
+            'failure_severity', 'energy_in_bbox', 'activation_spread',
+            'entropy', 'center_shift'
+        ])
+        cam_metrics_csv = results_dir / "gradcam_metrics_timeseries.csv"
+        cam_metrics_df.to_csv(cam_metrics_csv, index=False)  # Overwrite with empty CSV
+        print(f"  [WARN] No CAM records computed; wrote empty {cam_metrics_csv}")
     
     # Save error log for bias analysis
     if len(error_records) > 0:
@@ -508,15 +673,29 @@ def main():
         print("Dynamic Refinement: Detecting and Subdividing Failure Regions")
         print("=" * 60)
         
-        # Detect failure regions
-        failure_regions = detect_failure_region(
-            cam_metrics_df,
-            threshold=refinement_config.get('failure_detection_threshold', 0.3)
-        )
+        # CRITICAL: If cam_metrics_df is empty, try to load from disk CSV
+        if (cam_metrics_df is None or len(cam_metrics_df) == 0) and cam_metrics_csv.exists():
+            try:
+                cam_metrics_df = pd.read_csv(cam_metrics_csv)
+                print(f"  [INFO] Loaded CAM metrics from disk: {cam_metrics_csv} ({len(cam_metrics_df)} records)")
+            except Exception as e:
+                print(f"  [WARN] Failed to load CAM metrics from {cam_metrics_csv}: {e}")
+                cam_metrics_df = None
         
-        print(f"\nDetected {len(failure_regions)} failure regions")
+        # Check if cam_metrics_df exists and has data
+        if cam_metrics_df is None or len(cam_metrics_df) == 0:
+            print("  [WARN] No CAM metrics available for dynamic refinement. Skipping.")
+            failure_regions = []
+        else:
+            # Detect failure regions
+            failure_regions = detect_failure_region(
+                cam_metrics_df,
+                threshold=refinement_config.get('failure_detection_threshold', 0.3)
+            )
         
         if len(failure_regions) > 0:
+            print(f"\nDetected {len(failure_regions)} failure regions")
+            
             # Subdivide and re-analyze
             subdivision_steps = refinement_config.get('subdivision_steps', 10)
             refined_records = []
@@ -563,20 +742,19 @@ def main():
                 yolo_refined = YOLO(model_path)
                 torch_model_refined = yolo_refined.model
                 
-                # Use fallback layers for refinement too
+                # Use primary layer for refinement
+                primary_layer_name = layer_config.get('primary', {}).get('name', 'model.18.cv2.conv')
                 gradcam_refined = None
-                for layer_name in target_layer_candidates:
-                    try:
-                        gradcam_refined = YOLOGradCAM(torch_model_refined, target_layer_name=layer_name)
-                        break
-                    except Exception:
-                        if layer_name == target_layer_candidates[-1]:
-                            del yolo_refined
-                            del torch_model_refined
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            continue  # Skip this region if all layers fail
+                try:
+                    gradcam_refined = YOLOGradCAM(torch_model_refined, target_layer_name=primary_layer_name)
+                except Exception as e:
+                    print(f"  [ERROR] Failed to initialize Grad-CAM for refinement: {e}")
+                    del yolo_refined
+                    del torch_model_refined
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue  # Skip this region if layer fails
                 
                 if gradcam_refined is None:
                     del yolo_refined
@@ -709,80 +887,72 @@ def main():
                     if current_shape_refined != baseline_shape_refined:
                         print(f"[DBG] REFINED SHAPE MISMATCH: {image_id} sub_severity {sub_severity}: expected {baseline_shape_refined}, got {current_shape_refined}")
                     
-                    # Try CAM generation with fallback layers
+                    # Try CAM generation (single layer for refinement)
                     cam = None
-                    for layer_name in target_layer_candidates:
-                        try:
-                            # Use the refined gradcam instance
-                            cam = gradcam_refined.generate_cam(image, yolo_bbox, class_id)
-                            break  # Success
-                        except torch.cuda.OutOfMemoryError as e:
-                            error_msg = str(e)
-                            error_records.append({
-                                'model': model_name,
-                                'corruption': corruption,
-                                'image_id': image_id,
-                                'class_id': class_id,
-                                'severity': sub_severity,
-                                'failure_severity': end_sev,
-                                'error_type': 'CUDA_OOM',
-                                'error_message': error_msg[:200],
-                                'refined': True,
-                                'original_start_sev': start_sev,
-                                'original_end_sev': end_sev,
-                                'target_layer': layer_name
-                            })
-                            del image
-                            gc.collect()
+                    try:
+                        cam, letterbox_meta_refined = gradcam_refined.generate_cam(image, yolo_bbox, class_id)
+                    except torch.cuda.OutOfMemoryError as e:
+                        error_msg = str(e)
+                        error_records.append({
+                            'model': model_name,
+                            'corruption': corruption,
+                            'image_id': image_id,
+                            'class_id': class_id,
+                            'severity': sub_severity,
+                            'failure_severity': end_sev,
+                            'error_type': 'CUDA_OOM',
+                            'error_message': error_msg[:200],
+                            'refined': True,
+                            'original_start_sev': start_sev,
+                            'original_end_sev': end_sev,
+                            'target_layer': primary_layer_name
+                        })
+                        del image
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        continue
+                    except MemoryError as e:
+                        error_msg = str(e)
+                        error_records.append({
+                            'model': model_name,
+                            'corruption': corruption,
+                            'image_id': image_id,
+                            'class_id': class_id,
+                            'severity': sub_severity,
+                            'failure_severity': end_sev,
+                            'error_type': 'CPU_MemoryError',
+                            'error_message': error_msg[:200],
+                            'refined': True,
+                            'original_start_sev': start_sev,
+                            'original_end_sev': end_sev,
+                            'target_layer': primary_layer_name
+                        })
+                        del image
+                        gc.collect()
+                        if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                            break
-                        except MemoryError as e:
-                            error_msg = str(e)
-                            error_records.append({
-                                'model': model_name,
-                                'corruption': corruption,
-                                'image_id': image_id,
-                                'class_id': class_id,
-                                'severity': sub_severity,
-                                'failure_severity': end_sev,
-                                'error_type': 'CPU_MemoryError',
-                                'error_message': error_msg[:200],
-                                'refined': True,
-                                'original_start_sev': start_sev,
-                                'original_end_sev': end_sev,
-                                'target_layer': layer_name
-                            })
-                            del image
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            break
-                        except (RuntimeError, ValueError) as e:
-                            error_msg = str(e)
-                            # Check if it's a shape mismatch error
-                            if "Sizes of tensors must match" in error_msg or "Expected size" in error_msg:
-                                if layer_name != target_layer_candidates[-1]:
-                                    continue  # Try next candidate
-                            # If last candidate or non-shape error, record and skip
-                            error_records.append({
-                                'model': model_name,
-                                'corruption': corruption,
-                                'image_id': image_id,
-                                'class_id': class_id,
-                                'severity': sub_severity,
-                                'failure_severity': end_sev,
-                                'error_type': type(e).__name__,
-                                'error_message': error_msg[:200],
-                                'refined': True,
-                                'original_start_sev': start_sev,
-                                'original_end_sev': end_sev,
-                                'target_layer': layer_name
-                            })
-                            del image
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            break  # Exit retry loop
+                        continue
+                    except (RuntimeError, ValueError) as e:
+                        error_msg = str(e)
+                        error_records.append({
+                            'model': model_name,
+                            'corruption': corruption,
+                            'image_id': image_id,
+                            'class_id': class_id,
+                            'severity': sub_severity,
+                            'failure_severity': end_sev,
+                            'error_type': type(e).__name__,
+                            'error_message': error_msg[:200],
+                            'refined': True,
+                            'original_start_sev': start_sev,
+                            'original_end_sev': end_sev,
+                            'target_layer': primary_layer_name
+                        })
+                        del image
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue  # Exit retry loop
                     
                     if cam is None:
                         # Clean up before continuing
@@ -848,11 +1018,16 @@ def main():
                             torch.cuda.empty_cache()
             
             # CRITICAL: Clean up after refined analysis
-            del baseline_image
-            del baseline_cam
-            del gradcam_refined
-            del torch_model_refined
-            del yolo_refined
+            if 'baseline_image' in locals():
+                del baseline_image
+            if 'baseline_cam' in locals():
+                del baseline_cam
+            if 'gradcam_refined' in locals():
+                del gradcam_refined
+            if 'torch_model_refined' in locals():
+                del torch_model_refined
+            if 'yolo_refined' in locals():
+                del yolo_refined
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -862,8 +1037,12 @@ def main():
                 print(f"\nGenerated {len(refined_records)} refined CAM metrics")
                 refined_df = pd.DataFrame(refined_records)
                 
-                # Append to existing metrics
-                cam_metrics_df = pd.concat([cam_metrics_df, refined_df], ignore_index=True)
+                # Append to existing metrics (ensure cam_metrics_df exists)
+                if cam_metrics_df is None or len(cam_metrics_df) == 0:
+                    cam_metrics_df = refined_df
+                else:
+                    cam_metrics_df = pd.concat([cam_metrics_df, refined_df], ignore_index=True)
+                
                 cam_metrics_df.to_csv(cam_metrics_csv, index=False)
                 print(f"  Updated {cam_metrics_csv}")
                 print(f"  Total CAM metrics: {len(cam_metrics_df)}")

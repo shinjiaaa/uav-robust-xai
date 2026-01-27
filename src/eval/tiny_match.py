@@ -185,7 +185,7 @@ def match_prediction_to_gt(
     gt_box: Tuple[int, float, float, float, float],  # (class, x, y, w, h)
     iou_threshold: float = 0.5,
     same_class: bool = True
-) -> Optional[Tuple[float, float]]:
+) -> Optional[Tuple[float, float, Tuple[float, float, float, float]]]:
     """Find best matching prediction for a GT box.
     
     Args:
@@ -195,13 +195,15 @@ def match_prediction_to_gt(
         same_class: Whether to require same class
         
     Returns:
-        (score, iou) if match found, None otherwise
+        (score, iou, pred_bbox) if match found, None otherwise
+        pred_bbox: (x_center, y_center, width, height) in normalized coordinates
     """
     gt_class, gt_x, gt_y, gt_w, gt_h = gt_box
     gt_box_coords = (gt_x, gt_y, gt_w, gt_h)
     
     best_iou = 0.0
     best_score = 0.0
+    best_pred_bbox = None
     found_match = False
     
     for pred_class, pred_x, pred_y, pred_w, pred_h, pred_score in pred_boxes:
@@ -214,12 +216,27 @@ def match_prediction_to_gt(
         if iou > best_iou:
             best_iou = iou
             best_score = pred_score
+            best_pred_bbox = (pred_x, pred_y, pred_w, pred_h)
             found_match = True
     
     if found_match and best_iou >= iou_threshold:
-        return (best_score, best_iou)
+        return (best_score, best_iou, best_pred_bbox)
     
     return None
+
+
+# Global model cache to avoid reloading models
+_model_cache = {}
+
+
+def clear_model_cache():
+    """Clear the global model cache to free memory."""
+    global _model_cache
+    _model_cache.clear()
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def run_inference_on_image(
@@ -239,24 +256,88 @@ def run_inference_on_image(
         conf_thres: Confidence threshold
         iou_thres: IoU threshold for NMS
         device: Device to run on
-        
+    
     Returns:
         List of (class_id, x_center, y_center, width, height, score) in normalized coordinates
     """
-    # Load model
-    if model_type == 'yolo':
-        model = YOLO(model_path)
-    elif model_type == 'rtdetr':
-        if RTDETR is None:
-            print("Warning: RT-DETR not available, using YOLO instead")
-            model = YOLO(model_path)
-        else:
-            model = RTDETR(model_path)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+    global _model_cache
     
-    # Run inference
-    results = model(str(image_path), conf=conf_thres, iou=iou_thres, device=device, verbose=False)
+    # Use cached model if available
+    cache_key = f"{model_path}_{model_type}_{device}"
+    if cache_key not in _model_cache:
+        # Load model only once with file access protection and retry logic
+        max_retries = 3
+        retry_delay = 1.0  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Check file access before loading
+                try:
+                    with open(model_path, 'rb') as f:
+                        f.read(1)  # Try to read first byte
+                except (OSError, IOError, PermissionError) as e:
+                    if attempt < max_retries - 1:
+                        import time
+                        print(f"  [WARN] Model file locked (attempt {attempt+1}/{max_retries}), waiting {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        print(f"  [ERROR] Model file is locked or in use: {model_path}")
+                        print(f"  [ERROR] Please run: python scripts/kill_python_processes.py")
+                        raise RuntimeError(f"Model file access denied after {max_retries} attempts: {model_path}") from e
+                
+                # Load model
+                if model_type == 'yolo':
+                    # Use task='detect' to prevent file locking issues
+                    model = YOLO(model_path, task='detect')
+                elif model_type == 'rtdetr':
+                    if RTDETR is None:
+                        print("Warning: RT-DETR not available, using YOLO instead")
+                        model = YOLO(model_path, task='detect')
+                    else:
+                        model = RTDETR(model_path)
+                else:
+                    raise ValueError(f"Unknown model type: {model_type}")
+                
+                _model_cache[cache_key] = model
+                break  # Success
+                
+            except (OSError, IOError, PermissionError) as e:
+                error_msg = str(e).lower()
+                if attempt < max_retries - 1:
+                    import time
+                    print(f"  [WARN] Model loading failed (attempt {attempt+1}/{max_retries}), retrying...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    if "cannot access" in error_msg or "being used" in error_msg or "locked" in error_msg:
+                        print(f"  [ERROR] Model file is locked or in use: {model_path}")
+                        print(f"  [ERROR] Please run: python scripts/kill_python_processes.py")
+                        raise RuntimeError(f"Model file access denied: {model_path}. Another process may be using it.") from e
+                    raise
+    else:
+        model = _model_cache[cache_key]
+    
+    # Run inference with memory-efficient settings
+    try:
+        # CRITICAL: Use smaller image size and eval mode to reduce memory
+        if device.startswith('cuda'):
+            # Temporarily set to eval mode for inference (saves memory)
+            was_training = model.model.training
+            model.model.eval()
+            # Use smaller imgsz to reduce memory (512 instead of 640)
+            with torch.cuda.amp.autocast(enabled=False):  # Disable autocast to avoid memory issues
+                results = model(str(image_path), conf=conf_thres, iou=iou_thres, device=device, verbose=False, imgsz=512)
+            if was_training:
+                model.model.train()
+        else:
+            # CPU: Use even smaller size
+            results = model(str(image_path), conf=conf_thres, iou=iou_thres, device=device, verbose=False, imgsz=512)
+    except Exception as e:
+        # If inference fails, return empty list
+        # Don't print warning for every failure to avoid spam
+        return []
     
     # Extract boxes
     boxes = []
@@ -272,5 +353,10 @@ def run_inference_on_image(
                 height = float(box.xywhn[0][3])
                 score = float(box.conf[0])
                 boxes.append((cls, x_center, y_center, width, height, score))
+    
+    # CRITICAL: Clear results to free memory immediately
+    del results
+    import gc
+    gc.collect()
     
     return boxes

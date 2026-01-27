@@ -27,12 +27,22 @@ def load_metrics(config):
     else:
         metrics['dataset'] = []
     
-    # Detection records
-    timeseries_csv = results_root / "tiny_records_timeseries.csv"
-    if timeseries_csv.exists():
-        metrics['detection_records'] = pd.read_csv(timeseries_csv).to_dict('records')
+    # Detection records (prefer detection_records.csv)
+    det_csv = results_root / "detection_records.csv"
+    ts_csv = results_root / "tiny_records_timeseries.csv"
+    
+    if det_csv.exists() and det_csv.stat().st_size > 0:
+        metrics['detection_records'] = pd.read_csv(det_csv).to_dict('records')
+        detection_source = "detection_records.csv"
+    elif ts_csv.exists() and ts_csv.stat().st_size > 0:
+        metrics['detection_records'] = pd.read_csv(ts_csv).to_dict('records')
+        detection_source = "tiny_records_timeseries.csv"
     else:
         metrics['detection_records'] = []
+        detection_source = "NONE"
+    
+    # Debug: print which file was used
+    print(f"  Detection records source: {detection_source}")
     
     # Tiny object curves
     tiny_curves_csv = results_root / "tiny_curves.csv"

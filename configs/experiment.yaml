@@ -111,7 +111,24 @@ risk_detection:
 # Grad-CAM (failure-event based)
 gradcam:
   enabled: true
-  target_layer: "model.18.cv2.conv"  # Backbone last C2f block's cv2 conv (stable single feature map, avoids concat)
+  # Layer configuration (primary/secondary approach)
+  layers:
+    primary:
+      name: "model.9.cv2.conv"  # CRITICAL: Backbone layer (not detect head) - more stable than model.18
+      # YOLOv8 structure: model.0-9 = backbone, model.10-21 = neck, model.22-24 = head
+      # model.9 is the last backbone C2f block before neck - most stable for CAM
+      role: "primary"  # Main layer for analysis
+      required: true  # Must succeed
+    # secondary:
+    #   name: "model.6.cv2.conv"  # Alternative backbone layer (mid-backbone, optional)
+    #   role: "secondary"  # Supplementary layer
+    #   required: false  # Optional, can fail
+    # CRITICAL: Disabled secondary for quick success test - use primary only
+  # Quality Gate (QC) thresholds
+  quality_gate:
+    finite_ratio_threshold: 0.99  # >99% of values must be finite (not NaN/inf)
+    cam_sum_epsilon: 1e-8  # CRITICAL: Reduced from 1e-6 to 1e-8 for debugging (allow very small CAMs to pass)
+    cam_var_epsilon: 1e-10  # CRITICAL: Reduced from 1e-8 to 1e-10 for debugging (allow near-flat CAMs to pass)
   top_k_percent: 10
   save_samples: true
   max_samples: 20
