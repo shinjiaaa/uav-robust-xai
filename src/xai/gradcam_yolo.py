@@ -160,10 +160,14 @@ class YOLOGradCAM:
 
             # 4) backward로 gradients 확보
             self.model.zero_grad(set_to_none=True)
+            new_target = None
+            forward_output = _  # Save reference before backward
             try:
                 # target.backward(retain_graph=False)
-                new_target = sum(o.sum() for o in _)
-                new_target.backward(retain_graph=True)
+                new_target = sum(o.sum() for o in forward_output)
+                # CRITICAL: retain_graph=False to free graph memory immediately after backward
+                # The graph is only needed during backward, not after
+                new_target.backward(retain_graph=False)
                 # print("backward called")
             except RuntimeError as e:
                 if "element 0 of tensors does not require grad" in str(e):
@@ -172,6 +176,15 @@ class YOLOGradCAM:
                                     f"target.grad_fn={target.grad_fn}, "
                                     f"x.requires_grad={x.requires_grad}") from e
                 raise
+            finally:
+                # CRITICAL: Explicitly clear computation graph after backward
+                # This helps free memory, especially on CPU
+                if new_target is not None:
+                    del new_target
+                # Clear forward output after backward is complete
+                del forward_output
+                # Clear input gradients if they exist (but keep x for CAM computation)
+                # x.grad will be cleared after CAM is computed
             # print("after backward: act.grad is None?", self.activations.grad is None)
             # if self.activations.grad is not None:
             #     print("act.grad mean:", self.activations.grad.abs().mean().item())
@@ -202,4 +215,25 @@ class YOLOGradCAM:
             # print("*"*100)
             # print("555")
             # print("*"*100)
-            return cam.detach().cpu().numpy()
+            # CRITICAL: Convert to numpy and explicitly free tensor memory
+            # Detach from graph first, then move to CPU, then convert to numpy
+            cam_detached = cam.detach()
+            del cam  # Free GPU/CPU tensor immediately
+            cam_numpy = cam_detached.cpu().numpy()
+            del cam_detached  # Free CPU tensor
+            
+            # CRITICAL: Clear input tensor and gradients to free memory
+            if x is not None:
+                if hasattr(x, 'grad') and x.grad is not None:
+                    x.grad = None
+                del x
+            
+            # Clear activations and gradients references (they're captured by hooks, but clear grad if exists)
+            if self.activations is not None:
+                if hasattr(self.activations, 'grad') and self.activations.grad is not None:
+                    self.activations.grad = None
+            if self.gradients is not None:
+                if hasattr(self.gradients, 'grad') and self.gradients.grad is not None:
+                    self.gradients.grad = None
+            
+            return cam_numpy

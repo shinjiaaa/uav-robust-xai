@@ -8,6 +8,9 @@ from PIL import Image
 import torch
 import gc
 
+# Set PIL safety limits to prevent decompression bombs
+Image.MAX_IMAGE_PIXELS = 40_000_000  # 40MP limit (adjust if needed)
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.xai.gradcam_yolo import YOLOGradCAM
@@ -94,62 +97,69 @@ def main():
     # Track CAM generation success/failure by corruption
     corruption_cam_stats = {corr: {'success': 0, 'failed': 0} for corr in sample_events['corruption'].unique()}
     
+    # CRITICAL: Load model ONCE outside the loop to avoid memory accumulation
+    model_name = 'yolo_generic'  # Only process yolo_generic
+    model_config = config['models'][model_name]
+    if model_config['type'] != 'yolo':
+        print(f"[ERROR] Model {model_name} is not YOLO type")
+        sys.exit(1)
+    
+    # Get model path
+    if model_config['fine_tuned'] and Path(model_config['checkpoint']).exists():
+        model_path = model_config['checkpoint']
+    else:
+        model_path = model_config['pretrained']
+    
+    print(f"\nLoading model: {model_path}")
+    yolo = YOLO(model_path)
+    torch_model = yolo.model
+    
+    # CRITICAL: Force model to GPU if available to reduce CPU RAM usage
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')
+        torch_model = torch_model.to(device)
+        print(f"  Model moved to GPU: {device}")
+    else:
+        device = torch.device('cpu')
+        print(f"  Model on CPU (GPU not available)")
+        print(f"  [WARN] CPU mode will use more RAM - ensure sufficient memory")
+    
+    # Fallback layer candidates (most stable first)
+    target_layer_candidates = [
+        gradcam_config['target_layer'],  # Primary: model.18.cv2.conv
+        "model.18.cv2.conv",  # Explicit backup
+        "model.16.conv",  # Alternative backbone layer
+        "model.19.conv",  # Another backbone option
+    ]
+    
+    # Initialize Grad-CAM once with explicit device
+    gradcam = None
+    device_str = str(device) if 'device' in locals() else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    for layer_name in target_layer_candidates:
+        try:
+            gradcam = YOLOGradCAM(torch_model, target_layer_name=layer_name, device=device_str)
+            actual_device = next(gradcam.model.parameters()).device
+            print(f"  CAM model device: {actual_device}")
+            print(f"  Using target layer: {layer_name}")
+            break
+        except Exception as e:
+            if layer_name == target_layer_candidates[-1]:  # Last candidate failed
+                print(f"  [ERROR] Failed to initialize Grad-CAM with all fallback layers: {e}")
+                sys.exit(1)
+    
+    if gradcam is None:
+        print("[ERROR] Failed to initialize Grad-CAM")
+        sys.exit(1)
+    
     for _, event in tqdm(sample_events.iterrows(), total=len(sample_events), desc="Processing events"):
-        model_name = event['model']
-        # print("*"*100)
-        # print(event)
-        # print("*"*100)
-        
-        # Only process yolo_generic
-        if model_name != 'yolo_generic':
+        # Only process yolo_generic (already filtered by model loading)
+        if event['model'] != model_name:
             continue
         
         corruption = event['corruption']
         image_id = event['image_id']
         class_id = event['class_id']
         failure_severity = int(event['failure_severity'])
-        
-        # Get model config
-        model_config = config['models'][model_name]
-        if model_config['type'] != 'yolo':
-            continue
-        
-        # Get model path
-        if model_config['fine_tuned'] and Path(model_config['checkpoint']).exists():
-            model_path = model_config['checkpoint']
-        else:
-            model_path = model_config['pretrained']
-        
-        # Load model and setup Grad-CAM with fallback layers
-        yolo = YOLO(model_path)
-        torch_model = yolo.model
-                
-        # Fallback layer candidates (most stable first)
-        target_layer_candidates = [
-            gradcam_config['target_layer'],  # Primary: model.18.cv2.conv
-            "model.18.cv2.conv",  # Explicit backup
-            "model.16.conv",  # Alternative backbone layer
-            "model.19.conv",  # Another backbone option
-        ]
-        
-        gradcam = None
-        for layer_name in target_layer_candidates:
-            try:
-                gradcam = YOLOGradCAM(torch_model, target_layer_name=layer_name)
-                # Device check (print once)
-                if not device_checked:
-                    print(f"  CAM model device: {next(gradcam.model.parameters()).device}")
-                    print(f"  Using target layer: {layer_name}")
-                    device_checked = True
-                break
-            except Exception as e:
-                if layer_name == target_layer_candidates[-1]:  # Last candidate failed
-                    print(f"  [ERROR] Failed to initialize Grad-CAM with all fallback layers: {e}")
-                    print(f"  [SKIP] Skipping {model_name}")
-                    continue
-        
-        if gradcam is None:
-            continue
         
         # Get tiny object bbox
         key = (image_id, class_id)
@@ -176,21 +186,79 @@ def main():
             
             # Load image with memory-efficient approach
             try:
-                pil_image = Image.open(image_path)
-                # Convert to RGB if needed (handles RGBA, L, etc.)
-                if pil_image.mode != 'RGB':
-                    pil_image = pil_image.convert('RGB')
-                image = np.array(pil_image, dtype=np.uint8)
-                img_height, img_width = image.shape[:2]
-                # Explicitly close PIL image to free memory
-                pil_image.close()
+                # Use context manager for safe PIL image loading
+                with Image.open(image_path) as pil_image:
+                    # Check image size before processing
+                    w, h = pil_image.size
+                    pixel_count = w * h
+                    
+                    # Skip if image is too large (safety check)
+                    if pixel_count > 40_000_000:  # 40MP limit
+                        print(f"  [WARN] Image too large ({w}x{h}={pixel_count} pixels): {image_path}")
+                        error_records.append({
+                            'model': model_name,
+                            'corruption': corruption,
+                            'image_id': image_id,
+                            'class_id': class_id,
+                            'severity': severity,
+                            'failure_severity': failure_severity,
+                            'error_type': 'ImageTooLarge',
+                            'error_message': f'Image size {w}x{h} exceeds 40MP limit',
+                            'target_layer': gradcam_config['target_layer']
+                        })
+                        continue
+                    
+                    # Resize if too large (max side 1280px to reduce memory)
+                    MAX_SIDE = 1280
+                    scale = MAX_SIDE / max(w, h) if max(w, h) > MAX_SIDE else 1.0
+                    if scale < 1.0:
+                        new_w, new_h = int(w * scale), int(h * scale)
+                        pil_image = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                        w, h = new_w, new_h
+                    
+                    # Convert to RGB if needed
+                    if pil_image.mode != 'RGB':
+                        pil_image = pil_image.convert('RGB')
+                    
+                    # Use np.asarray instead of np.array to avoid unnecessary copy
+                    image = np.asarray(pil_image, dtype=np.uint8)
+                    img_height, img_width = image.shape[:2]
+                
+                # PIL image is automatically closed by context manager
+                # Explicit cleanup
                 del pil_image
+                
             except MemoryError as e:
-                print(f"  [ERROR] Memory error loading image {image_path}: {e}")
+                print(f"  [ERROR] CPU Memory error loading image {image_path}: {e}")
+                error_records.append({
+                    'model': model_name,
+                    'corruption': corruption,
+                    'image_id': image_id,
+                    'class_id': class_id,
+                    'severity': severity,
+                    'failure_severity': failure_severity,
+                    'error_type': 'CPU_MemoryError',
+                    'error_message': str(e)[:200],
+                    'target_layer': gradcam_config['target_layer']
+                })
                 # Clean up and skip
                 gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                continue
+            except (OSError, IOError, ValueError) as e:
+                # Handle corrupted images, decompression bombs, etc.
+                print(f"  [ERROR] Image loading error {image_path}: {e}")
+                error_records.append({
+                    'model': model_name,
+                    'corruption': corruption,
+                    'image_id': image_id,
+                    'class_id': class_id,
+                    'severity': severity,
+                    'failure_severity': failure_severity,
+                    'error_type': type(e).__name__,
+                    'error_message': str(e)[:200],
+                    'target_layer': gradcam_config['target_layer']
+                })
+                gc.collect()
                 continue
             
             # DEBUG: Check image shape consistency across severities
@@ -207,47 +275,91 @@ def main():
             visdrone_bbox = tiny_obj['bbox']  # (left, top, width, height) in pixels
             yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
 
-            # print(gradcam is None) = False
-            # Try primary layer first
-            for layer_name in target_layer_candidates:
-                try:
-                    # Recreate gradcam with fallback layer if needed
-                    if layer_name != gradcam_config['target_layer']:
-                        gradcam = YOLOGradCAM(torch_model, target_layer_name=layer_name)
-                    # print(gradcam.model)
-                    cam = gradcam.generate_cam(
-                        image,
-                        yolo_bbox,
-                        class_id
-                    )
-                    # exit()
-                    break  # Success, exit retry loop
-                except (RuntimeError, ValueError) as e:
-                    print(f"[DBG] err_msg={str(e)[:120]}")
-                    error_msg = str(e)
-                    # Check if it's a shape mismatch error
-                    if "Sizes of tensors must match" in error_msg or "Expected size" in error_msg:
-                        # Try next fallback layer
-                        if layer_name != target_layer_candidates[-1]:
-                            continue  # Try next candidate
-                    # If last candidate or non-shape error, record and skip
-                    error_count += 1
-                    if error_count <= 5:  # Print first 5 errors
-                        print(f"  [WARN] Failed to generate CAM for {image_id} severity {severity} (layer {layer_name}): {e}")
-                    
-                    # Record error details for analysis
-                    error_records.append({
-                        'model': model_name,
-                        'corruption': corruption,
-                        'image_id': image_id,
-                        'class_id': class_id,
-                        'severity': severity,
-                        'failure_severity': failure_severity,
-                        'error_type': type(e).__name__,
-                        'error_message': error_msg[:200],  # Truncate long messages
-                        'target_layer': layer_name
-                    })
-                    break  # Exit retry loop
+            # Try to generate CAM (gradcam is already initialized)
+            try:
+                cam = gradcam.generate_cam(
+                    image,
+                    yolo_bbox,
+                    class_id
+                )
+                # CRITICAL: Force garbage collection after CAM generation to free graph memory
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except torch.cuda.OutOfMemoryError as e:
+                # CUDA OOM
+                print(f"[DBG] CUDA OOM: {str(e)[:120]}")
+                error_msg = str(e)
+                error_count += 1
+                if error_count <= 5:
+                    print(f"  [WARN] CUDA OOM for {image_id} severity {severity}: {e}")
+                
+                error_records.append({
+                    'model': model_name,
+                    'corruption': corruption,
+                    'image_id': image_id,
+                    'class_id': class_id,
+                    'severity': severity,
+                    'failure_severity': failure_severity,
+                    'error_type': 'CUDA_OOM',
+                    'error_message': error_msg[:200],
+                    'target_layer': gradcam_config['target_layer']
+                })
+                # Clean up and continue
+                del image
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+            except MemoryError as e:
+                # CPU RAM OOM
+                print(f"[DBG] CPU MemoryError: {str(e)[:120]}")
+                error_msg = str(e)
+                error_count += 1
+                if error_count <= 5:
+                    print(f"  [WARN] CPU MemoryError for {image_id} severity {severity}: {e}")
+                
+                error_records.append({
+                    'model': model_name,
+                    'corruption': corruption,
+                    'image_id': image_id,
+                    'class_id': class_id,
+                    'severity': severity,
+                    'failure_severity': failure_severity,
+                    'error_type': 'CPU_MemoryError',
+                    'error_message': error_msg[:200],
+                    'target_layer': gradcam_config['target_layer']
+                })
+                # Clean up and continue
+                del image
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            except (RuntimeError, ValueError) as e:
+                # Other runtime errors
+                print(f"[DBG] RuntimeError: {str(e)[:120]}")
+                error_msg = str(e)
+                error_count += 1
+                if error_count <= 5:
+                    print(f"  [WARN] Failed to generate CAM for {image_id} severity {severity}: {e}")
+                
+                error_records.append({
+                    'model': model_name,
+                    'corruption': corruption,
+                    'image_id': image_id,
+                    'class_id': class_id,
+                    'severity': severity,
+                    'failure_severity': failure_severity,
+                    'error_type': type(e).__name__,
+                    'error_message': error_msg[:200],
+                    'target_layer': gradcam_config['target_layer']
+                })
+                # Clean up and continue
+                del image
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             if cam is None:
                 # Clean up memory before continuing
                 gc.collect()
@@ -258,17 +370,21 @@ def main():
             # Store baseline (severity 0) - use copy to avoid reference sharing
             if severity == 0:
                 baseline_cam = cam.copy()  # CRITICAL: Copy to avoid reference sharing across corruptions
+                # Force garbage collection after baseline creation
+                gc.collect()
             
             # Compute metrics
             metrics = None
             if baseline_cam is not None:
                 # CRITICAL: Create new metrics dict for each record to avoid reference sharing
+                # Use baseline_cam directly (already a copy from severity 0)
+                # Only copy if we need to modify it, but compute_cam_metrics doesn't modify
                 metrics = compute_cam_metrics(
                     cam,
                     yolo_bbox,
                     img_width,
                     img_height,
-                    baseline_cam=baseline_cam.copy()  # Copy baseline to ensure isolation
+                    baseline_cam=baseline_cam  # Use directly, compute_cam_metrics doesn't modify it
                 )
                 
                 # CRITICAL: Create new dict with explicit values (not references)
@@ -290,15 +406,53 @@ def main():
             if cam is None:
                 corruption_cam_stats[corruption]['failed'] += 1
             
-            # Clean up memory after each severity
+            # CRITICAL: Clean up memory after each severity
+            # Delete in order to ensure proper cleanup
             del image
             if cam is not None:
                 del cam
             if metrics is not None:
                 del metrics
+            # Force Python garbage collection
             gc.collect()
+            # Force PyTorch to free unused memory
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Wait for CUDA operations to complete
+            else:
+                # On CPU, explicitly clear PyTorch cache
+                torch.cuda.empty_cache() if hasattr(torch.cuda, 'empty_cache') else None
+        
+        # CRITICAL: Clean up after each failure event (all severities processed)
+        if baseline_cam is not None:
+            del baseline_cam
+            baseline_cam = None
+        # Aggressive cleanup after each event
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        else:
+            # On CPU, try to free any cached allocations
+            import sys
+            if sys.platform == 'win32':
+                # Windows: force memory release
+                gc.collect()
+                gc.collect()  # Second pass for stubborn references
+    
+    # CRITICAL: Clean up model and gradcam after all events
+    del gradcam
+    del torch_model
+    del yolo
+    # Multiple passes of garbage collection for thorough cleanup
+    gc.collect()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print("\n[INFO] CUDA cache cleared after all events")
+    else:
+        print("\n[INFO] CPU memory cleaned up after all events")
     
     # Print CAM generation statistics by corruption
     print("\n[DBG] CAM generation statistics by corruption:")
@@ -404,20 +558,32 @@ def main():
                 else:
                     model_path = model_config['pretrained']
                 
-                yolo = YOLO(model_path)
-                torch_model = yolo.model  # Extract torch module
+                # CRITICAL: Reuse the same model/gradcam from main loop if possible
+                # For now, create new instance but clean up properly
+                yolo_refined = YOLO(model_path)
+                torch_model_refined = yolo_refined.model
                 
                 # Use fallback layers for refinement too
-                gradcam = None
+                gradcam_refined = None
                 for layer_name in target_layer_candidates:
                     try:
-                        gradcam = YOLOGradCAM(torch_model, target_layer_name=layer_name)
+                        gradcam_refined = YOLOGradCAM(torch_model_refined, target_layer_name=layer_name)
                         break
                     except Exception:
                         if layer_name == target_layer_candidates[-1]:
+                            del yolo_refined
+                            del torch_model_refined
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                             continue  # Skip this region if all layers fail
                 
-                if gradcam is None:
+                if gradcam_refined is None:
+                    del yolo_refined
+                    del torch_model_refined
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
                 
                 # Get tiny object
@@ -434,17 +600,54 @@ def main():
                 if not baseline_image_path.exists():
                     continue
                 
-                baseline_image = np.array(Image.open(baseline_image_path))
-                img_height, img_width = baseline_image.shape[:2]
-                baseline_shape_refined = (img_height, img_width)
-                print(f"[DBG] Refined baseline shape (severity 0): {baseline_shape_refined} for {image_id}")
+                # Load baseline image with memory-efficient approach
+                try:
+                    with Image.open(baseline_image_path) as pil_image:
+                        w, h = pil_image.size
+                        pixel_count = w * h
+                        
+                        if pixel_count > 40_000_000:
+                            print(f"  [WARN] Baseline image too large ({w}x{h}): {baseline_image_path}")
+                            continue
+                        
+                        # Resize if too large
+                        MAX_SIDE = 1280
+                        scale = MAX_SIDE / max(w, h) if max(w, h) > MAX_SIDE else 1.0
+                        if scale < 1.0:
+                            new_w, new_h = int(w * scale), int(h * scale)
+                            pil_image = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                            w, h = new_w, new_h
+                        
+                        if pil_image.mode != 'RGB':
+                            pil_image = pil_image.convert('RGB')
+                        
+                        baseline_image = np.asarray(pil_image, dtype=np.uint8)
+                        img_height, img_width = baseline_image.shape[:2]
+                        baseline_shape_refined = (img_height, img_width)
+                        print(f"[DBG] Refined baseline shape (severity 0): {baseline_shape_refined} for {image_id}")
+                except MemoryError as e:
+                    print(f"  [ERROR] CPU Memory error loading baseline image: {e}")
+                    gc.collect()
+                    continue
+                except (OSError, IOError, ValueError) as e:
+                    print(f"  [ERROR] Image loading error: {e}")
+                    gc.collect()
+                    continue
                 visdrone_bbox = tiny_obj['bbox']
                 yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
                 
                 try:
-                    baseline_cam = gradcam.generate_cam(baseline_image, yolo_bbox, class_id)
+                    baseline_cam = gradcam_refined.generate_cam(baseline_image, yolo_bbox, class_id)
                     baseline_cam = baseline_cam.copy()  # CRITICAL: Copy to avoid reference sharing
-                except:
+                except Exception as e:
+                    print(f"  [WARN] Failed to generate baseline CAM for refined analysis: {e}")
+                    del baseline_image
+                    del yolo_refined
+                    del torch_model_refined
+                    del gradcam_refined
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
                 
                 # Analyze subdivided severities
@@ -471,7 +674,37 @@ def main():
                         continue
                     
                     # Load and analyze
-                    image = np.array(Image.open(image_path))
+                    # Load image with memory-efficient approach
+                    try:
+                        with Image.open(image_path) as pil_image:
+                            w, h = pil_image.size
+                            pixel_count = w * h
+                            
+                            if pixel_count > 40_000_000:
+                                print(f"  [WARN] Image too large ({w}x{h}): {image_path}")
+                                continue
+                            
+                            # Resize if too large
+                            MAX_SIDE = 1280
+                            scale = MAX_SIDE / max(w, h) if max(w, h) > MAX_SIDE else 1.0
+                            if scale < 1.0:
+                                new_w, new_h = int(w * scale), int(h * scale)
+                                pil_image = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                                w, h = new_w, new_h
+                            
+                            if pil_image.mode != 'RGB':
+                                pil_image = pil_image.convert('RGB')
+                            
+                            image = np.asarray(pil_image, dtype=np.uint8)
+                            img_height, img_width = image.shape[:2]
+                    except MemoryError as e:
+                        print(f"  [ERROR] CPU Memory error loading image: {e}")
+                        gc.collect()
+                        continue
+                    except (OSError, IOError, ValueError) as e:
+                        print(f"  [ERROR] Image loading error: {e}")
+                        gc.collect()
+                        continue
                     current_shape_refined = image.shape[:2]
                     if current_shape_refined != baseline_shape_refined:
                         print(f"[DBG] REFINED SHAPE MISMATCH: {image_id} sub_severity {sub_severity}: expected {baseline_shape_refined}, got {current_shape_refined}")
@@ -480,12 +713,50 @@ def main():
                     cam = None
                     for layer_name in target_layer_candidates:
                         try:
-                            # Recreate gradcam with fallback layer if needed
-                            if layer_name != gradcam_config['target_layer']:
-                                gradcam = YOLOGradCAM(torch_model, target_layer_name=layer_name)
-                            
-                            cam = gradcam.generate_cam(image, yolo_bbox, class_id)
+                            # Use the refined gradcam instance
+                            cam = gradcam_refined.generate_cam(image, yolo_bbox, class_id)
                             break  # Success
+                        except torch.cuda.OutOfMemoryError as e:
+                            error_msg = str(e)
+                            error_records.append({
+                                'model': model_name,
+                                'corruption': corruption,
+                                'image_id': image_id,
+                                'class_id': class_id,
+                                'severity': sub_severity,
+                                'failure_severity': end_sev,
+                                'error_type': 'CUDA_OOM',
+                                'error_message': error_msg[:200],
+                                'refined': True,
+                                'original_start_sev': start_sev,
+                                'original_end_sev': end_sev,
+                                'target_layer': layer_name
+                            })
+                            del image
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            break
+                        except MemoryError as e:
+                            error_msg = str(e)
+                            error_records.append({
+                                'model': model_name,
+                                'corruption': corruption,
+                                'image_id': image_id,
+                                'class_id': class_id,
+                                'severity': sub_severity,
+                                'failure_severity': end_sev,
+                                'error_type': 'CPU_MemoryError',
+                                'error_message': error_msg[:200],
+                                'refined': True,
+                                'original_start_sev': start_sev,
+                                'original_end_sev': end_sev,
+                                'target_layer': layer_name
+                            })
+                            del image
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            break
                         except (RuntimeError, ValueError) as e:
                             error_msg = str(e)
                             # Check if it's a shape mismatch error
@@ -507,12 +778,22 @@ def main():
                                 'original_end_sev': end_sev,
                                 'target_layer': layer_name
                             })
+                            del image
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                             break  # Exit retry loop
                     
                     if cam is None:
+                        # Clean up before continuing
+                        del image
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         continue  # Skip this severity
                     
                     # Compute metrics if CAM succeeded
+                    metrics = None
                     try:
                         metrics = compute_cam_metrics(
                             cam,
@@ -555,7 +836,26 @@ def main():
                             'original_end_sev': end_sev,
                             'target_layer': 'metrics_computation'
                         })
-                        continue
+                    finally:
+                        # CRITICAL: Clean up memory after each refined severity
+                        del image
+                        if cam is not None:
+                            del cam
+                        if metrics is not None:
+                            del metrics
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+            
+            # CRITICAL: Clean up after refined analysis
+            del baseline_image
+            del baseline_cam
+            del gradcam_refined
+            del torch_model_refined
+            del yolo_refined
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             # Append refined records
             if len(refined_records) > 0:
