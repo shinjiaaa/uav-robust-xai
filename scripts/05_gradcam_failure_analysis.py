@@ -48,23 +48,44 @@ def main():
     
     results_dir = Path(config['results']['root'])
     
-    # Load failure events
+    # CRITICAL: Load risk_events.csv (new format with CAM computation scope)
+    # If risk_events.csv exists, use it; otherwise fallback to failure_events.csv (legacy)
+    risk_events_csv = results_dir / "risk_events.csv"
     failure_events_csv = results_dir / "failure_events.csv"
-    if not failure_events_csv.exists():
-        print("Error: Failure events not found. Run scripts/04_detect_failure_events.py first")
-        sys.exit(1)
     
-    # Check if file is empty
-    try:
-        failure_events_df = pd.read_csv(failure_events_csv)
-        if len(failure_events_df) == 0:
-            print("Warning: No failure events found. Skipping Grad-CAM analysis.")
+    use_risk_events = False
+    if risk_events_csv.exists() and risk_events_csv.stat().st_size > 0:
+        try:
+            risk_events_df = pd.read_csv(risk_events_csv)
+            if len(risk_events_df) > 0:
+                failure_events_df = risk_events_df  # Use risk_events as failure_events
+                use_risk_events = True
+                print(f"[INFO] Loaded {len(risk_events_df)} risk events from risk_events.csv")
+                print(f"[INFO] CAM will be computed only for risk regions (cam_sev_from to cam_sev_to)")
+        except Exception as e:
+            print(f"[WARN] Failed to load risk_events.csv: {e}")
+            use_risk_events = False
+    
+    if not use_risk_events:
+        # Fallback to legacy failure_events.csv
+        if not failure_events_csv.exists():
+            print("Error: Neither risk_events.csv nor failure_events.csv found.")
+            print("Please run scripts/04_detect_risk_events.py (or scripts/04_detect_failure_events.py) first")
+            sys.exit(1)
+        
+        try:
+            failure_events_df = pd.read_csv(failure_events_csv)
+            if len(failure_events_df) == 0:
+                print("Warning: No failure events found. Skipping Grad-CAM analysis.")
+                sys.exit(0)
+        except pd.errors.EmptyDataError:
+            print("Warning: Failure events file is empty. Skipping Grad-CAM analysis.")
             sys.exit(0)
-    except pd.errors.EmptyDataError:
-        print("Warning: Failure events file is empty. Skipping Grad-CAM analysis.")
-        sys.exit(0)
+        
+        print(f"[INFO] Loaded {len(failure_events_df)} failure events from failure_events.csv (legacy)")
+        print(f"[WARN] Using legacy format - CAM will be computed for all severities 0 to failure_severity")
     
-    print(f"Loaded {len(failure_events_df)} failure events")
+    print(f"Total events to process: {len(failure_events_df)}")
     
     # Load tiny objects
     tiny_objects_file = results_dir / "tiny_objects_samples.json"
@@ -92,13 +113,23 @@ def main():
     # Process failure events (limit to max_samples)
     max_samples = gradcam_config.get('max_samples', 20)
     
-    sample_events = (failure_events_df
-                 .groupby("corruption", group_keys=False)
-                 .head(max_samples//3))
+    # CRITICAL: If using risk_events, we already have filtered scope (cam_sev_from to cam_sev_to)
+    # So we can process more events efficiently
+    if use_risk_events:
+        # Process all risk events (they are already scoped to risk regions)
+        sample_events = failure_events_df.copy()
+        print(f"\n[INFO] Using risk_events.csv - processing all {len(sample_events)} risk events")
+        print("[INFO] CAM will be computed only for risk regions (reduces computation cost)")
+    else:
+        # Legacy: sample events for memory efficiency
+        sample_events = (failure_events_df
+                     .groupby("corruption", group_keys=False)
+                     .head(max_samples//3))
+        print(f"\n[INFO] Using legacy failure_events.csv - sampling {len(sample_events)} events")
                  
     print("\n[DBG] sample_events corruption distribution:")
     print(sample_events["corruption"].value_counts())
-    print(f"\nProcessing {len(sample_events)} failure events...")
+    print(f"\nProcessing {len(sample_events)} events...")
     
     # Track CAM generation success/failure by corruption
     corruption_cam_stats = {corr: {'success': 0, 'failed': 0} for corr in sample_events['corruption'].unique()}
@@ -205,28 +236,79 @@ def main():
     
     for _, event in tqdm(sample_events.iterrows(), total=len(sample_events), desc="Processing events"):
         # Only process yolo_generic (already filtered by model loading)
-        if event['model'] != model_name:
+        event_model = event.get('model', event.get('model_id', ''))
+        if event_model != model_name:
             continue
         
         corruption = event['corruption']
-        image_id = event['image_id']
-        class_id = event['class_id']
-        failure_severity = int(event['failure_severity'])
         
-        # Get tiny object bbox
-        key = (image_id, class_id)
-        tiny_obj = tiny_obj_lookup.get(key)
-        if not tiny_obj:
-            print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id}")
-            continue
+        # CRITICAL: Use risk_events format if available (has object_uid, cam_sev_from, cam_sev_to)
+        if use_risk_events and 'object_uid' in event and 'cam_sev_from' in event and 'cam_sev_to' in event:
+            object_uid = event['object_uid']
+            cam_sev_from = int(event['cam_sev_from'])
+            cam_sev_to = int(event['cam_sev_to'])
+            start_severity = int(event['start_severity'])
+            failure_type = event.get('failure_type', 'unknown')
+            failure_event_id = event.get('failure_event_id', '')
+            
+            # Get tiny object from object_uid (parse image_id and class_id from object_uid)
+            # object_uid format: {image_id}_obj{object_index}_cls{class_id}
+            try:
+                if '_cls' in object_uid:
+                    parts = object_uid.split('_cls')
+                    image_id = parts[0].rsplit('_obj', 1)[0] if '_obj' in parts[0] else parts[0]
+                    class_id = int(parts[1])
+                elif '_obj' in object_uid:
+                    parts = object_uid.split('_obj')
+                    image_id = parts[0]
+                    class_id = int(parts[1]) if len(parts) > 1 else 0
+                else:
+                    # Fallback: use object_uid as image_id
+                    image_id = object_uid
+                    class_id = 0
+            except Exception as e:
+                # Fallback: try to get from event if available
+                image_id = event.get('image_id', object_uid)
+                class_id = event.get('class_id', 0)
+                print(f"[WARN] Failed to parse object_uid {object_uid}: {e}, using image_id={image_id}, class_id={class_id}")
+            
+            # Get tiny object bbox
+            key = (image_id, class_id)
+            tiny_obj = tiny_obj_lookup.get(key)
+            if not tiny_obj:
+                print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id} (object_uid={object_uid})")
+                continue
+            
+            frame_rel_path = tiny_obj['frame_path']
+            failure_severity = start_severity  # Use start_severity as failure_severity
+            
+            # CRITICAL: Process only CAM computation scope (cam_sev_from to cam_sev_to)
+            severity_range = range(cam_sev_from, cam_sev_to + 1)
+        else:
+            # Legacy format: use failure_events.csv structure
+            image_id = event['image_id']
+            class_id = event['class_id']
+            failure_severity = int(event['failure_severity'])
+            failure_event_id = event.get('failure_event_id', '')
+            failure_type = 'unknown'
+            
+            # Get tiny object bbox
+            key = (image_id, class_id)
+            tiny_obj = tiny_obj_lookup.get(key)
+            if not tiny_obj:
+                print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id}")
+                continue
+            
+            frame_rel_path = tiny_obj['frame_path']
+            object_uid = f"{image_id}_obj_{class_id}"  # Generate object_uid if missing
+            
+            # Legacy: Process all severities 0 to failure_severity
+            severity_range = range(0, failure_severity + 1)
         
-        frame_rel_path = tiny_obj['frame_path']
-        
-        # Process each severity up to failure severity
         # Store baseline CAMs per layer (primary/secondary)
         baseline_cams = {}  # {layer_role: cam}
         
-        for severity in range(0, failure_severity + 1):
+        for severity in severity_range:
             # Get image path
             if severity == 0:
                 image_path = visdrone_root / frame_rel_path
@@ -389,12 +471,14 @@ def main():
                         preprocessed_shape_tuple = preprocessed_shape
                     
                     # Create fail record with detailed error information and QC diagnostics
+                    # CRITICAL: Include object_uid and failure_event_id for alignment analysis
                     record = create_cam_record(
                         model=model_name,
                         corruption=corruption,
                         severity=severity,
                         image_id=image_id,
                         class_id=class_id,
+                        object_id=object_uid if 'object_uid' in locals() else None,  # Store object_uid
                         bbox_x1=visdrone_bbox[0],
                         bbox_y1=visdrone_bbox[1],
                         bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
@@ -417,6 +501,11 @@ def main():
                         preprocessed_shape=preprocessed_shape_tuple,
                         failure_severity=failure_severity
                     )
+                    
+                    # Add failure_event_id if available (for alignment analysis)
+                    if use_risk_events and 'failure_event_id' in event:
+                        record['failure_event_id'] = event['failure_event_id']
+                        record['failure_type'] = failure_type
                     cam_records.append(record)
                     if layer_role == 'primary':
                         corruption_cam_stats[corruption]['failed'] += 1
@@ -471,12 +560,14 @@ def main():
                         preprocessed_shape_tuple = preprocessed_shape
                     
                     # Create record with new schema
+                    # CRITICAL: Include object_uid and failure_event_id for alignment analysis
                     record = create_cam_record(
                         model=model_name,
                         corruption=corruption,
                         severity=severity,
                         image_id=image_id,
                         class_id=class_id,
+                        object_id=object_uid if 'object_uid' in locals() else None,  # Store object_uid
                         bbox_x1=visdrone_bbox[0],
                         bbox_y1=visdrone_bbox[1],
                         bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
@@ -503,6 +594,11 @@ def main():
                         preprocessed_shape=preprocessed_shape_tuple,
                         failure_severity=failure_severity
                     )
+                    
+                    # Add failure_event_id if available (for alignment analysis)
+                    if use_risk_events and 'failure_event_id' in event:
+                        record['failure_event_id'] = event['failure_event_id']
+                        record['failure_type'] = failure_type
                     cam_records.append(record)
                     if layer_role == 'primary':
                         corruption_cam_stats[corruption]['success'] += 1

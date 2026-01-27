@@ -58,9 +58,10 @@ def main():
             'required': False  # Optional: may take long time
         },
         {
-            'name': '4. Detect failure events',
-            'script': 'scripts/04_detect_failure_events.py',
-            'required': True
+            'name': '4. Detect risk events (Performance Axis → risk_events.csv)',
+            'script': 'scripts/04_detect_risk_events.py',
+            'required': True,
+            'fallback': 'scripts/04_detect_failure_events.py'  # Fallback to legacy if new script fails
         },
         {
             'name': '5. Grad-CAM failure analysis (with dynamic refinement)',
@@ -82,12 +83,38 @@ def main():
         try:
             result = subprocess.run(
                 [sys.executable, step['script']],
-                check=step['required']
+                check=step['required'],
+                capture_output=True,
+                text=True
             )
+            print(result.stdout)
             print(f"[OK] {step['name']} completed")
         except subprocess.CalledProcessError as e:
-            if step['required']:
+            # Try fallback script if available
+            if 'fallback' in step and step['fallback']:
+                print(f"[WARN] {step['name']} failed, trying fallback: {step['fallback']}")
+                try:
+                    result = subprocess.run(
+                        [sys.executable, step['fallback']],
+                        check=step['required'],
+                        capture_output=True,
+                        text=True
+                    )
+                    print(result.stdout)
+                    print(f"[OK] Fallback script completed")
+                except subprocess.CalledProcessError as e2:
+                    if step['required']:
+                        print(f"[ERROR] Both scripts failed:")
+                        print(f"  Primary: {e}")
+                        print(f"  Fallback: {e2}")
+                        print("Stopping full experiment.")
+                        return
+                    else:
+                        print(f"[SKIP] Both scripts failed (optional)")
+            elif step['required']:
                 print(f"[ERROR] {step['name']} failed: {e}")
+                if hasattr(e, 'stderr') and e.stderr:
+                    print(f"Error output: {e.stderr}")
                 print("Stopping full experiment.")
                 return
             else:

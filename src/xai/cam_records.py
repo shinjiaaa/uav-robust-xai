@@ -12,7 +12,7 @@ def create_cam_record(
     corruption: str,
     severity: int,
     image_id: str,
-    object_id: Optional[str] = None,
+    object_id: Optional[str] = None,  # Can store object_uid for alignment
     frame_id: Optional[str] = None,
     clip_id: Optional[str] = None,
     class_id: int = None,
@@ -62,7 +62,10 @@ def create_cam_record(
     
     # Additional metadata
     letterbox_meta: Optional[Dict] = None,
-    failure_severity: Optional[int] = None
+    failure_severity: Optional[int] = None,
+    # Alignment analysis fields (for joining with risk_events)
+    failure_event_id: Optional[str] = None,  # Links to risk_events.csv
+    failure_type: Optional[str] = None  # miss / score_drop / iou_drop
 ) -> Dict:
     """Create a CAM record with standardized schema.
     
@@ -124,7 +127,10 @@ def create_cam_record(
         'map_bucket': map_bucket,
         
         # Metadata
-        'failure_severity': failure_severity
+        'failure_severity': failure_severity,
+        # Alignment analysis fields
+        'failure_event_id': failure_event_id,
+        'failure_type': failure_type
     }
     
     # Store letterbox_meta as JSON string if provided

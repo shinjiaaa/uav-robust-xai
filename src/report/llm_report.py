@@ -170,6 +170,14 @@ def load_metrics(config: Dict) -> Dict:
     else:
         metrics['cam_records'] = []
     
+    # Risk events (for alignment analysis)
+    risk_events_csv = results_root / "risk_events.csv"
+    if risk_events_csv.exists():
+        metrics['risk_events'] = _read_csv_if_exists(risk_events_csv)
+        print(f"[INFO] Loaded {len(metrics['risk_events'])} risk events from risk_events.csv")
+    else:
+        metrics['risk_events'] = []
+    
     # Legacy CAM metrics (for backward compatibility, but NOT used for Table 7)
     cam_metrics_csv = results_root / "cam_metrics.csv"
     if cam_metrics_csv.exists():
@@ -1107,6 +1115,190 @@ def summarize_metrics(metrics: Dict) -> Dict:
         }
 
         summarized['final_summary'] = final_summary
+        
+        # ---- alignment_analysis (NEW: Performance Axis vs Cognition Axis alignment)
+        # CRITICAL: Join risk_events (Performance Axis) with cam_records (Cognition Axis)
+        risk_events = metrics.get('risk_events', [])
+        if len(risk_events) > 0 and len(cam_records) > 0:
+            risk_events_df = pd.DataFrame(risk_events)
+            cam_records_df = pd.DataFrame(cam_records)
+            
+            # CAM change detection thresholds
+            CAM_CHANGE_THRESHOLDS_ALIGNMENT = {
+                'center_shift': 0.05,  # Significant center shift
+                'entropy': 0.5,  # Significant entropy change
+                'activation_spread': 0.05,  # Significant spread change
+                'energy_in_bbox': 0.001  # Significant energy change
+            }
+            
+            alignment_analysis = {}
+            
+            for _, risk_event in risk_events_df.iterrows():
+                event_id = risk_event.get('failure_event_id', '')
+                corruption = risk_event.get('corruption', '')
+                object_uid = risk_event.get('object_uid', '')
+                start_severity = int(risk_event.get('start_severity', -1))
+                failure_type = risk_event.get('failure_type', 'unknown')
+                
+                if start_severity < 0:
+                    continue
+                
+                # Find CAM records for this event (by object_uid or failure_event_id)
+                # Try multiple join strategies for robustness
+                event_cam = pd.DataFrame()
+                
+                # Strategy 1: Join by failure_event_id (most reliable)
+                if 'failure_event_id' in cam_records_df.columns:
+                    event_cam = cam_records_df[cam_records_df['failure_event_id'] == event_id].copy()
+                
+                # Strategy 2: Join by object_id (object_uid stored in object_id field)
+                if len(event_cam) == 0 and 'object_id' in cam_records_df.columns:
+                    event_cam = cam_records_df[cam_records_df['object_id'] == object_uid].copy()
+                
+                # Strategy 3: Join by image_id + class_id + corruption (fallback)
+                if len(event_cam) == 0:
+                    # Parse image_id from object_uid
+                    try:
+                        if '_cls' in object_uid:
+                            image_id_from_uid = object_uid.split('_cls')[0].rsplit('_obj', 1)[0] if '_obj' in object_uid else object_uid.split('_cls')[0]
+                            class_id_from_uid = int(object_uid.split('_cls')[1])
+                        else:
+                            image_id_from_uid = object_uid
+                            class_id_from_uid = None
+                        
+                        if 'image_id' in cam_records_df.columns and 'class_id' in cam_records_df.columns:
+                            event_cam = cam_records_df[
+                                (cam_records_df['image_id'] == image_id_from_uid) &
+                                (cam_records_df['class_id'] == class_id_from_uid) &
+                                (cam_records_df['corruption'] == corruption)
+                            ].copy()
+                    except:
+                        pass
+                
+                if len(event_cam) == 0:
+                    continue
+                
+                if len(event_cam) == 0:
+                    continue
+                
+                # Filter by corruption and severity range
+                event_cam = event_cam[
+                    (event_cam['corruption'] == corruption) &
+                    (event_cam['severity'] <= start_severity)
+                ].copy()
+                
+                if len(event_cam) == 0:
+                    continue
+                
+                # Get baseline CAM (severity 0)
+                baseline_cam = event_cam[event_cam['severity'] == 0].copy()
+                if len(baseline_cam) == 0:
+                    continue
+                
+                # Find CAM change start severity (first severity where CAM metric changes significantly)
+                cam_change_severity = {}
+                for metric_name, threshold in CAM_CHANGE_THRESHOLDS_ALIGNMENT.items():
+                    if metric_name not in event_cam.columns:
+                        continue
+                    
+                    baseline_val = baseline_cam[metric_name].mean()
+                    if pd.isna(baseline_val):
+                        continue
+                    
+                    # Check each severity for significant change
+                    for sev in sorted(event_cam['severity'].unique()):
+                        if sev == 0:
+                            continue
+                        
+                        sev_cam = event_cam[event_cam['severity'] == sev]
+                        if len(sev_cam) == 0:
+                            continue
+                        
+                        sev_val = sev_cam[metric_name].mean()
+                        if pd.isna(sev_val):
+                            continue
+                        
+                        delta = abs(sev_val - baseline_val)
+                        if delta >= threshold:
+                            if metric_name not in cam_change_severity:
+                                cam_change_severity[metric_name] = sev
+                            break
+                
+                # Determine alignment (lead/coincident/lag)
+                if len(cam_change_severity) > 0:
+                    # Use earliest CAM change as the CAM change start
+                    earliest_cam_change = min(cam_change_severity.values())
+                    
+                    if earliest_cam_change < start_severity:
+                        alignment = 'lead'
+                        lead_steps = start_severity - earliest_cam_change
+                    elif earliest_cam_change == start_severity:
+                        alignment = 'coincident'
+                        lead_steps = 0
+                    else:
+                        alignment = 'lag'
+                        lead_steps = earliest_cam_change - start_severity
+                else:
+                    alignment = 'no_cam_change'
+                    earliest_cam_change = None
+                    lead_steps = None
+                
+                # Store alignment result
+                if corruption not in alignment_analysis:
+                    alignment_analysis[corruption] = []
+                
+                alignment_analysis[corruption].append({
+                    'failure_event_id': event_id,
+                    'object_uid': object_uid,
+                    'failure_type': failure_type,
+                    'performance_start_severity': start_severity,  # Performance Axis start
+                    'cam_change_severity': earliest_cam_change,  # Cognition Axis start
+                    'alignment': alignment,  # lead / coincident / lag / no_cam_change
+                    'lead_steps': lead_steps,  # How many severity steps CAM leads/lags
+                    'cam_change_metrics': list(cam_change_severity.keys())  # Which metrics changed
+                })
+            
+            # Aggregate alignment statistics by corruption
+            alignment_summary = {}
+            for corruption, events in alignment_analysis.items():
+                if len(events) == 0:
+                    continue
+                
+                events_df = pd.DataFrame(events)
+                total_events = len(events_df)
+                
+                alignment_summary[corruption] = {
+                    'total_events': total_events,
+                    'lead_count': int((events_df['alignment'] == 'lead').sum()),
+                    'coincident_count': int((events_df['alignment'] == 'coincident').sum()),
+                    'lag_count': int((events_df['alignment'] == 'lag').sum()),
+                    'no_cam_change_count': int((events_df['alignment'] == 'no_cam_change').sum()),
+                    'lead_percentage': float((events_df['alignment'] == 'lead').sum() / total_events * 100) if total_events > 0 else 0.0,
+                    'avg_lead_steps': float(events_df[events_df['alignment'] == 'lead']['lead_steps'].mean()) if (events_df['alignment'] == 'lead').any() else None,
+                    'by_failure_type': {}
+                }
+                
+                # Breakdown by failure type
+                for ftype in events_df['failure_type'].unique():
+                    ftype_events = events_df[events_df['failure_type'] == ftype]
+                    alignment_summary[corruption]['by_failure_type'][ftype] = {
+                        'total': len(ftype_events),
+                        'lead': int((ftype_events['alignment'] == 'lead').sum()),
+                        'coincident': int((ftype_events['alignment'] == 'coincident').sum()),
+                        'lag': int((ftype_events['alignment'] == 'lag').sum()),
+                        'no_cam_change': int((ftype_events['alignment'] == 'no_cam_change').sum())
+                    }
+            
+            summarized['alignment_analysis'] = {
+                'by_event': alignment_analysis,  # Detailed per-event alignment
+                'summary': alignment_summary  # Aggregated statistics
+            }
+        else:
+            summarized['alignment_analysis'] = {
+                'by_event': {},
+                'summary': {},
+                'note': 'Alignment analysis requires both risk_events.csv and cam_records.csv'
+            }
 
     else:
         # If no CAM metrics or no detection records, keep these empty
@@ -1116,6 +1308,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
         summarized['lead_lag_analysis'] = {}
         summarized['cross_corruption_pattern'] = {}
         summarized['final_summary'] = {}
+        summarized['alignment_analysis'] = {}
 
     # Keep gradcam error summary (optional)
     summarized['gradcam_errors'] = metrics.get('gradcam_errors', [])[:200]
@@ -1268,6 +1461,22 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - Format: | Corruption | Severity | n_cam_frames | failure_severity | Energy in BBox Mean | Activation Spread Mean | Entropy Mean | Center Shift Mean |
     - Example: If lowlight has failure_severity=1, ALL lowlight severity rows (0-4) should show failure_severity=1
     - DO NOT omit the failure_severity column even if some values are None
+17. CRITICAL: Alignment Analysis Table (NEW - Performance Axis vs Cognition Axis):
+    - This table shows whether CAM changes (Cognition Axis) occur BEFORE, AT THE SAME TIME, or AFTER performance degradation (Performance Axis)
+    - Alignment analysis is computed from risk_events.csv (Performance Axis) and cam_records.csv (Cognition Axis)
+    - For each risk event, compare:
+      * performance_start_severity: When performance degradation starts (from risk_events.csv)
+      * cam_change_severity: When CAM metrics first change significantly (from cam_records.csv)
+    - Alignment types:
+      * lead: CAM changes BEFORE performance degradation (cam_change_severity < performance_start_severity)
+      * coincident: CAM changes AT THE SAME TIME as performance degradation (==)
+      * lag: CAM changes AFTER performance degradation (>)
+      * no_cam_change: No significant CAM change detected
+    - Create a table showing:
+      * Corruption | Total Events | Lead Count | Coincident Count | Lag Count | Lead % | Avg Lead Steps
+      * Breakdown by failure_type (miss / score_drop / iou_drop) if available
+    - This table directly answers the research question: "Do CAM changes occur before performance collapse?"
+    - Example interpretation: "fog: 73% of events show CAM changes 1-2 severity steps before performance degradation"
 
 Experiment Configuration:
 - Seed: {config['seed']}
@@ -1282,13 +1491,29 @@ Metrics Data (Summarized, JSON format - compact):
 REPORT STRUCTURE:
 1. Start with a brief explanation of the TWO-AXIS research structure:
    - Performance Axis (detection_records.csv): Frame-level detection results showing WHEN performance degrades
+     * Contains: miss-rate curve, score curve, IoU curve by severity
+     * Defines: Risk region start point (first miss/score_drop/iou_drop occurrence)
    - Cognition Axis (cam_records.csv): CAM metrics showing HOW internal cognition changes
+     * Contains: energy_in_bbox, activation_spread, entropy, center_shift by severity
+     * Shows: Internal attention/distribution changes as corruption increases
    - Research goal: Align these axes on time (severity) to prove "CAM changes before performance collapse"
+   - Alignment analysis: Join risk_events.csv (Performance Axis) with cam_records.csv (Cognition Axis)
+     * Compare: performance_start_severity vs cam_change_severity
+     * Result: lead (CAM first) / coincident (same time) / lag (CAM after)
 
 2. Then generate tables showing:
    - Table 2: Performance metrics from detection_records.csv (THE PERFORMANCE AXIS)
+     * Shows: miss-rate, avg_score, avg_iou by corruption×severity
+     * From: detection_records.csv aggregation
    - Table 7: CAM metrics from cam_records.csv (THE COGNITION AXIS)
-   - Alignment analysis: Compare CAM changes with performance degradation timeline
+     * Shows: energy_in_bbox, activation_spread, entropy, center_shift by corruption×severity
+     * From: cam_records.csv (cam_status='ok' only)
+   - Table X (NEW): Alignment Analysis (Performance vs Cognition)
+     * Shows: For each corruption, how many events show lead/coincident/lag
+     * Format: | Corruption | Total Events | Lead Count | Coincident Count | Lag Count | Lead % | Avg Lead Steps |
+     * Breakdown by failure_type (miss / score_drop / iou_drop) if available
+     * This table directly answers: "Do CAM changes occur before performance collapse?"
+     * Example: "fog: 73% of events (73/100) show CAM changes 1-2 severity steps before performance degradation"
 
 Generate a markdown report with TABLES ONLY. All text descriptions should be commented out with <!-- -->.
 """
