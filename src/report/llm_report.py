@@ -48,10 +48,19 @@ def get_failure_severity_for_corruption(
     # Method 1: Use failure_events.csv if available
     if fail_df is not None and len(fail_df) > 0 and 'corruption' in fail_df.columns:
         corr_fail = fail_df[fail_df['corruption'] == corruption].copy()
-        if len(corr_fail) > 0 and 'first_miss_severity' in corr_fail.columns:
-            first_miss_sevs = corr_fail['first_miss_severity'].dropna()
-            if len(first_miss_sevs) > 0:
-                return int(first_miss_sevs.min())
+        if len(corr_fail) > 0:
+            # Try first_miss_severity first (preferred)
+            if 'first_miss_severity' in corr_fail.columns:
+                first_miss_sevs = corr_fail['first_miss_severity'].dropna()
+                if len(first_miss_sevs) > 0:
+                    return int(first_miss_sevs.min())
+            
+            # Fallback to failure_severity if first_miss_severity is not available
+            # This handles cases like lowlight where failure_type is score_drop/iou_drop
+            if 'failure_severity' in corr_fail.columns:
+                failure_sevs = corr_fail['failure_severity'].dropna()
+                if len(failure_sevs) > 0:
+                    return int(failure_sevs.min())
 
     # Method 2: Fallback to detection records (miss_rate >= 0.25)
     if det_df is not None and len(det_df) > 0 and 'corruption' in det_df.columns:
@@ -67,7 +76,14 @@ def get_failure_severity_for_corruption(
 
 def _read_csv_if_exists(path: Path) -> list:
     if path.exists():
-        return pd.read_csv(path).to_dict('records')
+        try:
+            df = pd.read_csv(path)
+            # Handle empty CSV files
+            if len(df) == 0 or df.empty:
+                return []
+            return df.to_dict('records')
+        except (pd.errors.EmptyDataError, pd.errors.ParserError):
+            return []
     return []
 
 
@@ -520,6 +536,13 @@ def summarize_metrics(metrics: Dict) -> Dict:
         # Use the same available_corruptions_from_det from dataset metrics section
         # (already computed at the beginning of summarize_metrics)
 
+        # Get failure severity for each corruption (to include in CAM metrics table)
+        failure_severity_by_corruption = {}
+        for corruption in all_expected_corruptions:
+            if corruption in available_corruptions_from_det:
+                unified_failure_sev = get_failure_severity_for_corruption(fail_df, corruption, det_df)
+                failure_severity_by_corruption[corruption] = unified_failure_sev
+        
         for corruption in all_expected_corruptions:
             # CRITICAL: Only process corruptions that have actual detection records
             if corruption not in available_corruptions_from_det:
@@ -531,12 +554,16 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         'entropy_mean': None,
                         'center_shift_mean': None,
                         'n_cam_frames': 0,
+                        'failure_severity': None,  # Add failure_severity
                         'note': 'N/A (no detection records - data inconsistency)'
                     }
                 continue
             
             corr_cam = cam_df[cam_df['corruption'] == corruption].copy() if 'corruption' in cam_df.columns and corruption in cam_df['corruption'].unique() else pd.DataFrame()
             cam_metrics_by_corruption_severity[corruption] = {}
+            
+            # Get failure severity for this corruption
+            unified_failure_sev = failure_severity_by_corruption.get(corruption)
 
             if len(corr_cam) > 0 and 'severity' in corr_cam.columns:
                 for sev in all_severities:
@@ -549,6 +576,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
                             'entropy_mean': float(sev_cam['entropy'].mean()) if 'entropy' in sev_cam.columns else None,
                             'center_shift_mean': float(sev_cam['center_shift'].mean()) if 'center_shift' in sev_cam.columns else None,
                             'n_cam_frames': int(n_cam_frames),
+                            'failure_severity': unified_failure_sev,  # Add failure_severity
                             'note': f'Computed from {n_cam_frames} CAM frames'
                         }
                     else:
@@ -558,6 +586,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
                             'entropy_mean': None,
                             'center_shift_mean': None,
                             'n_cam_frames': 0,
+                            'failure_severity': unified_failure_sev,  # Add failure_severity even when n_cam_frames=0
                             'note': 'N/A (n_cam_frames=0)'
                         }
             else:
@@ -568,6 +597,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         'entropy_mean': None,
                         'center_shift_mean': None,
                         'n_cam_frames': 0,
+                        'failure_severity': unified_failure_sev,  # Add failure_severity even when CAM data not available
                         'note': 'N/A (CAM data not available for this corruption, n_cam_frames=0)'
                     }
 
@@ -1030,6 +1060,14 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - Each severity's CAM is computed INDEPENDENTLY (not cumulative)
     - CAM metrics compare each severity's CAM to baseline (severity 0)
     - This tracks CAM distribution changes as corruption severity increases up to failure point
+16. CRITICAL: CAM Metrics Table MUST include failure_severity column:
+    - The "CAM Metrics by Corruption Severity" table MUST have a "failure_severity" column
+    - failure_severity is the unified failure severity for the ENTIRE corruption (same value for all severities of the same corruption)
+    - failure_severity comes from cam_metrics_by_corruption_severity[corruption][severity]['failure_severity']
+    - If n_cam_frames=0, still show failure_severity if it exists (do NOT mark as N/A)
+    - Format: | Corruption | Severity | n_cam_frames | failure_severity | Energy in BBox Mean | Activation Spread Mean | Entropy Mean | Center Shift Mean |
+    - Example: If lowlight has failure_severity=1, ALL lowlight severity rows (0-4) should show failure_severity=1
+    - DO NOT omit the failure_severity column even if some values are None
 
 Experiment Configuration:
 - Seed: {config['seed']}

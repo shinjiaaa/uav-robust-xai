@@ -66,20 +66,52 @@ def detect_failure_events(
                     first_miss_frame = 0  # Single image, no frame index
             
             # Check for score drop
+            # Use both absolute and relative drop thresholds for better detection
+            # Relative drop is useful for lowlight where baseline scores may be lower
             if score_drop_severity is None:
                 matched = severity_group[severity_group['miss'] == 0]
                 if len(matched) > 0:
                     avg_score = matched['score'].mean()
-                    if baseline_score - avg_score >= risk_config['score_drop_threshold']:
+                    absolute_drop = baseline_score - avg_score
+                    # Use relative drop if baseline is > 0.1 (avoid division by very small numbers)
+                    relative_drop = absolute_drop / baseline_score if baseline_score > 0.1 else 0.0
+                    
+                    # Check absolute threshold (original)
+                    absolute_triggered = absolute_drop >= risk_config['score_drop_threshold']
+                    # Check relative threshold (useful for lowlight)
+                    relative_threshold = risk_config.get('score_drop_relative_threshold', 0.2)
+                    relative_triggered = relative_drop >= relative_threshold
+                    
+                    # Also check if drop is significant even if below threshold (for lowlight cases)
+                    # If absolute drop > 0.03 and relative drop > 0.05, consider it a failure
+                    # This catches cases like 0000001_03499_d_0000006_4 where drop is meaningful but below strict threshold
+                    meaningful_drop = absolute_drop > 0.03 and relative_drop > 0.05
+                    
+                    if absolute_triggered or relative_triggered or meaningful_drop:
                         score_drop_severity = severity
                         score_drop_frame = 0  # Single image, no frame index
             
             # Check for IoU drop
+            # Use both absolute and relative drop thresholds
             if iou_drop_severity is None:
                 matched = severity_group[severity_group['miss'] == 0]
                 if len(matched) > 0:
                     avg_iou = matched['iou'].mean()
-                    if baseline_iou - avg_iou >= risk_config['iou_drop_threshold']:
+                    absolute_drop = baseline_iou - avg_iou
+                    # Use relative drop if baseline is > 0.1
+                    relative_drop = absolute_drop / baseline_iou if baseline_iou > 0.1 else 0.0
+                    
+                    # Check absolute threshold (original)
+                    absolute_triggered = absolute_drop >= risk_config['iou_drop_threshold']
+                    # Check relative threshold (useful for lowlight)
+                    relative_threshold = risk_config.get('iou_drop_relative_threshold', 0.2)
+                    relative_triggered = relative_drop >= relative_threshold
+                    
+                    # Also check if drop is significant even if below threshold
+                    # If absolute drop > 0.03 and relative drop > 0.05, consider it a failure
+                    meaningful_drop = absolute_drop > 0.03 and relative_drop > 0.05
+                    
+                    if absolute_triggered or relative_triggered or meaningful_drop:
                         iou_drop_severity = severity
                         iou_drop_frame = 0  # Single image, no frame index
         

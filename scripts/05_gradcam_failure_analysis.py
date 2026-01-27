@@ -5,6 +5,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 from PIL import Image
+import torch
+import gc
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -172,9 +174,24 @@ def main():
             if not image_path.exists():
                 continue
             
-            # Load image
-            image = np.array(Image.open(image_path))
-            img_height, img_width = image.shape[:2]
+            # Load image with memory-efficient approach
+            try:
+                pil_image = Image.open(image_path)
+                # Convert to RGB if needed (handles RGBA, L, etc.)
+                if pil_image.mode != 'RGB':
+                    pil_image = pil_image.convert('RGB')
+                image = np.array(pil_image, dtype=np.uint8)
+                img_height, img_width = image.shape[:2]
+                # Explicitly close PIL image to free memory
+                pil_image.close()
+                del pil_image
+            except MemoryError as e:
+                print(f"  [ERROR] Memory error loading image {image_path}: {e}")
+                # Clean up and skip
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             
             # DEBUG: Check image shape consistency across severities
             if severity == 0:
@@ -232,6 +249,10 @@ def main():
                     })
                     break  # Exit retry loop
             if cam is None:
+                # Clean up memory before continuing
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue  # Skip this severity if all layers failed
             
             # Store baseline (severity 0) - use copy to avoid reference sharing
@@ -239,6 +260,7 @@ def main():
                 baseline_cam = cam.copy()  # CRITICAL: Copy to avoid reference sharing across corruptions
             
             # Compute metrics
+            metrics = None
             if baseline_cam is not None:
                 # CRITICAL: Create new metrics dict for each record to avoid reference sharing
                 metrics = compute_cam_metrics(
@@ -267,6 +289,16 @@ def main():
             
             if cam is None:
                 corruption_cam_stats[corruption]['failed'] += 1
+            
+            # Clean up memory after each severity
+            del image
+            if cam is not None:
+                del cam
+            if metrics is not None:
+                del metrics
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     # Print CAM generation statistics by corruption
     print("\n[DBG] CAM generation statistics by corruption:")

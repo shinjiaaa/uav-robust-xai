@@ -102,8 +102,10 @@ evaluation:
 risk_detection:
   map_drop_threshold: 0.15  # absolute drop from severity 0
   miss_rate_threshold: 0.25  # miss rate threshold for risk region (25% - realistic for tiny objects)
-  score_drop_threshold: 0.2  # score drop threshold
-  iou_drop_threshold: 0.2  # IoU drop threshold
+  score_drop_threshold: 0.2  # absolute score drop threshold
+  iou_drop_threshold: 0.2  # absolute IoU drop threshold
+  score_drop_relative_threshold: 0.15  # relative score drop threshold (15% of baseline) - useful for lowlight
+  iou_drop_relative_threshold: 0.15  # relative IoU drop threshold (15% of baseline) - useful for lowlight
   instability_threshold: 0.3  # variance threshold for instability detection (across severities)
   
 # Grad-CAM (failure-event based)
