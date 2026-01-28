@@ -1313,21 +1313,30 @@ def summarize_metrics(metrics: Dict) -> Dict:
         
         # ---- alignment_analysis (NEW: Performance Axis vs Cognition Axis alignment)
         # CRITICAL: Join risk_events (Performance Axis) with cam_records (Cognition Axis)
+        # CRITICAL: Event unit = (corruption, object_uid, failure_type) - one event per unique combination
         risk_events = metrics.get('risk_events', [])
-        if len(risk_events) > 0 and len(cam_records) > 0:
+        cam_records = metrics.get('cam_records', [])
+        
+        # CRITICAL: Process ALL risk_events (even if cam_records is empty - include CAM missing events)
+        if len(risk_events) > 0:
             risk_events_df = pd.DataFrame(risk_events)
-            cam_records_df = pd.DataFrame(cam_records)
+            cam_records_df = pd.DataFrame(cam_records) if len(cam_records) > 0 else pd.DataFrame()
             
-            # CAM change detection thresholds
-            CAM_CHANGE_THRESHOLDS_ALIGNMENT = {
-                'center_shift': 0.05,  # Significant center shift
-                'entropy': 0.5,  # Significant entropy change
-                'activation_spread': 0.05,  # Significant spread change
-                'energy_in_bbox': 0.001  # Significant energy change
-            }
+            # CRITICAL: Define event unit as (corruption, object_uid, failure_type)
+            # Remove duplicates to ensure one event per unique combination
+            if 'corruption' in risk_events_df.columns and 'object_uid' in risk_events_df.columns and 'failure_type' in risk_events_df.columns:
+                # Group by unique key and take first occurrence (or aggregate if needed)
+                risk_events_df = risk_events_df.drop_duplicates(subset=['corruption', 'object_uid', 'failure_type'], keep='first').copy()
+                print(f"[INFO] Deduplicated risk_events: {len(risk_events_df)} unique events (corruption, object_uid, failure_type)")
+            
+            # CRITICAL: Use activation_spread as the representative metric for CAM change detection
+            # This ensures one cam_change_sev per event (not per metric)
+            REPRESENTATIVE_CAM_METRIC = 'activation_spread'
+            CAM_CHANGE_THRESHOLD = 0.05  # Threshold for activation_spread
             
             alignment_analysis = {}
             
+            # CRITICAL: Process ALL events from risk_events_df (even if CAM data is missing)
             for _, risk_event in risk_events_df.iterrows():
                 event_id = risk_event.get('failure_event_id', '')
                 corruption = risk_event.get('corruption', '')
@@ -1370,64 +1379,58 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     except:
                         pass
                 
-                if len(event_cam) == 0:
-                    continue
+                # CRITICAL: Filter by corruption and severity range (up to start_severity)
+                if len(event_cam) > 0:
+                    event_cam = event_cam[
+                        (event_cam['corruption'] == corruption) &
+                        (event_cam['severity'] <= start_severity)
+                    ].copy()
                 
-                if len(event_cam) == 0:
-                    continue
+                # CRITICAL: Find CAM change using representative metric (activation_spread)
+                # This ensures one cam_change_sev per event
+                cam_change_severity = None
+                cam_change_metric = None
                 
-                # Filter by corruption and severity range
-                event_cam = event_cam[
-                    (event_cam['corruption'] == corruption) &
-                    (event_cam['severity'] <= start_severity)
-                ].copy()
-                
-                if len(event_cam) == 0:
-                    continue
-                
-                # Get baseline CAM (severity 0)
-                baseline_cam = event_cam[event_cam['severity'] == 0].copy()
-                if len(baseline_cam) == 0:
-                    continue
-                
-                # Find CAM change start severity (first severity where CAM metric changes significantly)
-                cam_change_severity = {}
-                for metric_name, threshold in CAM_CHANGE_THRESHOLDS_ALIGNMENT.items():
-                    if metric_name not in event_cam.columns:
-                        continue
+                if len(event_cam) > 0:
+                    # Get baseline CAM (severity 0) - use primary layer only
+                    baseline_cam = event_cam[
+                        (event_cam['severity'] == 0) & 
+                        (event_cam.get('layer_role', 'primary') == 'primary')
+                    ].copy()
                     
-                    baseline_val = baseline_cam[metric_name].mean()
-                    if pd.isna(baseline_val):
-                        continue
-                    
-                    # Check each severity for significant change
-                    for sev in sorted(event_cam['severity'].unique()):
-                        if sev == 0:
-                            continue
+                    if len(baseline_cam) > 0 and REPRESENTATIVE_CAM_METRIC in baseline_cam.columns:
+                        baseline_val = baseline_cam[REPRESENTATIVE_CAM_METRIC].mean()
                         
-                        sev_cam = event_cam[event_cam['severity'] == sev]
-                        if len(sev_cam) == 0:
-                            continue
-                        
-                        sev_val = sev_cam[metric_name].mean()
-                        if pd.isna(sev_val):
-                            continue
-                        
-                        delta = abs(sev_val - baseline_val)
-                        if delta >= threshold:
-                            if metric_name not in cam_change_severity:
-                                cam_change_severity[metric_name] = sev
-                            break
+                        if pd.notna(baseline_val):
+                            # Use primary layer only for consistency
+                            event_cam_primary = event_cam[event_cam.get('layer_role', 'primary') == 'primary'].copy()
+                            
+                            # Find first severity where activation_spread changes significantly
+                            for sev in sorted(event_cam_primary['severity'].unique()):
+                                if sev == 0:
+                                    continue
+                                
+                                sev_cam = event_cam_primary[event_cam_primary['severity'] == sev]
+                                if len(sev_cam) == 0:
+                                    continue
+                                
+                                sev_val = sev_cam[REPRESENTATIVE_CAM_METRIC].mean()
+                                if pd.isna(sev_val):
+                                    continue
+                                
+                                delta = abs(sev_val - baseline_val)
+                                if delta >= CAM_CHANGE_THRESHOLD:
+                                    cam_change_severity = sev
+                                    cam_change_metric = REPRESENTATIVE_CAM_METRIC
+                                    break
                 
                 # CRITICAL: Determine alignment using unified formula
                 # lead_steps = perf_start_severity - cam_change_severity
                 # > 0 → lead, = 0 → coincident, < 0 → lag
-                if len(cam_change_severity) > 0:
-                    # Use earliest CAM change as the CAM change start
-                    earliest_cam_change = min(cam_change_severity.values())
-                    
+                # CRITICAL: If CAM is missing, mark as N/A (don't skip the event)
+                if cam_change_severity is not None:
                     # CRITICAL: Unified lead_steps calculation
-                    lead_steps = start_severity - earliest_cam_change
+                    lead_steps = start_severity - cam_change_severity
                     
                     # CRITICAL: Alignment based on lead_steps (not separate conditions)
                     if lead_steps > 0:
@@ -1437,11 +1440,13 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     else:  # lead_steps < 0
                         alignment = 'lag'
                 else:
-                    alignment = 'no_cam_change'
-                    earliest_cam_change = None
+                    # CAM missing: mark as N/A (event still exists in X-detail)
+                    alignment = None  # N/A
+                    cam_change_severity = None
                     lead_steps = None
+                    cam_change_metric = None
                 
-                # Store alignment result
+                # CRITICAL: Store alignment result for ALL events (including CAM missing)
                 if corruption not in alignment_analysis:
                     alignment_analysis[corruption] = []
                 
@@ -1450,10 +1455,10 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     'object_uid': object_uid,
                     'failure_type': failure_type,
                     'performance_start_severity': start_severity,  # Performance Axis start
-                    'cam_change_severity': earliest_cam_change,  # Cognition Axis start
-                    'alignment': alignment,  # lead / coincident / lag / no_cam_change
-                    'lead_steps': lead_steps,  # Unified: perf_start_sev - cam_change_sev
-                    'cam_change_metrics': list(cam_change_severity.keys())  # Which metrics changed
+                    'cam_change_severity': cam_change_severity,  # Cognition Axis start (one per event)
+                    'cam_change_metric': cam_change_metric,  # Representative metric (activation_spread)
+                    'alignment': alignment,  # lead / coincident / lag / None (N/A if CAM missing)
+                    'lead_steps': lead_steps,  # Unified: perf_start_sev - cam_change_sev (None if CAM missing)
                 })
             
             # CRITICAL: Aggregate alignment statistics by corruption
@@ -1468,18 +1473,19 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 # CRITICAL: Create detail_events first (Table X-detail)
                 # This is the source of truth - all summary stats must come from here
                 # CRITICAL: lead_steps MUST be calculated as: perf_start_sev - cam_change_sev
+                # CRITICAL: X-summary MUST be calculated from detail_events_df (not from original events_df)
                 detail_events_list = []
                 for _, event_row in events_df.iterrows():
                     perf_start = event_row.get('performance_start_severity')
                     cam_change = event_row.get('cam_change_severity')
                     
-                    # CRITICAL: Recalculate lead_steps using unified formula
+                    # CRITICAL: Recalculate lead_steps using unified formula (ALWAYS, no exceptions)
                     # lead_steps = perf_start_sev - cam_change_sev
                     if perf_start is not None and cam_change is not None:
                         # Recalculate lead_steps (this is the ONLY correct formula)
-                        recalc_lead_steps = perf_start - cam_change
+                        recalc_lead_steps = int(perf_start) - int(cam_change)
                         
-                        # Re-verify alignment based on recalculated lead_steps
+                        # Re-verify alignment based on recalculated lead_steps (ALWAYS recalculate)
                         if recalc_lead_steps > 0:
                             recalc_alignment = 'lead'
                         elif recalc_lead_steps == 0:
@@ -1487,13 +1493,19 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         else:  # recalc_lead_steps < 0
                             recalc_alignment = 'lag'
                         
-                        # CRITICAL: Always use recalculated values (fix any inconsistency)
+                        # CRITICAL: Always use recalculated values (ignore original values completely)
                         alignment = recalc_alignment
                         lead_steps = recalc_lead_steps
+                    elif perf_start is not None:
+                        # perf_start exists but cam_change is None → CAM missing (N/A)
+                        alignment = None  # N/A (not 'no_cam_change' - use None for clarity)
+                        lead_steps = None
+                        cam_change_metric = None
                     else:
-                        # If either is None, use original values but mark as no_cam_change
-                        alignment = event_row.get('alignment', 'no_cam_change')
-                        lead_steps = event_row.get('lead_steps')
+                        # Both None → invalid event, but still include in detail
+                        alignment = None
+                        lead_steps = None
+                        cam_change_metric = None
                     
                     detail_events_list.append({
                         'failure_event_id': event_row.get('failure_event_id', ''),
@@ -1501,56 +1513,69 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         'corruption': corruption,
                         'failure_type': event_row.get('failure_type', ''),
                         'performance_start_severity': perf_start,
-                        'cam_change_severity': cam_change,
-                        'cam_change_metric': event_row.get('cam_change_metrics', [None])[0] if isinstance(event_row.get('cam_change_metrics'), list) and len(event_row.get('cam_change_metrics', [])) > 0 else None,
-                        'alignment': alignment,  # Always use recalculated alignment
-                        'lead_steps': lead_steps  # Always use recalculated lead_steps
+                        'cam_change_severity': cam_change,  # None if CAM missing
+                        'cam_change_metric': cam_change_metric if 'cam_change_metric' in locals() else event_row.get('cam_change_metric'),  # activation_spread or None
+                        'alignment': alignment,  # ALWAYS recalculated alignment (None if CAM missing)
+                        'lead_steps': lead_steps  # ALWAYS recalculated lead_steps (None if CAM missing)
                     })
                 
-                # CRITICAL: Recreate events_df from detail_events to ensure consistency
+                # CRITICAL: Create detail_events_df from detail_events_list
+                # This is the SOURCE OF TRUTH - X-summary MUST be calculated from this DataFrame
                 detail_events_df = pd.DataFrame(detail_events_list)
-                # CRITICAL: total_events should match the original events count (not detail_events count)
-                # detail_events contains ALL events (not a sample), so count should match
-                total_events = len(events_df)  # Use original count (should match detail_events if all events have CAM data)
-                
-                # CRITICAL: Verify that detail_events count matches total_events
-                # If detail_events is shorter, it means some events don't have CAM data
-                if len(detail_events_list) < total_events:
-                    # Some events are missing from detail (no CAM data)
-                    # This is OK - detail_events only includes events with CAM data
-                    pass
-                
-                # STEP 2: Calculate summary from detail_events_df (Table X-summary)
-                # This ensures summary is always consistent with detail
-                # CRITICAL: total_events should be the count of events with CAM data (detail_events_df length)
-                # If some events don't have CAM data, they won't be in detail_events_df
                 detail_total = len(detail_events_df)
+                total_events = len(events_df)  # Original count from risk_events
+                
+                # CRITICAL: Verify detail_events_df has correct alignment values
+                # Debug: Print alignment distribution to verify
+                if detail_total > 0:
+                    alignment_counts = detail_events_df['alignment'].value_counts().to_dict()
+                    print(f"[DEBUG] {corruption}: detail_events_df alignment counts: {alignment_counts}")
+                
+                # STEP 2: Calculate summary EXCLUSIVELY from detail_events_df (Table X-summary)
+                # CRITICAL: X-summary MUST match X-detail - use detail_events_df as the ONLY source
+                # CRITICAL: Total Events = ALL events in detail_events_df (including CAM missing)
+                # Events with CAM = events where cam_change_severity is not None
+                total_events = detail_total  # All events in detail table
+                events_with_cam = int(detail_events_df['cam_change_severity'].notna().sum())
+                
+                # Calculate counts from detail_events_df (only events with CAM)
+                lead_count = int((detail_events_df['alignment'] == 'lead').sum())
+                coincident_count = int((detail_events_df['alignment'] == 'coincident').sum())
+                lag_count = int((detail_events_df['alignment'] == 'lag').sum())
+                cam_missing_count = int(detail_events_df['cam_change_severity'].isna().sum())
+                
+                # Calculate avg_lead_steps only from lead events (lead strength interpretation)
+                lead_events = detail_events_df[detail_events_df['alignment'] == 'lead']
+                avg_lead_steps = float(lead_events['lead_steps'].mean()) if len(lead_events) > 0 else None
                 
                 alignment_summary[corruption] = {
-                    'total_events': total_events,  # Original count from risk_events
-                    'total_events_with_cam': detail_total,  # Events that have CAM data (for detail table)
-                    'lead_count': int((detail_events_df['alignment'] == 'lead').sum()) if detail_total > 0 else 0,
-                    'coincident_count': int((detail_events_df['alignment'] == 'coincident').sum()) if detail_total > 0 else 0,
-                    'lag_count': int((detail_events_df['alignment'] == 'lag').sum()) if detail_total > 0 else 0,
-                    'no_cam_change_count': int((detail_events_df['alignment'] == 'no_cam_change').sum()) if detail_total > 0 else 0,
-                    # CRITICAL: Lead % based on events with CAM data
-                    'lead_percentage': float((detail_events_df['alignment'] == 'lead').sum() / detail_total * 100) if detail_total > 0 else 0.0,
-                    # CRITICAL: Avg lead_steps only from lead events (not coincident/lag)
-                    'avg_lead_steps': float(detail_events_df[detail_events_df['alignment'] == 'lead']['lead_steps'].mean()) if detail_total > 0 and (detail_events_df['alignment'] == 'lead').any() else None,
+                    'total_events': total_events,  # ALL events (including CAM missing)
+                    'total_events_with_cam': events_with_cam,  # Events that have CAM data
+                    # CRITICAL: Counts MUST come from detail_events_df (the source of truth)
+                    'lead_count': lead_count,
+                    'coincident_count': coincident_count,
+                    'lag_count': lag_count,
+                    'cam_missing_count': cam_missing_count,  # Events without CAM data
+                    # CRITICAL: Lead % based on events with CAM data (not total events)
+                    'lead_percentage': float(lead_count / events_with_cam * 100) if events_with_cam > 0 else 0.0,
+                    # CRITICAL: Avg lead_steps only from lead events (lead strength interpretation)
+                    'avg_lead_steps': avg_lead_steps,
                     'by_failure_type': {},
-                    'detail_events': detail_events_list,  # Store detail for Table X-detail (ALL events with CAM data)
-                    'note': f'Total {total_events} events, {detail_total} events have CAM data (shown in detail table)' if detail_total < total_events else f'All {total_events} events have CAM data'
+                    'detail_events': detail_events_list,  # Store detail for Table X-detail (ALL events)
+                    'note': f'Total {total_events} events, {events_with_cam} events have CAM data' if events_with_cam < total_events else f'All {total_events} events have CAM data'
                 }
                 
                 # Breakdown by failure type (from detail_events_df)
                 for ftype in detail_events_df['failure_type'].unique():
                     ftype_events = detail_events_df[detail_events_df['failure_type'] == ftype]
+                    ftype_with_cam = ftype_events[ftype_events['cam_change_severity'].notna()]
                     alignment_summary[corruption]['by_failure_type'][ftype] = {
-                        'total': len(ftype_events),
+                        'total': len(ftype_events),  # All events of this type
+                        'with_cam': len(ftype_with_cam),  # Events with CAM data
                         'lead': int((ftype_events['alignment'] == 'lead').sum()),
                         'coincident': int((ftype_events['alignment'] == 'coincident').sum()),
                         'lag': int((ftype_events['alignment'] == 'lag').sum()),
-                        'no_cam_change': int((ftype_events['alignment'] == 'no_cam_change').sum())
+                        'cam_missing': int(ftype_events['cam_change_severity'].isna().sum())
                     }
             
             summarized['alignment_analysis'] = {
@@ -1799,17 +1824,19 @@ REPORT STRUCTURE:
      * From: cam_records.csv (cam_status='ok' only)
    - Table X-summary (NEW): Alignment Analysis Summary (Performance vs Cognition)
      * CRITICAL: This table MUST be calculated from Table X-detail (not manually)
+     * CRITICAL: Event unit = (corruption, object_uid, failure_type) - one event per unique combination
      * Shows: For each corruption, how many events show lead/coincident/lag
      * Format: | Corruption | Total Events | Events with CAM | Lead Count | Coincident Count | Lag Count | Lead % | Avg Lead Steps |
      * Calculation rules (MUST follow):
-       * Total Events = total events from risk_events.csv
-       * Events with CAM = events that have CAM data (shown in detail table)
-       * Lead Count = count where lead_steps > 0 (from detail table)
-       * Coincident Count = count where lead_steps == 0 (from detail table)
-       * Lag Count = count where lead_steps < 0 (from detail table)
-       * Lead % = (Lead Count / Events with CAM) * 100
-       * Avg Lead Steps = mean(lead_steps) where alignment == 'lead' (only positive values)
-     * CRITICAL: If Total Events > Events with CAM, note: "Some events missing CAM data"
+       * Total Events = count of ALL events in X-detail (including CAM missing)
+       * Events with CAM = count where cam_change_severity != N/A in X-detail
+       * Lead Count = count where alignment == 'lead' in X-detail
+       * Coincident Count = count where alignment == 'coincident' in X-detail
+       * Lag Count = count where alignment == 'lag' in X-detail
+       * Lead % = (Lead Count / Events with CAM) * 100 (NOT total events)
+       * Avg Lead Steps = mean(lead_steps) where alignment == 'lead' (only lead events, for lead strength interpretation)
+     * CRITICAL: If Total Events > Events with CAM, note: "Some events missing CAM data (N/A in detail table)"
+     * CRITICAL: If Total Events == Events with CAM, do NOT show "missing CAM data" note
      * Breakdown by failure_type (miss / score_drop / iou_drop) if available
      * This table directly answers: "Do CAM changes occur before performance collapse?"
      * Example: "fog: 73% of events (73/100) show CAM changes 1-2 severity steps before performance degradation"
@@ -1817,24 +1844,27 @@ REPORT STRUCTURE:
    
    - Table X-detail (NEW - REQUIRED): Alignment Analysis Detail (Reviewer Evidence Table)
      * CRITICAL: This table provides evidence for each alignment conclusion
+     * CRITICAL: Event unit = (corruption, object_uid, failure_type) - one row per event
      * Format: | event_id | corruption | object_uid | failure_type | perf_start_sev | cam_change_sev | cam_metric | alignment | lead_steps |
      * CRITICAL: lead_steps calculation MUST be: lead_steps = perf_start_sev - cam_change_sev
      * CRITICAL: alignment MUST match lead_steps:
        * lead_steps > 0 → alignment = 'lead'
        * lead_steps == 0 → alignment = 'coincident'
        * lead_steps < 0 → alignment = 'lag'
+       * cam_change_sev = N/A → alignment = N/A, lead_steps = N/A
      * Examples:
        * perf_start_sev=1, cam_change_sev=1 → lead_steps=0 → alignment='coincident' (NOT 'lead')
        * perf_start_sev=1, cam_change_sev=0 → lead_steps=1 → alignment='lead'
        * perf_start_sev=1, cam_change_sev=2 → lead_steps=-1 → alignment='lag'
+       * perf_start_sev=1, cam_change_sev=N/A → lead_steps=N/A → alignment=N/A (CAM missing)
      * perf_start_sev = performance_start_severity (from risk_events.csv)
-     * cam_change_sev = cam_change_severity (from cam_records.csv)
-     * cam_metric = which CAM metric detected the change (e.g., 'center_shift')
-     * This table is REQUIRED - without it, reviewers cannot verify alignment claims
-     * CRITICAL: Show ALL events that have CAM data (detail_events count should match or be close to total_events)
-     * If detail_events count < total_events, note: "Some events are missing from detail table (no CAM data available)"
+     * cam_change_sev = cam_change_severity (from cam_records.csv, using activation_spread as representative metric)
+     * cam_metric = representative CAM metric used (always 'activation_spread' - one metric per event)
+     * CRITICAL: Show ALL events from risk_events.csv (including CAM missing events with N/A values)
+     * CRITICAL: Total rows in X-detail MUST match Total Events in X-summary (one row per event)
+     * If some events have N/A for cam_change_sev, they still appear in detail table (with N/A values)
      * Data source: alignment_analysis.summary[corruption]['detail_events'] for each corruption
-     * If detail_events is empty, note: "No detail events available (alignment analysis requires risk_events.csv and cam_records.csv)"
+     * If detail_events is empty, note: "No detail events available (alignment analysis requires risk_events.csv)"
      * This table can be in appendix if too long for main text, but MUST be included somewhere
 
 Generate a markdown report with TABLES ONLY. All text descriptions should be commented out with <!-- -->.
