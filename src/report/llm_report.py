@@ -1718,12 +1718,16 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
       * Avg ΔScore (Avg Score(sev) - Avg Score(sev0) by severity) - CRITICAL: explains score_drop events
         Example: fog sev3: 0.202 - 0.237 = -0.035 (score degradation)
       * Score Drop Rate (mean(is_score_drop) by severity) - shows score_drop events
+        CRITICAL: Display with at least 3 decimal places (e.g., 0.000, 0.001, 0.015) to distinguish between true 0.0 and very small values
+        Format: Use .3f or .4f format (e.g., 0.000 instead of 0.0, 0.001 instead of 0.00)
       * IoU Drop Rate (mean(is_iou_drop) by severity) - shows iou_drop events
+        CRITICAL: Display with at least 3 decimal places (same as Score Drop Rate)
       * Avg ΔIoU (mean(delta_iou where matched==1) by severity) - shows IoU degradation magnitude
     - These columns explain: "Miss Rate = 0 but events exist because score_drop/iou_drop occurred"
     - Avg ΔScore is the KEY metric: negative values show score degradation even without miss
-    - CRITICAL: If Score Drop Rate is 0 but score_drop events exist in risk_events.csv, add this note below Table 2:
-      "Note: Score-drop events are detected at the object level (risk_events.csv), whereas Score Drop Rate in Table 2 is an aggregate over all records; thus the rate can be low even when individual events exist. Avg ΔScore shows the actual score degradation magnitude."
+    - CRITICAL: ALWAYS add this definition note below Table 2 (after the table, before any other content):
+      "**Definition note:** Score Drop Rate is computed at the record level per severity (fraction of records whose confidence falls below the drop threshold relative to the severity-0 baseline), while `score_drop` events in Table X are derived at the object level as the first severity where the drop condition is met."
+      This note MUST appear immediately after Table 2, regardless of whether Score Drop Rate is 0 or not.
     - Check detection_summary.has_data field in the metrics data
     - If detection_summary.has_data is False or missing:
       - DO NOT create Table 2 (Detection Summary / Performance Metrics)
@@ -1825,22 +1829,37 @@ REPORT STRUCTURE:
    - Table X-summary (NEW): Alignment Analysis Summary (Performance vs Cognition)
      * CRITICAL: This table MUST be calculated from Table X-detail (not manually)
      * CRITICAL: Event unit = (corruption, object_uid, failure_type) - one event per unique combination
+     * CRITICAL: You MUST count the actual rows in Table X-detail to determine Total Events
+     * CRITICAL: DO NOT use any pre-computed summary values - count directly from X-detail table
      * Shows: For each corruption, how many events show lead/coincident/lag
      * Format: | Corruption | Total Events | Events with CAM | Lead Count | Coincident Count | Lag Count | Lead % | Avg Lead Steps |
-     * Calculation rules (MUST follow):
-       * Total Events = count of ALL events in X-detail (including CAM missing)
-       * Events with CAM = count where cam_change_severity != N/A in X-detail
-       * Lead Count = count where alignment == 'lead' in X-detail
-       * Coincident Count = count where alignment == 'coincident' in X-detail
-       * Lag Count = count where alignment == 'lag' in X-detail
-       * Lead % = (Lead Count / Events with CAM) * 100 (NOT total events)
-       * Avg Lead Steps = mean(lead_steps) where alignment == 'lead' (only lead events, for lead strength interpretation)
+     * Calculation rules (MUST follow - count from X-detail table):
+       * Step 1: Count rows in X-detail for each corruption
+         * fog: Count rows where corruption='fog' in X-detail → this is Total Events for fog
+         * lowlight: Count rows where corruption='lowlight' in X-detail → this is Total Events for lowlight
+         * motion_blur: Count rows where corruption='motion_blur' in X-detail → this is Total Events for motion_blur
+       * Step 2: For each corruption, count events with CAM data
+         * Events with CAM = count rows where cam_change_severity != N/A (or != None) in X-detail for that corruption
+       * Step 3: Count alignment types from X-detail
+         * Lead Count = count rows where alignment == 'lead' in X-detail for that corruption
+         * Coincident Count = count rows where alignment == 'coincident' in X-detail for that corruption
+         * Lag Count = count rows where alignment == 'lag' in X-detail for that corruption
+       * Step 4: Calculate percentages
+         * Lead % = (Lead Count / Events with CAM) * 100 (NOT total events, use Events with CAM as denominator)
+         * Avg Lead Steps = mean(lead_steps) where alignment == 'lead' (only lead events, for lead strength interpretation)
+     * CRITICAL EXAMPLE: If X-detail shows fog has 2 rows (event 1, event 2), then:
+       * Total Events for fog = 2 (NOT 3, NOT any other number)
+       * Events with CAM = count of rows where cam_change_severity is not N/A (if both have CAM, then = 2)
+       * Lead Count = count of rows where alignment == 'lead' (e.g., if event 1 is lead, then = 1)
+       * Coincident Count = count of rows where alignment == 'coincident' (e.g., if event 2 is coincident, then = 1)
+       * Lead % = (Lead Count / Events with CAM) * 100 = (1 / 2) * 100 = 50.00 (NOT 33.33)
      * CRITICAL: If Total Events > Events with CAM, note: "Some events missing CAM data (N/A in detail table)"
      * CRITICAL: If Total Events == Events with CAM, do NOT show "missing CAM data" note
      * Breakdown by failure_type (miss / score_drop / iou_drop) if available
      * This table directly answers: "Do CAM changes occur before performance collapse?"
      * Example: "fog: 73% of events (73/100) show CAM changes 1-2 severity steps before performance degradation"
      * CRITICAL: If perf_start_sev == cam_change_sev, then lead_steps = 0 and alignment = 'coincident' (NOT 'lead')
+     * CRITICAL: DO NOT trust pre-computed summary values - always count from X-detail table rows
    
    - Table X-detail (NEW - REQUIRED): Alignment Analysis Detail (Reviewer Evidence Table)
      * CRITICAL: This table provides evidence for each alignment conclusion

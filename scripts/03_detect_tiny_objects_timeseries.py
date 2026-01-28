@@ -367,18 +367,27 @@ def main():
             
             # CRITICAL: Post-process records to add baseline comparisons and failure flags
             # This requires severity 0 baseline values for each object_uid (within this corruption)
+            # CRITICAL: Baseline definition must match 04_detect_risk_events.py exactly:
+            #   baseline = (same object_uid, same frame_index, same corruption, severity=0의 pred_score)
+            #   - matched 여부와 관계없이 severity 0의 pred_score 사용
+            #   - severity 0에서 matched=0이면 pred_score=0이 될 수 있음 (이 경우 baseline=0)
             # Filter records for current corruption only
             corruption_records = [r for r in records if r.get('corruption') == corruption and r.get('model') == model_name]
             if len(corruption_records) > 0:
                 # Create baseline lookup (severity 0 values per object_uid for this corruption)
+                # CRITICAL: Use object_uid as key (matches 04_detect_risk_events.py's key_cols grouping)
+                # Note: 04 uses key_cols=[run_id, model_id, corruption, clip_id, frame_idx, object_uid]
+                #       but since we filter by corruption and model, object_uid alone is sufficient
                 baseline_lookup = {}
                 for rec in corruption_records:
                     if rec['severity'] == 0:
                         object_uid = rec['object_uid']
+                        # CRITICAL: Use pred_score from severity 0 (matched or not)
+                        # This matches 04_detect_risk_events.py: base = df[df["severity"] == 0][...]
                         baseline_lookup[object_uid] = {
-                            'base_pred_score': rec['pred_score'],
-                            'base_match_iou': rec['match_iou'],
-                            'base_matched': rec['matched']
+                            'base_pred_score': rec.get('pred_score', 0.0) if rec.get('pred_score') is not None else 0.0,
+                            'base_match_iou': rec.get('match_iou', 0.0) if rec.get('match_iou') is not None else 0.0,
+                            'base_matched': rec.get('matched', 0)
                         }
                 
                 # Add baseline comparisons and failure flags to all records of this corruption
@@ -412,10 +421,18 @@ def main():
                     else:
                         rec['is_iou_drop'] = 0
                     
-                    # Score drop: baseline score 대비 0.3 이상 감소
-                    if rec['base_pred_score'] is not None and rec['base_pred_score'] > 0:
-                        score_drop_threshold = 0.3
-                        rec['is_score_drop'] = 1 if rec['delta_score'] is not None and rec['delta_score'] < -score_drop_threshold else 0
+                    # Score drop: baseline score 대비 50% 미만 (04_detect_risk_events.py와 동일한 기준)
+                    # CRITICAL: 04_detect_risk_events.py의 SCORE_DROP_RATIO = 0.5와 일치해야 함
+                    # CRITICAL: Baseline definition matches 04: severity 0의 pred_score (matched 여부 무관)
+                    # Formula: pred_score <= base_pred_score * 0.5 (baseline 대비 50% 미만)
+                    # Condition: matched == 1 (only check drop for matched predictions)
+                    base_score = rec.get('base_pred_score', 0.0) if rec.get('base_pred_score') is not None else 0.0
+                    score_drop_ratio = 0.5  # 50% of baseline (matches 04_detect_risk_events.py SCORE_DROP_RATIO)
+                    
+                    if base_score > 0 and rec.get('matched') == 1 and rec.get('pred_score') is not None:
+                        # CRITICAL: Exact match with 04_detect_risk_events.py line 103:
+                        # df["is_score_drop"] = (df["matched"] == 1) & (df["pred_score"] <= base_score * SCORE_DROP_RATIO)
+                        rec['is_score_drop'] = 1 if rec['pred_score'] <= base_score * score_drop_ratio else 0
                     else:
                         rec['is_score_drop'] = 0
                     
