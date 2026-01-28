@@ -911,8 +911,12 @@ def main():
                 yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
                 
                 try:
-                    baseline_cam = gradcam_refined.generate_cam(baseline_image, yolo_bbox, class_id)
-                    baseline_cam = baseline_cam.copy()  # CRITICAL: Copy to avoid reference sharing
+                    # CRITICAL: generate_cam returns (cam, meta_dict) tuple, unpack it
+                    baseline_cam_result = gradcam_refined.generate_cam(baseline_image, yolo_bbox, class_id)
+                    if isinstance(baseline_cam_result, tuple):
+                        baseline_cam = baseline_cam_result[0].copy()  # Extract cam array and copy
+                    else:
+                        baseline_cam = baseline_cam_result.copy()  # Fallback: already array
                 except Exception as e:
                     print(f"  [WARN] Failed to generate baseline CAM for refined analysis: {e}")
                     del baseline_image
@@ -1061,12 +1065,16 @@ def main():
                     # Compute metrics if CAM succeeded
                     metrics = None
                     try:
+                        # CRITICAL: Ensure baseline_cam is numpy array (not tuple)
+                        baseline_cam_for_metrics = baseline_cam
+                        if isinstance(baseline_cam, tuple):
+                            baseline_cam_for_metrics = baseline_cam[0]
                         metrics = compute_cam_metrics(
                             cam,
                             yolo_bbox,
                             img_width,
                             img_height,
-                            baseline_cam=baseline_cam.copy()  # Copy to avoid reference sharing
+                            baseline_cam=baseline_cam_for_metrics.copy()  # Copy to avoid reference sharing
                         )
                         
                         # CRITICAL: Create new dict with explicit values (not references)

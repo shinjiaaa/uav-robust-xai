@@ -54,7 +54,7 @@ def main():
     all_tiny_objects = []
     image_tiny_objects = {}  # Track tiny objects per image
     
-    for image_path in image_files[:500]:
+    for image_path in image_files[:5]:
         image_stem = image_path.stem
         ann_file = annotations_dir / f"{image_stem}.txt"
         

@@ -436,11 +436,17 @@ def summarize_metrics(metrics: Dict) -> Dict:
             n_frames_valid = len(df)
             frame_count_column = 'total_records'
         
+        # CRITICAL: Calculate unique objects (object_uid) for clarity
+        n_objects_unique = df['object_uid'].nunique() if 'object_uid' in df.columns else (df['image_id'].nunique() if 'image_id' in df.columns else None)
+        
         overall_summary = {
             'total_records': len(detection_records),
-            'n_objects_total': len(detection_records),  # Total detection records (objects × severities)
+            'n_records_total': len(detection_records),  # Total detection records (row count: objects × severities)
+            'n_objects_unique': int(n_objects_unique) if n_objects_unique is not None else None,  # Unique object_uid count
             'n_frames_valid': int(n_frames_valid),  # Unique frames (frame_id or image_id based)
             'frame_count_column': frame_count_column,  # Which column was used for counting
+            # Legacy alias for backward compatibility
+            'n_objects_total': len(detection_records),  # DEPRECATED: Use n_records_total instead
             'by_model': df.groupby('model').size().to_dict() if 'model' in df.columns else {},
             'by_corruption': df.groupby('corruption').size().to_dict() if 'corruption' in df.columns else {},
             'by_severity': df.groupby('severity').size().to_dict() if 'severity' in df.columns else {},
@@ -454,11 +460,46 @@ def summarize_metrics(metrics: Dict) -> Dict:
         if 'corruption' in df.columns:
             for corruption in df['corruption'].unique():
                 corr_df = df[df['corruption'] == corruption]
+                
+                # CRITICAL: Use new column names (is_miss, is_score_drop, delta_score, is_iou_drop)
+                # Fallback to legacy names (miss, score, iou) for backward compatibility
+                miss_col = 'is_miss' if 'is_miss' in corr_df.columns else 'miss'
+                score_col = 'pred_score' if 'pred_score' in corr_df.columns else 'score'
+                iou_col = 'match_iou' if 'match_iou' in corr_df.columns else 'iou'
+                matched_col = 'matched' if 'matched' in corr_df.columns else None
+                
+                # CRITICAL: Calculate Avg Score by severity (for Avg ΔScore calculation)
+                avg_score_by_sev = corr_df.groupby('severity')[score_col].mean().to_dict() if score_col in corr_df.columns else {}
+                
                 per_corruption[corruption] = {
-                    'miss_rate_by_severity': corr_df.groupby('severity')['miss'].mean().to_dict() if 'miss' in corr_df.columns else {},
-                    'avg_score_by_severity': corr_df.groupby('severity')['score'].mean().to_dict() if 'score' in corr_df.columns else {},
-                    'avg_iou_by_severity': corr_df.groupby('severity')['iou'].mean().to_dict() if 'iou' in corr_df.columns else {},
+                    'miss_rate_by_severity': corr_df.groupby('severity')[miss_col].mean().to_dict() if miss_col in corr_df.columns else {},
+                    'avg_score_by_severity': avg_score_by_sev,
+                    'avg_iou_by_severity': corr_df.groupby('severity')[iou_col].mean().to_dict() if iou_col in corr_df.columns else {},
                 }
+                
+                # CRITICAL: Calculate Avg ΔScore = Avg Score(sev) - Avg Score(sev0)
+                # This is the key metric that explains score_drop events
+                if len(avg_score_by_sev) > 0 and 0 in avg_score_by_sev:
+                    base_score = avg_score_by_sev[0]
+                    avg_delta_score_by_sev = {}
+                    for sev, avg_score in avg_score_by_sev.items():
+                        if sev == 0:
+                            avg_delta_score_by_sev[sev] = 0.0  # Baseline: no change
+                        else:
+                            avg_delta_score_by_sev[sev] = avg_score - base_score if avg_score is not None and base_score is not None else None
+                    per_corruption[corruption]['avg_delta_score_by_severity'] = avg_delta_score_by_sev
+                
+                # CRITICAL: Add drop rates for Table 2 (explains why events exist even if miss_rate=0)
+                if 'is_score_drop' in corr_df.columns:
+                    per_corruption[corruption]['score_drop_rate_by_severity'] = corr_df.groupby('severity')['is_score_drop'].mean().to_dict()
+                if 'is_iou_drop' in corr_df.columns:
+                    per_corruption[corruption]['iou_drop_rate_by_severity'] = corr_df.groupby('severity')['is_iou_drop'].mean().to_dict()
+                # Note: avg_delta_score_by_severity is already calculated above (from avg_score_by_severity)
+                if 'delta_iou' in corr_df.columns and matched_col and matched_col in corr_df.columns:
+                    # Avg ΔIoU = mean(delta_iou where matched==1)
+                    matched_df = corr_df[corr_df[matched_col] == 1]
+                    if len(matched_df) > 0:
+                        per_corruption[corruption]['avg_delta_iou_by_severity'] = matched_df.groupby('severity')['delta_iou'].mean().to_dict()
 
         summarized['detection_summary'] = {**overall_summary, 'per_corruption': per_corruption}
         summarized['detection_summary']['has_data'] = True
@@ -676,12 +717,47 @@ def summarize_metrics(metrics: Dict) -> Dict:
         # Use the same available_corruptions_from_det from dataset metrics section
         # (already computed at the beginning of summarize_metrics)
 
-        # Get failure severity for each corruption (to include in CAM metrics table)
+        # CRITICAL: Get failure severity distribution from risk_events or failure_events
+        # Instead of single unified value, compute distribution (median, IQR) for each corruption
+        risk_events = metrics.get('risk_events', [])
         failure_severity_by_corruption = {}
+        failure_severity_distribution = {}  # New: distribution stats
+        
         for corruption in all_expected_corruptions:
-            if corruption in available_corruptions_from_det:
-                unified_failure_sev = get_failure_severity_for_corruption(fail_df, corruption, det_df)
-                failure_severity_by_corruption[corruption] = unified_failure_sev
+            if corruption not in available_corruptions_from_det:
+                continue
+                
+            # Try risk_events first (has start_severity)
+            if risk_events and len(risk_events) > 0:
+                risk_df = pd.DataFrame(risk_events)
+                corr_risk = risk_df[risk_df['corruption'] == corruption].copy() if 'corruption' in risk_df.columns else pd.DataFrame()
+                if len(corr_risk) > 0 and 'start_severity' in corr_risk.columns:
+                    start_sevs = corr_risk['start_severity'].dropna()
+                    if len(start_sevs) > 0:
+                        failure_severity_by_corruption[corruption] = int(start_sevs.median())  # Use median as representative
+                        failure_severity_distribution[corruption] = {
+                            'median': float(start_sevs.median()),
+                            'q25': float(start_sevs.quantile(0.25)),
+                            'q75': float(start_sevs.quantile(0.75)),
+                            'min': float(start_sevs.min()),
+                            'max': float(start_sevs.max()),
+                            'count': int(len(start_sevs))
+                        }
+                        continue
+            
+            # Fallback to unified failure severity (legacy)
+            unified_failure_sev = get_failure_severity_for_corruption(fail_df, corruption, det_df)
+            failure_severity_by_corruption[corruption] = unified_failure_sev
+            if unified_failure_sev is not None:
+                failure_severity_distribution[corruption] = {
+                    'median': float(unified_failure_sev),
+                    'q25': None,
+                    'q75': None,
+                    'min': float(unified_failure_sev),
+                    'max': float(unified_failure_sev),
+                    'count': 1,
+                    'note': 'Single unified value (legacy format)'
+                }
         
         for corruption in all_expected_corruptions:
             # CRITICAL: Only process corruptions that have actual detection records
@@ -705,21 +781,72 @@ def summarize_metrics(metrics: Dict) -> Dict:
             # Get failure severity for this corruption
             unified_failure_sev = failure_severity_by_corruption.get(corruption)
 
+            # CRITICAL: Calculate expected frames for CAM coverage ratio
+            # Expected frames = unique frames in detection_records for this corruption×severity
+            corr_det = det_df[det_df['corruption'] == corruption].copy() if len(det_df) > 0 and 'corruption' in det_df.columns else pd.DataFrame()
+            
+            # CRITICAL: Track CAM failure rate by severity (especially for severity 4)
+            # This explains why severity 4 is missing in the table
+            cam_failure_stats_by_severity = {}
+            
+            # Initialize failure stats for all severities
+            for sev in all_severities:
+                cam_failure_stats_by_severity[sev] = {
+                    'total_attempts': 0,
+                    'success': 0,
+                    'failed': 0,
+                    'failure_rate': None,
+                    'note': 'No CAM attempts'
+                }
+            
             if len(corr_cam) > 0 and 'severity' in corr_cam.columns:
                 for sev in all_severities:
                     sev_cam = corr_cam[corr_cam['severity'] == sev].copy()
+                    
+                    # Calculate expected frames from detection_records
+                    if len(corr_det) > 0 and 'severity' in corr_det.columns:
+                        sev_det = corr_det[corr_det['severity'] == sev].copy()
+                        if 'frame_id' in sev_det.columns:
+                            n_expected_frames = sev_det['frame_id'].nunique()
+                        elif 'image_id' in sev_det.columns:
+                            n_expected_frames = sev_det['image_id'].nunique()
+                        else:
+                            n_expected_frames = len(sev_det) if len(sev_det) > 0 else None
+                    else:
+                        n_expected_frames = None
+                    
                     if len(sev_cam) > 0:
                         # CRITICAL: Only count cam_status == "ok" as valid CAM frames
                         # (If using cam_records.csv, this is already filtered, but double-check for legacy data)
                         if 'cam_status' in sev_cam.columns:
                             sev_cam_ok = sev_cam[sev_cam['cam_status'] == 'ok'].copy()
+                            sev_cam_failed = sev_cam[sev_cam['cam_status'] != 'ok'].copy()
                             n_cam_frames = len(sev_cam_ok)
+                            n_cam_failed = len(sev_cam_failed)
+                            n_cam_total = len(sev_cam)
+                            # Track failure rate for this severity
+                            cam_failure_stats_by_severity[sev] = {
+                                'total_attempts': n_cam_total,
+                                'success': n_cam_frames,
+                                'failed': n_cam_failed,
+                                'failure_rate': float(n_cam_failed / n_cam_total) if n_cam_total > 0 else 0.0
+                            }
                             # Use only OK records for metric computation
                             metric_df = sev_cam_ok
                         else:
                             # Fallback: if cam_status column doesn't exist, count all (legacy data)
                             n_cam_frames = len(sev_cam)
                             metric_df = sev_cam
+                            cam_failure_stats_by_severity[sev] = {
+                                'total_attempts': n_cam_frames,
+                                'success': n_cam_frames,
+                                'failed': 0,
+                                'failure_rate': 0.0,
+                                'note': 'Legacy data (no cam_status column)'
+                            }
+                        
+                        # Calculate CAM coverage ratio
+                        cam_valid_ratio = float(n_cam_frames / n_expected_frames) if n_expected_frames is not None and n_expected_frames > 0 else None
                         
                         # Compute metrics only from OK records
                         cam_metrics_by_corruption_severity[corruption][sev] = {
@@ -728,32 +855,100 @@ def summarize_metrics(metrics: Dict) -> Dict:
                             'entropy_mean': float(metric_df['entropy'].mean()) if 'entropy' in metric_df.columns and len(metric_df) > 0 else None,
                             'center_shift_mean': float(metric_df['center_shift'].mean()) if 'center_shift' in metric_df.columns and len(metric_df) > 0 else None,
                             'n_cam_frames': int(n_cam_frames),
+                            'n_expected_frames': int(n_expected_frames) if n_expected_frames is not None else None,
+                            'cam_valid_ratio': cam_valid_ratio,  # CAM coverage: n_cam_frames / n_expected_frames
                             'failure_severity': unified_failure_sev,  # Add failure_severity
+                            'cam_failure_rate': cam_failure_stats_by_severity.get(sev, {}).get('failure_rate'),
                             'note': f'Computed from {n_cam_frames} CAM frames (cam_status=ok only)' if n_cam_frames > 0 else 'N/A (no valid CAM frames, all failed)'
                         }
                     else:
+                        # Calculate expected frames for coverage ratio
+                        if len(corr_det) > 0 and 'severity' in corr_det.columns:
+                            sev_det = corr_det[corr_det['severity'] == sev].copy()
+                            if 'frame_id' in sev_det.columns:
+                                n_expected_frames = sev_det['frame_id'].nunique()
+                            elif 'image_id' in sev_det.columns:
+                                n_expected_frames = sev_det['image_id'].nunique()
+                            else:
+                                n_expected_frames = len(sev_det) if len(sev_det) > 0 else None
+                        else:
+                            n_expected_frames = None
+                        
+                        # Check if CAM was attempted but failed
+                        failure_info = cam_failure_stats_by_severity.get(sev, {})
+                        if failure_info.get('total_attempts', 0) > 0:
+                            failure_rate = failure_info.get('failure_rate', 0.0)
+                            note = f'N/A (CAM calculation failed, failure_rate={failure_rate:.1%})'
+                        else:
+                            note = 'N/A (n_cam_frames=0, no CAM attempts)'
+                        
                         cam_metrics_by_corruption_severity[corruption][sev] = {
                             'energy_in_bbox_mean': None,
                             'activation_spread_mean': None,
                             'entropy_mean': None,
                             'center_shift_mean': None,
                             'n_cam_frames': 0,
+                            'n_expected_frames': int(n_expected_frames) if n_expected_frames is not None else None,
+                            'cam_valid_ratio': None,
                             'failure_severity': unified_failure_sev,  # Add failure_severity even when n_cam_frames=0
-                            'note': 'N/A (n_cam_frames=0)'
+                            'cam_failure_rate': failure_info.get('failure_rate') if failure_info else None,
+                            'note': note
                         }
             else:
-                for sev in all_severities:
-                    cam_metrics_by_corruption_severity[corruption][sev] = {
-                        'energy_in_bbox_mean': None,
-                        'activation_spread_mean': None,
-                        'entropy_mean': None,
-                        'center_shift_mean': None,
-                        'n_cam_frames': 0,
-                        'failure_severity': unified_failure_sev,  # Add failure_severity even when CAM data not available
-                        'note': 'N/A (CAM data not available for this corruption, n_cam_frames=0)'
-                    }
+                    for sev in all_severities:
+                        # Calculate expected frames for coverage ratio
+                        if len(corr_det) > 0 and 'severity' in corr_det.columns:
+                            sev_det = corr_det[corr_det['severity'] == sev].copy()
+                            if 'frame_id' in sev_det.columns:
+                                n_expected_frames = sev_det['frame_id'].nunique()
+                            elif 'image_id' in sev_det.columns:
+                                n_expected_frames = sev_det['image_id'].nunique()
+                            else:
+                                n_expected_frames = len(sev_det) if len(sev_det) > 0 else None
+                        else:
+                            n_expected_frames = None
+                        
+                        cam_metrics_by_corruption_severity[corruption][sev] = {
+                            'energy_in_bbox_mean': None,
+                            'activation_spread_mean': None,
+                            'entropy_mean': None,
+                            'center_shift_mean': None,
+                            'n_cam_frames': 0,
+                            'n_expected_frames': int(n_expected_frames) if n_expected_frames is not None else None,
+                            'cam_valid_ratio': None,
+                            'failure_severity': unified_failure_sev,  # Add failure_severity even when CAM data not available
+                            'cam_failure_rate': None,
+                            'note': 'N/A (CAM data not available for this corruption, n_cam_frames=0)'
+                        }
 
         summarized['cam_metrics_by_corruption_severity'] = cam_metrics_by_corruption_severity
+        summarized['failure_severity_distribution'] = failure_severity_distribution  # Add distribution stats
+        
+        # CRITICAL: Add severity 4 missing reason summary
+        severity_4_missing_summary = {}
+        for corruption in all_expected_corruptions:
+            if corruption in cam_metrics_by_corruption_severity:
+                sev4_data = cam_metrics_by_corruption_severity[corruption].get(4, {})
+                if sev4_data.get('n_cam_frames', 0) == 0:
+                    failure_rate = sev4_data.get('cam_failure_rate')
+                    if failure_rate is not None:
+                        severity_4_missing_summary[corruption] = {
+                            'missing': True,
+                            'reason': 'CAM calculation failed',
+                            'failure_rate': float(failure_rate)
+                        }
+                    else:
+                        severity_4_missing_summary[corruption] = {
+                            'missing': True,
+                            'reason': 'No CAM attempts (out of analysis scope)',
+                            'failure_rate': None
+                        }
+                else:
+                    severity_4_missing_summary[corruption] = {
+                        'missing': False,
+                        'n_cam_frames': sev4_data.get('n_cam_frames', 0)
+                    }
+        summarized['severity_4_missing_summary'] = severity_4_missing_summary
 
         # ---- cam_pattern_summary (Table 5)
         # CRITICAL: Only include corruptions that have actual detection records
@@ -1224,20 +1419,23 @@ def summarize_metrics(metrics: Dict) -> Dict:
                                 cam_change_severity[metric_name] = sev
                             break
                 
-                # Determine alignment (lead/coincident/lag)
+                # CRITICAL: Determine alignment using unified formula
+                # lead_steps = perf_start_severity - cam_change_severity
+                # > 0 → lead, = 0 → coincident, < 0 → lag
                 if len(cam_change_severity) > 0:
                     # Use earliest CAM change as the CAM change start
                     earliest_cam_change = min(cam_change_severity.values())
                     
-                    if earliest_cam_change < start_severity:
+                    # CRITICAL: Unified lead_steps calculation
+                    lead_steps = start_severity - earliest_cam_change
+                    
+                    # CRITICAL: Alignment based on lead_steps (not separate conditions)
+                    if lead_steps > 0:
                         alignment = 'lead'
-                        lead_steps = start_severity - earliest_cam_change
-                    elif earliest_cam_change == start_severity:
+                    elif lead_steps == 0:
                         alignment = 'coincident'
-                        lead_steps = 0
-                    else:
+                    else:  # lead_steps < 0
                         alignment = 'lag'
-                        lead_steps = earliest_cam_change - start_severity
                 else:
                     alignment = 'no_cam_change'
                     earliest_cam_change = None
@@ -1254,33 +1452,99 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     'performance_start_severity': start_severity,  # Performance Axis start
                     'cam_change_severity': earliest_cam_change,  # Cognition Axis start
                     'alignment': alignment,  # lead / coincident / lag / no_cam_change
-                    'lead_steps': lead_steps,  # How many severity steps CAM leads/lags
+                    'lead_steps': lead_steps,  # Unified: perf_start_sev - cam_change_sev
                     'cam_change_metrics': list(cam_change_severity.keys())  # Which metrics changed
                 })
             
-            # Aggregate alignment statistics by corruption
+            # CRITICAL: Aggregate alignment statistics by corruption
+            # STEP 1: Create detail events first (Table X-detail - the source of truth)
             alignment_summary = {}
             for corruption, events in alignment_analysis.items():
                 if len(events) == 0:
                     continue
                 
                 events_df = pd.DataFrame(events)
-                total_events = len(events_df)
+                
+                # CRITICAL: Create detail_events first (Table X-detail)
+                # This is the source of truth - all summary stats must come from here
+                # CRITICAL: lead_steps MUST be calculated as: perf_start_sev - cam_change_sev
+                detail_events_list = []
+                for _, event_row in events_df.iterrows():
+                    perf_start = event_row.get('performance_start_severity')
+                    cam_change = event_row.get('cam_change_severity')
+                    
+                    # CRITICAL: Recalculate lead_steps using unified formula
+                    # lead_steps = perf_start_sev - cam_change_sev
+                    if perf_start is not None and cam_change is not None:
+                        # Recalculate lead_steps (this is the ONLY correct formula)
+                        recalc_lead_steps = perf_start - cam_change
+                        
+                        # Re-verify alignment based on recalculated lead_steps
+                        if recalc_lead_steps > 0:
+                            recalc_alignment = 'lead'
+                        elif recalc_lead_steps == 0:
+                            recalc_alignment = 'coincident'
+                        else:  # recalc_lead_steps < 0
+                            recalc_alignment = 'lag'
+                        
+                        # CRITICAL: Always use recalculated values (fix any inconsistency)
+                        alignment = recalc_alignment
+                        lead_steps = recalc_lead_steps
+                    else:
+                        # If either is None, use original values but mark as no_cam_change
+                        alignment = event_row.get('alignment', 'no_cam_change')
+                        lead_steps = event_row.get('lead_steps')
+                    
+                    detail_events_list.append({
+                        'failure_event_id': event_row.get('failure_event_id', ''),
+                        'object_uid': event_row.get('object_uid', ''),
+                        'corruption': corruption,
+                        'failure_type': event_row.get('failure_type', ''),
+                        'performance_start_severity': perf_start,
+                        'cam_change_severity': cam_change,
+                        'cam_change_metric': event_row.get('cam_change_metrics', [None])[0] if isinstance(event_row.get('cam_change_metrics'), list) and len(event_row.get('cam_change_metrics', [])) > 0 else None,
+                        'alignment': alignment,  # Always use recalculated alignment
+                        'lead_steps': lead_steps  # Always use recalculated lead_steps
+                    })
+                
+                # CRITICAL: Recreate events_df from detail_events to ensure consistency
+                detail_events_df = pd.DataFrame(detail_events_list)
+                # CRITICAL: total_events should match the original events count (not detail_events count)
+                # detail_events contains ALL events (not a sample), so count should match
+                total_events = len(events_df)  # Use original count (should match detail_events if all events have CAM data)
+                
+                # CRITICAL: Verify that detail_events count matches total_events
+                # If detail_events is shorter, it means some events don't have CAM data
+                if len(detail_events_list) < total_events:
+                    # Some events are missing from detail (no CAM data)
+                    # This is OK - detail_events only includes events with CAM data
+                    pass
+                
+                # STEP 2: Calculate summary from detail_events_df (Table X-summary)
+                # This ensures summary is always consistent with detail
+                # CRITICAL: total_events should be the count of events with CAM data (detail_events_df length)
+                # If some events don't have CAM data, they won't be in detail_events_df
+                detail_total = len(detail_events_df)
                 
                 alignment_summary[corruption] = {
-                    'total_events': total_events,
-                    'lead_count': int((events_df['alignment'] == 'lead').sum()),
-                    'coincident_count': int((events_df['alignment'] == 'coincident').sum()),
-                    'lag_count': int((events_df['alignment'] == 'lag').sum()),
-                    'no_cam_change_count': int((events_df['alignment'] == 'no_cam_change').sum()),
-                    'lead_percentage': float((events_df['alignment'] == 'lead').sum() / total_events * 100) if total_events > 0 else 0.0,
-                    'avg_lead_steps': float(events_df[events_df['alignment'] == 'lead']['lead_steps'].mean()) if (events_df['alignment'] == 'lead').any() else None,
-                    'by_failure_type': {}
+                    'total_events': total_events,  # Original count from risk_events
+                    'total_events_with_cam': detail_total,  # Events that have CAM data (for detail table)
+                    'lead_count': int((detail_events_df['alignment'] == 'lead').sum()) if detail_total > 0 else 0,
+                    'coincident_count': int((detail_events_df['alignment'] == 'coincident').sum()) if detail_total > 0 else 0,
+                    'lag_count': int((detail_events_df['alignment'] == 'lag').sum()) if detail_total > 0 else 0,
+                    'no_cam_change_count': int((detail_events_df['alignment'] == 'no_cam_change').sum()) if detail_total > 0 else 0,
+                    # CRITICAL: Lead % based on events with CAM data
+                    'lead_percentage': float((detail_events_df['alignment'] == 'lead').sum() / detail_total * 100) if detail_total > 0 else 0.0,
+                    # CRITICAL: Avg lead_steps only from lead events (not coincident/lag)
+                    'avg_lead_steps': float(detail_events_df[detail_events_df['alignment'] == 'lead']['lead_steps'].mean()) if detail_total > 0 and (detail_events_df['alignment'] == 'lead').any() else None,
+                    'by_failure_type': {},
+                    'detail_events': detail_events_list,  # Store detail for Table X-detail (ALL events with CAM data)
+                    'note': f'Total {total_events} events, {detail_total} events have CAM data (shown in detail table)' if detail_total < total_events else f'All {total_events} events have CAM data'
                 }
                 
-                # Breakdown by failure type
-                for ftype in events_df['failure_type'].unique():
-                    ftype_events = events_df[events_df['failure_type'] == ftype]
+                # Breakdown by failure type (from detail_events_df)
+                for ftype in detail_events_df['failure_type'].unique():
+                    ftype_events = detail_events_df[detail_events_df['failure_type'] == ftype]
                     alignment_summary[corruption]['by_failure_type'][ftype] = {
                         'total': len(ftype_events),
                         'lead': int((ftype_events['alignment'] == 'lead').sum()),
@@ -1416,6 +1680,25 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - detection_records.csv is the "Performance Axis" - it defines WHEN performance degrades
     - This file contains frame-level evidence: matched, is_miss, pred_score, match_iou for each tiny object
     - From this, we compute performance curves and identify risk region start points
+    - Column naming (CRITICAL for clarity):
+      * n_records_total: Total row count (objects × severities) - this is the raw record count
+      * n_objects_unique: Unique object_uid count (actual number of distinct tiny objects)
+      * n_frames_valid: Unique frame/image count (actual number of distinct frames)
+    - Example: If n_records_total=6915, n_objects_unique=461, n_frames_valid=461, this means:
+      * 461 unique objects × 5 severities × 3 corruptions ≈ 6915 records
+      * Each object appears in multiple rows (one per severity×corruption combination)
+    - CRITICAL: Table 2 MUST include these columns to explain why events exist even if miss_rate=0:
+      * Miss Rate (mean(is_miss) by severity) - shows miss events
+      * Avg Score (mean(pred_score) by severity) - baseline for ΔScore calculation
+      * Avg ΔScore (Avg Score(sev) - Avg Score(sev0) by severity) - CRITICAL: explains score_drop events
+        Example: fog sev3: 0.202 - 0.237 = -0.035 (score degradation)
+      * Score Drop Rate (mean(is_score_drop) by severity) - shows score_drop events
+      * IoU Drop Rate (mean(is_iou_drop) by severity) - shows iou_drop events
+      * Avg ΔIoU (mean(delta_iou where matched==1) by severity) - shows IoU degradation magnitude
+    - These columns explain: "Miss Rate = 0 but events exist because score_drop/iou_drop occurred"
+    - Avg ΔScore is the KEY metric: negative values show score degradation even without miss
+    - CRITICAL: If Score Drop Rate is 0 but score_drop events exist in risk_events.csv, add this note below Table 2:
+      "Note: Score-drop events are detected at the object level (risk_events.csv), whereas Score Drop Rate in Table 2 is an aggregate over all records; thus the rate can be low even when individual events exist. Avg ΔScore shows the actual score degradation magnitude."
     - Check detection_summary.has_data field in the metrics data
     - If detection_summary.has_data is False or missing:
       - DO NOT create Table 2 (Detection Summary / Performance Metrics)
@@ -1453,14 +1736,20 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - Each severity's CAM is computed INDEPENDENTLY (not cumulative)
     - CAM metrics compare each severity's CAM to baseline (severity 0)
     - This tracks CAM distribution changes as corruption severity increases up to failure point
-16. CRITICAL: CAM Metrics Table MUST include failure_severity column:
-    - The "CAM Metrics by Corruption Severity" table MUST have a "failure_severity" column
-    - failure_severity is the failure severity for the ENTIRE corruption (same value for all severities of the same corruption)
-    - failure_severity comes from cam_metrics_by_corruption_severity[corruption][severity]['failure_severity']
-    - If n_cam_frames=0, still show failure_severity if it exists (do NOT mark as N/A)
-    - Format: | Corruption | Severity | n_cam_frames | failure_severity | Energy in BBox Mean | Activation Spread Mean | Entropy Mean | Center Shift Mean |
-    - Example: If lowlight has failure_severity=1, ALL lowlight severity rows (0-4) should show failure_severity=1
-    - DO NOT omit the failure_severity column even if some values are None
+16. CRITICAL: CAM Metrics Table (Table 7) MUST include:
+    - Format: | Corruption | Severity | n_cam_frames | n_expected_frames | cam_valid_ratio | failure_severity_median | Energy in BBox Mean | Activation Spread Mean | Entropy Mean | Center Shift Mean |
+    - n_expected_frames: Expected frames from detection_records.csv (for this corruption×severity)
+    - cam_valid_ratio: CAM coverage ratio (n_cam_frames / n_expected_frames) - CRITICAL for reviewer to assess representativeness
+    - If cam_valid_ratio is very low (e.g., < 0.1), explicitly note the limited sample size
+    - failure_severity_median: Median failure severity from risk_events.csv (event-based distribution)
+    - If failure_severity_distribution exists, show median (Q25, Q75) instead of single value
+    - Example: "failure_severity_median: 2 (IQR: 1-3)" shows distribution, not fixed value
+    - DO NOT show failure_severity as single fixed value if distribution data exists
+    - CRITICAL: If severity 4 is missing (n_cam_frames=0), MUST add a note below the table explaining why:
+      * Check severity_4_missing_summary in metrics data
+      * If failure_rate exists: "Severity 4 is missing due to CAM calculation failure (failure_rate: XX%)"
+      * If no attempts: "Severity 4 is missing (out of analysis scope - no CAM attempts)"
+      * This is REQUIRED - reviewers will ask why severity 4 is missing
 17. CRITICAL: Alignment Analysis Table (NEW - Performance Axis vs Cognition Axis):
     - This table shows whether CAM changes (Cognition Axis) occur BEFORE, AT THE SAME TIME, or AFTER performance degradation (Performance Axis)
     - Alignment analysis is computed from risk_events.csv (Performance Axis) and cam_records.csv (Cognition Axis)
@@ -1508,12 +1797,45 @@ REPORT STRUCTURE:
    - Table 7: CAM metrics from cam_records.csv (THE COGNITION AXIS)
      * Shows: energy_in_bbox, activation_spread, entropy, center_shift by corruption×severity
      * From: cam_records.csv (cam_status='ok' only)
-   - Table X (NEW): Alignment Analysis (Performance vs Cognition)
+   - Table X-summary (NEW): Alignment Analysis Summary (Performance vs Cognition)
+     * CRITICAL: This table MUST be calculated from Table X-detail (not manually)
      * Shows: For each corruption, how many events show lead/coincident/lag
-     * Format: | Corruption | Total Events | Lead Count | Coincident Count | Lag Count | Lead % | Avg Lead Steps |
+     * Format: | Corruption | Total Events | Events with CAM | Lead Count | Coincident Count | Lag Count | Lead % | Avg Lead Steps |
+     * Calculation rules (MUST follow):
+       * Total Events = total events from risk_events.csv
+       * Events with CAM = events that have CAM data (shown in detail table)
+       * Lead Count = count where lead_steps > 0 (from detail table)
+       * Coincident Count = count where lead_steps == 0 (from detail table)
+       * Lag Count = count where lead_steps < 0 (from detail table)
+       * Lead % = (Lead Count / Events with CAM) * 100
+       * Avg Lead Steps = mean(lead_steps) where alignment == 'lead' (only positive values)
+     * CRITICAL: If Total Events > Events with CAM, note: "Some events missing CAM data"
      * Breakdown by failure_type (miss / score_drop / iou_drop) if available
      * This table directly answers: "Do CAM changes occur before performance collapse?"
      * Example: "fog: 73% of events (73/100) show CAM changes 1-2 severity steps before performance degradation"
+     * CRITICAL: If perf_start_sev == cam_change_sev, then lead_steps = 0 and alignment = 'coincident' (NOT 'lead')
+   
+   - Table X-detail (NEW - REQUIRED): Alignment Analysis Detail (Reviewer Evidence Table)
+     * CRITICAL: This table provides evidence for each alignment conclusion
+     * Format: | event_id | corruption | object_uid | failure_type | perf_start_sev | cam_change_sev | cam_metric | alignment | lead_steps |
+     * CRITICAL: lead_steps calculation MUST be: lead_steps = perf_start_sev - cam_change_sev
+     * CRITICAL: alignment MUST match lead_steps:
+       * lead_steps > 0 → alignment = 'lead'
+       * lead_steps == 0 → alignment = 'coincident'
+       * lead_steps < 0 → alignment = 'lag'
+     * Examples:
+       * perf_start_sev=1, cam_change_sev=1 → lead_steps=0 → alignment='coincident' (NOT 'lead')
+       * perf_start_sev=1, cam_change_sev=0 → lead_steps=1 → alignment='lead'
+       * perf_start_sev=1, cam_change_sev=2 → lead_steps=-1 → alignment='lag'
+     * perf_start_sev = performance_start_severity (from risk_events.csv)
+     * cam_change_sev = cam_change_severity (from cam_records.csv)
+     * cam_metric = which CAM metric detected the change (e.g., 'center_shift')
+     * This table is REQUIRED - without it, reviewers cannot verify alignment claims
+     * CRITICAL: Show ALL events that have CAM data (detail_events count should match or be close to total_events)
+     * If detail_events count < total_events, note: "Some events are missing from detail table (no CAM data available)"
+     * Data source: alignment_analysis.summary[corruption]['detail_events'] for each corruption
+     * If detail_events is empty, note: "No detail events available (alignment analysis requires risk_events.csv and cam_records.csv)"
+     * This table can be in appendix if too long for main text, but MUST be included somewhere
 
 Generate a markdown report with TABLES ONLY. All text descriptions should be commented out with <!-- -->.
 """
