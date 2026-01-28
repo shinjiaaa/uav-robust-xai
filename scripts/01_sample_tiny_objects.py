@@ -48,13 +48,15 @@ def main():
     tiny_config = config['tiny_objects']
     experiment_config = config.get('experiment', {})
     one_per_image = experiment_config.get('one_per_image', False)
-    # Note: sample_size from config is ignored - we use 500 or all available (see below)
-    sample_size = experiment_config.get('sample_size', tiny_config['sample_size'])
+    # RQ1: No sample limit - use all images unless max_images is set
+    target_tiny_objects = experiment_config.get('target_tiny_objects', 500)
+    max_images = experiment_config.get('max_images')  # null = no limit
+    image_list = image_files if max_images is None else image_files[:max_images]
     
     all_tiny_objects = []
     image_tiny_objects = {}  # Track tiny objects per image
     
-    for image_path in image_files[:500]:
+    for image_path in image_list:
         image_stem = image_path.stem
         ann_file = annotations_dir / f"{image_stem}.txt"
         
@@ -134,16 +136,14 @@ def main():
     
     print(f"   Found {len(all_tiny_objects)} tiny objects")
     
-    # CRITICAL: Use up to 500 tiny objects, or all available if less than 500
-    target_sample_size = 500
-    actual_sample_size = min(target_sample_size, len(all_tiny_objects))
+    # RQ1: Target target_tiny_objects (e.g. 461) or all available if less
+    actual_sample_size = min(target_tiny_objects, len(all_tiny_objects)) if target_tiny_objects else len(all_tiny_objects)
     
-    # Sample if needed
     if len(all_tiny_objects) > actual_sample_size:
         random.seed(config['seed'])
         all_tiny_objects = random.sample(all_tiny_objects, actual_sample_size)
     
-    print(f"   Sampled {len(all_tiny_objects)} tiny objects (target: {target_sample_size}, available: {len(all_tiny_objects) if len(all_tiny_objects) <= actual_sample_size else actual_sample_size})")
+    print(f"   Sampled {len(all_tiny_objects)} tiny objects (target: {target_tiny_objects or 'all'}, available: {len(all_tiny_objects)})")
     
     # Save results
     print("\n2. Saving results...")

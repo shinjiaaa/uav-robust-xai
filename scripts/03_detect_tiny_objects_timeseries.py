@@ -421,13 +421,12 @@ def main():
                     else:
                         rec['is_iou_drop'] = 0
                     
-                    # Score drop: baseline score 대비 50% 미만 (04_detect_risk_events.py와 동일한 기준)
-                    # CRITICAL: 04_detect_risk_events.py의 SCORE_DROP_RATIO = 0.5와 일치해야 함
-                    # CRITICAL: Baseline definition matches 04: severity 0의 pred_score (matched 여부 무관)
-                    # Formula: pred_score <= base_pred_score * 0.5 (baseline 대비 50% 미만)
-                    # Condition: matched == 1 (only check drop for matched predictions)
+                    # Score drop: baseline score 대비 ratio 미만 (04_detect_risk_events.py와 config 동기화)
+                    # CRITICAL: config risk_detection.score_drop_ratio 사용 (0.9 = more events, 0.5 = stronger drop)
+                    # Baseline definition matches 04: severity 0의 pred_score (matched 여부 무관)
+                    # Formula: pred_score <= base_pred_score * score_drop_ratio
                     base_score = rec.get('base_pred_score', 0.0) if rec.get('base_pred_score') is not None else 0.0
-                    score_drop_ratio = 0.5  # 50% of baseline (matches 04_detect_risk_events.py SCORE_DROP_RATIO)
+                    score_drop_ratio = float(config.get('risk_detection', {}).get('score_drop_ratio', 0.5))
                     
                     if base_score > 0 and rec.get('matched') == 1 and rec.get('pred_score') is not None:
                         # CRITICAL: Exact match with 04_detect_risk_events.py line 103:

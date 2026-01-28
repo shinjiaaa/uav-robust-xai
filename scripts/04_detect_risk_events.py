@@ -27,14 +27,17 @@ from src.utils.io import load_yaml
 from src.utils.seed import set_seed
 
 
-# Constants
+# Constants (overridden by config when provided)
 IOU_MISS_TH = 0.5  # IoU threshold for miss detection
-SCORE_DROP_RATIO = 0.5  # Score drop threshold (50% of baseline)
+SCORE_DROP_RATIO_DEFAULT = 0.5  # Default: 50% of baseline. Use 0.9 for more events (RQ1).
 IOU_DROP_ABSOLUTE = 0.2  # IoU drop threshold (absolute)
-W_PRE = 2  # CAM을 몇 severity 전까지 볼지 (직전 2단계 + 시작단계)
+# RQ1 severity window: [perf_start_sev-1, perf_start_sev, perf_start_sev+1] for CAM (Stage A)
+SEV_WINDOW_PRE = 1  # severities before start
+SEV_WINDOW_POST = 1  # severities after start
+MAX_SEVERITY = 4  # cap so cam_sev_to does not exceed dataset max (e.g. VisDrone 0..4)
 
 
-def make_risk_events(detection_df: pd.DataFrame) -> pd.DataFrame:
+def make_risk_events(detection_df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
     """Generate risk_events.csv from detection_records.csv.
     
     Args:
@@ -43,6 +46,10 @@ def make_risk_events(detection_df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with risk events (one row per risk event)
     """
+    # RQ1: Configurable score_drop_ratio (r=0.9 → more events, r=0.5 → stronger drop only)
+    risk_cfg = (config or {}).get('risk_detection', {})
+    score_drop_ratio = float(risk_cfg.get('score_drop_ratio', SCORE_DROP_RATIO_DEFAULT))
+    
     # Key columns for grouping (object 시계열 단위)
     key_cols = ["run_id", "model_id", "corruption", "clip_id", "frame_idx", "object_uid"]
     
@@ -100,7 +107,8 @@ def make_risk_events(detection_df: pd.DataFrame) -> pd.DataFrame:
     base_iou = df["base_match_iou"].fillna(0.0)
     
     if "is_score_drop" not in df.columns:
-        df["is_score_drop"] = (df["matched"] == 1) & (df["pred_score"] <= base_score * SCORE_DROP_RATIO)
+        # score(sev) / score0 < r  →  pred_score <= base_score * score_drop_ratio
+        df["is_score_drop"] = (df["matched"] == 1) & (df["pred_score"] <= base_score * score_drop_ratio)
     
     if "is_iou_drop" not in df.columns:
         df["is_iou_drop"] = (df["matched"] == 1) & (df["match_iou"] <= (base_iou - IOU_DROP_ABSOLUTE))
@@ -134,9 +142,9 @@ def make_risk_events(detection_df: pd.DataFrame) -> pd.DataFrame:
         else:
             s_star, ftype = s_iou, "iou_drop"
         
-        # CAM 계산 구간 (직전 W_PRE 단계 + 시작단계)
-        cam_s_from = max(0, s_star - W_PRE)
-        cam_s_to = s_star
+        # CAM severity window: [perf_start_sev - 1, perf_start_sev, perf_start_sev + 1]
+        cam_s_from = max(0, s_star - SEV_WINDOW_PRE)
+        cam_s_to = min(MAX_SEVERITY, s_star + SEV_WINDOW_POST)
         
         run_id, model_id, corr, clip_id, frame_idx, obj = k
         event_id = f"{run_id}|{model_id}|{corr}|{clip_id}|{frame_idx}|{obj}|S{s_star}|{ftype}"
@@ -196,9 +204,9 @@ def main():
         print("Please run scripts/03_detect_tiny_objects_timeseries.py first")
         sys.exit(1)
     
-    # Generate risk events
+    # Generate risk events (pass config for score_drop_ratio, etc.)
     print("\nDetecting risk events...")
-    risk_events_df = make_risk_events(records_df)
+    risk_events_df = make_risk_events(records_df, config=config)
     print(f"Found {len(risk_events_df)} risk events")
     
     if len(risk_events_df) > 0:

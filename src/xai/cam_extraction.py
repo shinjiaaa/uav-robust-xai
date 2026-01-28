@@ -119,8 +119,9 @@ def extract_cam_multi_layer(
             traceback_last_lines = '\n'.join([line for line in tb_lines[-4:] if line.strip()][-3:])
             extraction_error = f"{exc_type}: {exc_msg[:100]}"  # Use actual error type
         
-        # QC check (returns qc_stats with diagnostic info)
-        cam_status, fail_reason, qc_stats = get_qc_status(cam, extraction_error)
+        # QC check (returns qc_stats with diagnostic info and quality label)
+        # CRITICAL (RQ1): All CAMs are saved with quality labels (no hard filtering)
+        cam_status, fail_reason, cam_quality, qc_stats = get_qc_status(cam, extraction_error)
         
         # Get CAM shape if available
         cam_shape = None
@@ -136,8 +137,9 @@ def extract_cam_multi_layer(
         
         results[layer_role] = {
             'cam': cam,
-            'cam_status': cam_status,
-            'fail_reason': fail_reason,
+            'cam_status': cam_status,  # "ok" for all quality levels (even flat/noisy)
+            'fail_reason': fail_reason,  # Only for extraction errors (system errors)
+            'cam_quality': cam_quality,  # RQ1: "high" | "flat" | "noisy" | "low_energy" | "empty" | "extraction_failed"
             'letterbox_meta': letterbox_meta,
             'cam_shape': cam_shape,
             'preprocessed_shape': preprocessed_shape,  # For diagnostic
@@ -149,7 +151,7 @@ def extract_cam_multi_layer(
             'cam_max': qc_stats.get('cam_max'),
             'cam_sum': qc_stats.get('cam_sum'),
             'cam_var': qc_stats.get('cam_var'),
-            'cam_std': qc_stats.get('cam_std'),  # 추가: std for QC
+            'cam_std': qc_stats.get('cam_std'),
             'cam_dtype': qc_stats.get('cam_dtype'),
             'finite_ratio': qc_stats.get('finite_ratio')
         }

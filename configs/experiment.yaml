@@ -20,7 +20,9 @@ visdrone:
 # Experiment mode
 experiment:
   pilot_mode: false  # Full experiment mode: use standard severities [0,1,2,3,4]
-  sample_size: 100  # Number of tiny objects to sample
+  sample_size: 100  # Legacy: number of tiny objects to sample (overridden by target_tiny_objects)
+  target_tiny_objects: 461  # RQ1: target unique objects (Table 2 n_objects_unique). Use null or large to use all available.
+  max_images: null  # Max images to scan for tiny objects (null = no limit, process all)
   one_per_image: true  # Sample only one tiny bbox per image (avoid duplicate images)
   
 # Tiny object definition
@@ -103,6 +105,7 @@ risk_detection:
   map_drop_threshold: 0.15  # absolute drop from severity 0
   miss_rate_threshold: 0.25  # miss rate threshold for risk region (25% - realistic for tiny objects)
   score_drop_threshold: 0.2  # absolute score drop threshold
+  score_drop_ratio: 0.9  # RQ1: relative score drop (score(sev)/score0 < r). 0.9 = more events, 0.5 = stronger drop only
   iou_drop_threshold: 0.2  # absolute IoU drop threshold
   score_drop_relative_threshold: 0.15  # relative score drop threshold (15% of baseline) - useful for lowlight
   iou_drop_relative_threshold: 0.15  # relative IoU drop threshold (15% of baseline) - useful for lowlight
@@ -131,7 +134,7 @@ gradcam:
     cam_var_epsilon: 1e-10  # CRITICAL: Reduced from 1e-8 to 1e-10 for debugging (allow near-flat CAMs to pass)
   top_k_percent: 10
   save_samples: true
-  max_samples: 20
+  max_samples: null  # RQ1: null = process all risk events. Set to number to cap (e.g. 20 for debug).
   metrics: ["energy_in_bbox", "activation_spread", "entropy", "center_shift"]  # CAM distribution metrics
   # Dynamic refinement: analyze failure region in detail
   dynamic_refinement:

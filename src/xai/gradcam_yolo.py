@@ -245,6 +245,11 @@ class YOLOGradCAM:
             cam_numpy = cam_detached.cpu().numpy()
             del cam_detached  # Free CPU tensor
             
+            # CRITICAL (RQ1): Clean NaN/Inf values (tiny + FP16 환경에서 자주 발생)
+            # Replace NaN/Inf with 0.0 (preserve CAM structure for analysis)
+            # This allows "noisy" CAMs to be saved and analyzed
+            cam_numpy = np.nan_to_num(cam_numpy, nan=0.0, posinf=0.0, neginf=0.0)
+            
             # CRITICAL: Clear input tensor and gradients to free memory
             if x is not None:
                 if hasattr(x, 'grad') and x.grad is not None:

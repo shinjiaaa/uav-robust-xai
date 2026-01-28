@@ -1329,13 +1329,66 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 risk_events_df = risk_events_df.drop_duplicates(subset=['corruption', 'object_uid', 'failure_type'], keep='first').copy()
                 print(f"[INFO] Deduplicated risk_events: {len(risk_events_df)} unique events (corruption, object_uid, failure_type)")
             
-            # CRITICAL: Use activation_spread as the representative metric for CAM change detection
-            # This ensures one cam_change_sev per event (not per metric)
+            # CRITICAL: cam_change_sev = fixed detector (paper-friendly)
+            # (A) Z-score: z(sev) = (m(sev) - mean(m0)) / (std(m0) + 1e-8); cam_change_sev = min sev s.t. |z(sev)| >= 2
+            # (B) Optional: 2+ metrics with |z| >= 2 → cam_change (ensemble)
             REPRESENTATIVE_CAM_METRIC = 'activation_spread'
-            CAM_CHANGE_THRESHOLD = 0.05  # Threshold for activation_spread
-            
+            Z_SCORE_THRESHOLD = 2.0  # |z| >= 2 for significant CAM change
+            USE_CAM_ENSEMBLE = False  # If True: require >= MIN_METRICS_CHANGED metrics with |z| >= 2
+            MIN_METRICS_CHANGED = 2
+            CAM_METRICS_FOR_ENSEMBLE = ['energy_in_bbox', 'activation_spread', 'entropy', 'center_shift']
+
             alignment_analysis = {}
-            
+
+            def _cam_change_sev_zscore(event_cam_primary, severity_order, baseline_sev=0):
+                """Return (cam_change_sev, metric_used) using z-score: min sev s.t. |z(sev)| >= Z_SCORE_THRESHOLD."""
+                baseline_cam = event_cam_primary[event_cam_primary['severity'] == baseline_sev]
+                if len(baseline_cam) < 1:
+                    return None, None
+                cam_change_sev = None
+                metric_used = None
+                for sev in severity_order:
+                    if sev == baseline_sev:
+                        continue
+                    sev_cam = event_cam_primary[event_cam_primary['severity'] == sev]
+                    if len(sev_cam) == 0:
+                        continue
+                    if USE_CAM_ENSEMBLE:
+                        n_changed = 0
+                        for m in CAM_METRICS_FOR_ENSEMBLE:
+                            if m not in baseline_cam.columns or m not in sev_cam.columns:
+                                continue
+                            m0 = baseline_cam[m].dropna()
+                            ms = sev_cam[m].dropna()
+                            if len(m0) < 1 or len(ms) < 1:
+                                continue
+                            mean0, std0 = m0.mean(), m0.std()
+                            if pd.isna(std0) or std0 == 0:
+                                std0 = 1e-8
+                            z = (ms.mean() - mean0) / std0
+                            if abs(z) >= Z_SCORE_THRESHOLD:
+                                n_changed += 1
+                        if n_changed >= MIN_METRICS_CHANGED:
+                            cam_change_sev = sev
+                            metric_used = 'ensemble'
+                            break
+                    else:
+                        if REPRESENTATIVE_CAM_METRIC not in baseline_cam.columns or REPRESENTATIVE_CAM_METRIC not in sev_cam.columns:
+                            continue
+                        m0 = baseline_cam[REPRESENTATIVE_CAM_METRIC].dropna()
+                        ms = sev_cam[REPRESENTATIVE_CAM_METRIC].dropna()
+                        if len(m0) < 1 or len(ms) < 1:
+                            continue
+                        mean0, std0 = m0.mean(), m0.std()
+                        if pd.isna(std0) or std0 == 0:
+                            std0 = 1e-8
+                        z = (ms.mean() - mean0) / std0
+                        if abs(z) >= Z_SCORE_THRESHOLD:
+                            cam_change_sev = sev
+                            metric_used = REPRESENTATIVE_CAM_METRIC
+                            break
+                return (cam_change_sev, metric_used)
+
             # CRITICAL: Process ALL events from risk_events_df (even if CAM data is missing)
             for _, risk_event in risk_events_df.iterrows():
                 event_id = risk_event.get('failure_event_id', '')
@@ -1343,25 +1396,17 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 object_uid = risk_event.get('object_uid', '')
                 start_severity = int(risk_event.get('start_severity', -1))
                 failure_type = risk_event.get('failure_type', 'unknown')
-                
+
                 if start_severity < 0:
                     continue
-                
+
                 # Find CAM records for this event (by object_uid or failure_event_id)
-                # Try multiple join strategies for robustness
                 event_cam = pd.DataFrame()
-                
-                # Strategy 1: Join by failure_event_id (most reliable)
                 if 'failure_event_id' in cam_records_df.columns:
                     event_cam = cam_records_df[cam_records_df['failure_event_id'] == event_id].copy()
-                
-                # Strategy 2: Join by object_id (object_uid stored in object_id field)
                 if len(event_cam) == 0 and 'object_id' in cam_records_df.columns:
                     event_cam = cam_records_df[cam_records_df['object_id'] == object_uid].copy()
-                
-                # Strategy 3: Join by image_id + class_id + corruption (fallback)
                 if len(event_cam) == 0:
-                    # Parse image_id from object_uid
                     try:
                         if '_cls' in object_uid:
                             image_id_from_uid = object_uid.split('_cls')[0].rsplit('_obj', 1)[0] if '_obj' in object_uid else object_uid.split('_cls')[0]
@@ -1369,60 +1414,31 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         else:
                             image_id_from_uid = object_uid
                             class_id_from_uid = None
-                        
                         if 'image_id' in cam_records_df.columns and 'class_id' in cam_records_df.columns:
                             event_cam = cam_records_df[
                                 (cam_records_df['image_id'] == image_id_from_uid) &
                                 (cam_records_df['class_id'] == class_id_from_uid) &
                                 (cam_records_df['corruption'] == corruption)
                             ].copy()
-                    except:
+                    except Exception:
                         pass
-                
-                # CRITICAL: Filter by corruption and severity range (up to start_severity)
+
                 if len(event_cam) > 0:
                     event_cam = event_cam[
                         (event_cam['corruption'] == corruption) &
                         (event_cam['severity'] <= start_severity)
                     ].copy()
-                
-                # CRITICAL: Find CAM change using representative metric (activation_spread)
-                # This ensures one cam_change_sev per event
+
                 cam_change_severity = None
                 cam_change_metric = None
-                
+
                 if len(event_cam) > 0:
-                    # Get baseline CAM (severity 0) - use primary layer only
-                    baseline_cam = event_cam[
-                        (event_cam['severity'] == 0) & 
-                        (event_cam.get('layer_role', 'primary') == 'primary')
-                    ].copy()
-                    
-                    if len(baseline_cam) > 0 and REPRESENTATIVE_CAM_METRIC in baseline_cam.columns:
-                        baseline_val = baseline_cam[REPRESENTATIVE_CAM_METRIC].mean()
-                        
-                        if pd.notna(baseline_val):
-                            # Use primary layer only for consistency
-                            event_cam_primary = event_cam[event_cam.get('layer_role', 'primary') == 'primary'].copy()
-                            
-                            # Find first severity where activation_spread changes significantly
-                            for sev in sorted(event_cam_primary['severity'].unique()):
-                                if sev == 0:
-                                    continue
-                                
-                                sev_cam = event_cam_primary[event_cam_primary['severity'] == sev]
-                                if len(sev_cam) == 0:
-                                    continue
-                                
-                                sev_val = sev_cam[REPRESENTATIVE_CAM_METRIC].mean()
-                                if pd.isna(sev_val):
-                                    continue
-                                
-                                delta = abs(sev_val - baseline_val)
-                                if delta >= CAM_CHANGE_THRESHOLD:
-                                    cam_change_severity = sev
-                                    cam_change_metric = REPRESENTATIVE_CAM_METRIC
-                                    break
+                    event_cam_primary = event_cam[event_cam.get('layer_role', 'primary') == 'primary'].copy()
+                    if len(event_cam_primary) > 0:
+                        severity_order = sorted(event_cam_primary['severity'].unique())
+                        cam_change_severity, cam_change_metric = _cam_change_sev_zscore(
+                            event_cam_primary, severity_order, baseline_sev=0
+                        )
                 
                 # CRITICAL: Determine alignment using unified formula
                 # lead_steps = perf_start_severity - cam_change_severity
@@ -1784,7 +1800,7 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - Alignment analysis is computed from risk_events.csv (Performance Axis) and cam_records.csv (Cognition Axis)
     - For each risk event, compare:
       * performance_start_severity: When performance degradation starts (from risk_events.csv)
-      * cam_change_severity: When CAM metrics first change significantly (from cam_records.csv)
+      * cam_change_severity: First severity where |z(sev)|>=2 (z = (m(sev)-mean0)/(std0+1e-8) on activation_spread)
     - Alignment types:
       * lead: CAM changes BEFORE performance degradation (cam_change_severity < performance_start_severity)
       * coincident: CAM changes AT THE SAME TIME as performance degradation (==)
@@ -1877,8 +1893,8 @@ REPORT STRUCTURE:
        * perf_start_sev=1, cam_change_sev=2 → lead_steps=-1 → alignment='lag'
        * perf_start_sev=1, cam_change_sev=N/A → lead_steps=N/A → alignment=N/A (CAM missing)
      * perf_start_sev = performance_start_severity (from risk_events.csv)
-     * cam_change_sev = cam_change_severity (from cam_records.csv, using activation_spread as representative metric)
-     * cam_metric = representative CAM metric used (always 'activation_spread' - one metric per event)
+     * cam_change_sev = cam_change_severity (from cam_records.csv: z-score detector |z|>=2 on activation_spread vs severity-0 baseline)
+     * cam_metric = representative CAM metric used (activation_spread, or 'ensemble' if USE_CAM_ENSEMBLE)
      * CRITICAL: Show ALL events from risk_events.csv (including CAM missing events with N/A values)
      * CRITICAL: Total rows in X-detail MUST match Total Events in X-summary (one row per event)
      * If some events have N/A for cam_change_sev, they still appear in detail table (with N/A values)

@@ -27,9 +27,10 @@ def create_cam_record(
     layer_role: str = None,  # 'primary' or 'secondary'
     layer_name: str = None,
     
-    # CAM status
-    cam_status: str = None,  # 'ok' or 'fail'
-    fail_reason: Optional[str] = None,
+    # CAM status (RQ1: soft labels - all CAMs saved)
+    cam_status: str = None,  # 'ok' or 'fail' (for backward compatibility)
+    fail_reason: Optional[str] = None,  # Only for extraction errors (system errors)
+    cam_quality: Optional[str] = None,  # RQ1: 'high' | 'flat' | 'noisy' | 'low_energy' | 'empty' | 'extraction_failed'
     exc_type: Optional[str] = None,  # Exception type name (e.g., 'MemoryError', 'RuntimeError')
     exc_msg: Optional[str] = None,  # Exception message (first 200 chars)
     traceback_last_lines: Optional[str] = None,  # Last 1-3 lines of traceback
@@ -96,9 +97,10 @@ def create_cam_record(
         'layer_role': layer_role,
         'layer_name': layer_name,
         
-        # Status
+        # Status (RQ1: soft labels)
         'cam_status': cam_status,
         'fail_reason': fail_reason,
+        'cam_quality': cam_quality,  # RQ1: quality label for analysis
         'exc_type': exc_type,
         'exc_msg': exc_msg,
         'traceback_last_lines': traceback_last_lines,

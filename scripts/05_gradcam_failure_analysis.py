@@ -122,22 +122,28 @@ def main():
     error_records = []  # Store error details for analysis
     device_checked = False  # Flag to print device info once
     
-    # Process failure events (limit to max_samples)
-    max_samples = gradcam_config.get('max_samples', 20)
+    # RQ1: Process all events when max_samples is null/unset; no debug subset
+    max_samples = gradcam_config.get('max_samples')
+    cap_events = (max_samples is not None and max_samples > 0)
     
-    # CRITICAL: If using risk_events, we already have filtered scope (cam_sev_from to cam_sev_to)
-    # So we can process more events efficiently
     if use_risk_events:
         # Process all risk events (they are already scoped to risk regions)
         sample_events = failure_events_df.copy()
-        print(f"\n[INFO] Using risk_events.csv - processing all {len(sample_events)} risk events")
+        if cap_events:
+            sample_events = sample_events.head(max_samples)
+            print(f"\n[INFO] Using risk_events.csv - capped to {len(sample_events)} events (max_samples={max_samples})")
+        else:
+            print(f"\n[INFO] Using risk_events.csv - processing all {len(sample_events)} risk events")
         print("[INFO] CAM will be computed only for risk regions (reduces computation cost)")
     else:
-        # Legacy: sample events for memory efficiency
-        sample_events = (failure_events_df
-                     .groupby("corruption", group_keys=False)
-                     .head(max_samples//3))
-        print(f"\n[INFO] Using legacy failure_events.csv - sampling {len(sample_events)} events")
+        # Legacy: process all or cap by max_samples
+        if cap_events:
+            sample_events = (failure_events_df.groupby("corruption", group_keys=False)
+                             .apply(lambda g: g.head(max(max_samples // 3, 1))).reset_index(drop=True))
+            print(f"\n[INFO] Using legacy failure_events.csv - capped to {len(sample_events)} events (max_samples={max_samples})")
+        else:
+            sample_events = failure_events_df.copy()
+            print(f"\n[INFO] Using legacy failure_events.csv - processing all {len(sample_events)} events")
                  
     print("\n[DBG] sample_events corruption distribution:")
     print(sample_events["corruption"].value_counts())
@@ -496,9 +502,17 @@ def main():
                 finite_ratio = layer_result.get('finite_ratio')
                 preprocessed_shape = layer_result.get('preprocessed_shape')
                 
-                # Stage C: Quality Gate (already done in extract_cam_multi_layer)
-                # If QC failed, record and continue
-                if cam_status == 'fail':
+                # Stage C: Quality Gate (RQ1: soft labels - all CAMs saved)
+                # CRITICAL (RQ1): All CAMs are saved with quality labels (no hard filtering)
+                # Only extraction errors (system errors) are marked as 'fail'
+                # Quality issues (flat/noisy/low_energy) are labels, not failures
+                cam_quality = layer_result.get('cam_quality', 'unknown')
+                
+                # Only skip if extraction failed (system error) - quality issues are still saved
+                extraction_errors = ['no_activation', 'no_grad', 'shape_mismatch', 'memory_error', 'cam_extraction_failed', 'layer_not_configured']
+                is_extraction_error = (cam_status == 'fail' and fail_reason in extraction_errors)
+                
+                if is_extraction_error:
                     # Extract error information from layer_result
                     exc_type = layer_result.get('exc_type')
                     exc_msg = layer_result.get('exc_msg')
@@ -515,9 +529,9 @@ def main():
                     elif preprocessed_shape:
                         preprocessed_shape_tuple = preprocessed_shape
                     
-                    # Create fail record with detailed error information and QC diagnostics
+                    # Create record for extraction failures (system errors)
                     # CRITICAL: Include object_uid and failure_event_id for alignment analysis
-                    # RQ1: Include CAM target information (even for failed CAMs)
+                    # RQ1: Include CAM target information and quality label
                     record = create_cam_record(
                         model=model_name,
                         corruption=corruption,
@@ -533,8 +547,9 @@ def main():
                         bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
                         layer_role=layer_role,
                         layer_name=layer_config[layer_role]['name'],
-                        cam_status='fail',
+                        cam_status='fail',  # System error (extraction failed)
                         fail_reason=fail_reason,
+                        cam_quality=cam_quality if 'cam_quality' in locals() else 'extraction_failed',  # RQ1: quality label
                         exc_type=exc_type,
                         exc_msg=exc_msg,
                         traceback_last_lines=traceback_last_lines,
@@ -556,14 +571,17 @@ def main():
                         record['failure_type'] = failure_type
                     cam_records.append(record)
                     if layer_role == 'primary':
+                        # RQ1: Only count extraction errors as "failed", not quality issues
                         corruption_cam_stats[corruption]['failed'] += 1
-                    continue
+                    continue  # Skip metrics computation for extraction errors
                 
                 # Store baseline (severity 0) per layer
                 if severity == 0:
                     baseline_cams[layer_role] = cam.copy() if cam is not None else None
                 
                 # Stage D: Compute metrics (layer-invariant)
+                # RQ1: Compute metrics for all CAMs (including flat/noisy/low_energy)
+                # Only skip if extraction failed (system error)
                 if cam is not None and baseline_cams.get(layer_role) is not None:
                     # Convert visdrone bbox to xyxy format
                     bbox_xyxy = (
@@ -607,9 +625,10 @@ def main():
                     elif preprocessed_shape:
                         preprocessed_shape_tuple = preprocessed_shape
                     
-                    # Create record with new schema
+                    # Create record with new schema (RQ1: all CAMs saved with quality labels)
                     # CRITICAL: Include object_uid and failure_event_id for alignment analysis
-                    # RQ1: Include CAM target information (for miss cases)
+                    # RQ1: Include CAM target information and quality label
+                    cam_quality = layer_result.get('cam_quality', 'high')  # RQ1: quality label
                     record = create_cam_record(
                         model=model_name,
                         corruption=corruption,
@@ -625,8 +644,9 @@ def main():
                         bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
                         layer_role=layer_role,
                         layer_name=layer_config[layer_role]['name'],
-                        cam_status='ok',
-                        fail_reason=None,
+                        cam_status='ok',  # RQ1: All quality levels are 'ok' (even flat/noisy/low_energy)
+                        fail_reason=None,  # RQ1: No fail_reason for quality issues (they're labels)
+                        cam_quality=cam_quality,  # RQ1: 'high' | 'flat' | 'noisy' | 'low_energy'
                         cam_h=cam_shape[0] if cam_shape else None,
                         cam_w=cam_shape[1] if cam_shape else None,
                         entropy=float(metrics['entropy']),
