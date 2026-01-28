@@ -25,8 +25,8 @@ def apply_fog(image: np.ndarray, severity: int, seed: int = 42) -> np.ndarray:
     if severity == 0:
         return image.copy()
     
-    # Fog parameters
-    alpha_values = [0.0, 0.15, 0.30, 0.45, 0.60]
+    # Fog parameters - INCREASED STRENGTH
+    alpha_values = [0.0, 0.25, 0.50, 0.75, 0.90]  # Increased from [0.0, 0.15, 0.30, 0.45, 0.60]
     
     # Handle extreme severity (e.g., 50)
     if severity >= len(alpha_values):
@@ -65,9 +65,9 @@ def apply_lowlight(image: np.ndarray, severity: int, seed: int = 42) -> np.ndarr
     if severity == 0:
         return image.copy()
     
-    # Low-light parameters (reduced severity for better detection)
-    gamma_values = [1.0, 1.2, 1.4, 1.6, 1.8]
-    brightness_scale_values = [1.0, 0.90, 0.80, 0.70, 0.60]
+    # Low-light parameters - INCREASED STRENGTH
+    gamma_values = [1.0, 1.5, 2.0, 2.5, 3.0]  # Increased from [1.0, 1.2, 1.4, 1.6, 1.8]
+    brightness_scale_values = [1.0, 0.75, 0.50, 0.35, 0.20]  # Decreased from [1.0, 0.90, 0.80, 0.70, 0.60]
     
     # Handle extreme severity (e.g., 50)
     if severity >= len(gamma_values):
@@ -111,8 +111,8 @@ def apply_motion_blur(image: np.ndarray, severity: int, seed: int = 42, image_id
     if severity == 0:
         return image.copy()
     
-    # Motion blur parameters (reduced severity for better detection)
-    kernel_lengths = [0, 3, 6, 9, 12]
+    # Motion blur parameters - INCREASED STRENGTH
+    kernel_lengths = [0, 5, 10, 15, 20]  # Increased from [0, 3, 6, 9, 12]
     
     # Handle extreme severity (e.g., 50)
     if severity >= len(kernel_lengths):

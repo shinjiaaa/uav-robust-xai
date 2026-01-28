@@ -65,7 +65,10 @@ def create_cam_record(
     failure_severity: Optional[int] = None,
     # Alignment analysis fields (for joining with risk_events)
     failure_event_id: Optional[str] = None,  # Links to risk_events.csv
-    failure_type: Optional[str] = None  # miss / score_drop / iou_drop
+    failure_type: Optional[str] = None,  # miss / score_drop / iou_drop
+    # RQ1: CAM target selection (for miss cases)
+    cam_target_class_id: Optional[int] = None,  # Class ID used for CAM generation (may differ from GT class_id)
+    cam_target_type: Optional[str] = None  # "gt_class", "pred_class", "gt_class_miss"
 ) -> Dict:
     """Create a CAM record with standardized schema.
     
@@ -130,7 +133,10 @@ def create_cam_record(
         'failure_severity': failure_severity,
         # Alignment analysis fields
         'failure_event_id': failure_event_id,
-        'failure_type': failure_type
+        'failure_type': failure_type,
+        # RQ1: CAM target selection
+        'cam_target_class_id': cam_target_class_id,
+        'cam_target_type': cam_target_type
     }
     
     # Store letterbox_meta as JSON string if provided

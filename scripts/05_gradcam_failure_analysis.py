@@ -48,6 +48,18 @@ def main():
     
     results_dir = Path(config['results']['root'])
     
+    # CRITICAL: Load detection_records.csv to get matched/prediction information for CAM target selection
+    # This is required for RQ1: CAM generation even when matched=0 (miss)
+    detection_records_csv = results_dir / "detection_records.csv"
+    detection_records_df = None
+    if detection_records_csv.exists() and detection_records_csv.stat().st_size > 0:
+        try:
+            detection_records_df = pd.read_csv(detection_records_csv)
+            print(f"[INFO] Loaded {len(detection_records_df)} detection records for CAM target selection")
+        except Exception as e:
+            print(f"[WARN] Failed to load detection_records.csv: {e}")
+            print(f"[WARN] CAM will use GT class_id as target (may not work for miss cases)")
+    
     # CRITICAL: Load risk_events.csv (new format with CAM computation scope)
     # If risk_events.csv exists, use it; otherwise fallback to failure_events.csv (legacy)
     risk_events_csv = results_dir / "risk_events.csv"
@@ -308,6 +320,10 @@ def main():
         # Store baseline CAMs per layer (primary/secondary)
         baseline_cams = {}  # {layer_role: cam}
         
+        # CRITICAL (RQ1): Initialize CAM target variables (will be set per severity)
+        cam_target_class_id = class_id  # Default: GT class_id
+        cam_target_type = "gt_class"  # Track target type for debugging
+        
         for severity in severity_range:
             # Get image path
             if severity == 0:
@@ -418,12 +434,41 @@ def main():
             visdrone_bbox = tiny_obj['bbox']  # (left, top, width, height) in pixels
             yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
             
+            # CRITICAL (RQ1): Determine CAM target class_id based on matched status (per severity)
+            # For RQ1, we need CAM even when matched=0 (miss) to analyze failure regions
+            cam_target_class_id = class_id  # Default: GT class_id
+            cam_target_type = "gt_class"  # Track target type for debugging
+            
+            if detection_records_df is not None:
+                # Try to find matched prediction for this object+severity
+                object_records = detection_records_df[
+                    (detection_records_df.get('object_uid', '') == object_uid) &
+                    (detection_records_df.get('corruption', '') == corruption) &
+                    (detection_records_df.get('severity', -1) == severity)
+                ]
+                
+                if len(object_records) > 0:
+                    record = object_records.iloc[0]
+                    matched = record.get('matched', 0)
+                    
+                    if matched == 1:
+                        # Matched: use prediction's class_id (more meaningful for CAM)
+                        pred_class_id = record.get('pred_class_id')
+                        if pred_class_id is not None and not pd.isna(pred_class_id):
+                            cam_target_class_id = int(pred_class_id)
+                            cam_target_type = "pred_class"
+                    else:
+                        # Miss: use GT class_id (RQ1 requirement: CAM even for miss)
+                        cam_target_class_id = class_id
+                        cam_target_type = "gt_class_miss"
+                        # Note: This allows CAM generation for miss cases, critical for RQ1
+            
             # Extract CAMs from all configured layers
             cam_results = extract_cam_multi_layer(
                 gradcam_instances,
                 image,
                 yolo_bbox,
-                class_id,
+                cam_target_class_id,  # Use determined target class_id
                 layer_config,
                 qc_config
             )
@@ -472,6 +517,7 @@ def main():
                     
                     # Create fail record with detailed error information and QC diagnostics
                     # CRITICAL: Include object_uid and failure_event_id for alignment analysis
+                    # RQ1: Include CAM target information (even for failed CAMs)
                     record = create_cam_record(
                         model=model_name,
                         corruption=corruption,
@@ -479,6 +525,8 @@ def main():
                         image_id=image_id,
                         class_id=class_id,
                         object_id=object_uid if 'object_uid' in locals() else None,  # Store object_uid
+                        cam_target_class_id=cam_target_class_id if 'cam_target_class_id' in locals() else class_id,  # RQ1
+                        cam_target_type=cam_target_type if 'cam_target_type' in locals() else "gt_class",  # RQ1
                         bbox_x1=visdrone_bbox[0],
                         bbox_y1=visdrone_bbox[1],
                         bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
@@ -561,6 +609,7 @@ def main():
                     
                     # Create record with new schema
                     # CRITICAL: Include object_uid and failure_event_id for alignment analysis
+                    # RQ1: Include CAM target information (for miss cases)
                     record = create_cam_record(
                         model=model_name,
                         corruption=corruption,
@@ -568,6 +617,8 @@ def main():
                         image_id=image_id,
                         class_id=class_id,
                         object_id=object_uid if 'object_uid' in locals() else None,  # Store object_uid
+                        cam_target_class_id=cam_target_class_id,  # RQ1: track target class used for CAM
+                        cam_target_type=cam_target_type,  # RQ1: track target type (gt_class/pred_class/gt_class_miss)
                         bbox_x1=visdrone_bbox[0],
                         bbox_y1=visdrone_bbox[1],
                         bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
