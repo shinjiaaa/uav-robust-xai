@@ -286,22 +286,25 @@ def main():
                         # Pred rank (1 if matched, None if miss)
                         pred_rank = 1 if matched == 1 else None
                         
-                        # A-1: Miss definitions (standard 2-way)
-                        # miss_nd = no detection (no matched prediction for this GT)
-                        # miss_loc = prediction exists but IoU < threshold
-                        # miss_total = miss_nd OR miss_loc (same as current "miss")
+                        # A1: miss = "객체 탐지 실패(no detection)" only. IoU<0.3 = localization degradation (not miss).
+                        # is_detected = 1 if at least one overlapping prediction exists (탐지 결과 존재)
+                        # is_missed = 1 if no overlapping prediction (탐지 결과 없음)
+                        has_overlap = (best_iou_any_pred is not None and best_iou_any_pred > 0)
+                        is_detected = 1 if has_overlap else 0
+                        is_missed = 1 if not has_overlap else 0
+                        # Legacy 2-way (for analysis): miss_nd = no detection, miss_loc = overlap but IoU<threshold
                         if matched == 1:
                             detected = 1
-                            best_iou_val = iou  # actual IoU of matched prediction
+                            best_iou_val = iou
                             miss_nd = 0
                             miss_loc = 0
                             miss_total = 0
                         else:
                             detected = 0
-                            best_iou_val = best_iou_any_pred if (best_iou_any_pred is not None and best_iou_any_pred > 0) else None  # NaN when no overlap
-                            no_overlap = (best_iou_any_pred is None or best_iou_any_pred == 0)
+                            best_iou_val = best_iou_any_pred if has_overlap else None
+                            no_overlap = not has_overlap
                             miss_nd = 1 if no_overlap else 0
-                            miss_loc = 0 if no_overlap else 1  # overlap but below threshold
+                            miss_loc = 0 if no_overlap else 1
                             miss_total = 1
                         
                         # CRITICAL: Standard schema for RQ1 automatic report generation
@@ -337,8 +340,10 @@ def main():
                             
                             # C. 매칭 & 성능 원시값 (모든 curve의 원천)
                             'matched': matched,
+                            'is_detected': is_detected,   # A1: 1 = 탐지 존재 (overlap 있음), 0 = 없음
+                            'is_missed': is_missed,       # A1: 1 = no detection (overlap 없음). 집계는 이 컬럼만 사용.
                             'detected': detected,
-                            'best_iou': best_iou_val,  # NaN when no match (no overlap)
+                            'best_iou': best_iou_val,
                             'miss_nd': miss_nd,
                             'miss_loc': miss_loc,
                             'miss_total': miss_total,
@@ -513,7 +518,7 @@ def main():
             'run_id', 'model_id', 'model_family', 'dataset', 'split', 'corruption', 'severity',
             'clip_id', 'frame_idx', 'image_id', 'image_path', 'corrupted_image_path',
             'object_uid', 'gt_class_id', 'gt_class_name', 'gt_x1', 'gt_y1', 'gt_x2', 'gt_y2', 'gt_area', 'is_tiny',
-            'match_policy', 'iou_threshold', 'matched', 'detected', 'best_iou', 'miss_nd', 'miss_loc', 'miss_total',
+            'match_policy', 'iou_threshold', 'matched', 'is_detected', 'is_missed', 'detected', 'best_iou', 'miss_nd', 'miss_loc', 'miss_total',
             'is_miss', 'pred_rank',
             'pred_class_id', 'pred_class_name', 'pred_score', 'match_iou',
             'pred_x1', 'pred_y1', 'pred_x2', 'pred_y2',
@@ -569,7 +574,7 @@ def main():
             'run_id', 'model_id', 'model_family', 'dataset', 'split', 'corruption', 'severity',
             'clip_id', 'frame_idx', 'image_id', 'image_path', 'corrupted_image_path',
             'object_uid', 'gt_class_id', 'gt_class_name', 'gt_x1', 'gt_y1', 'gt_x2', 'gt_y2', 'gt_area', 'is_tiny',
-            'match_policy', 'iou_threshold', 'matched', 'detected', 'best_iou', 'miss_nd', 'miss_loc', 'miss_total',
+            'match_policy', 'iou_threshold', 'matched', 'is_detected', 'is_missed', 'detected', 'best_iou', 'miss_nd', 'miss_loc', 'miss_total',
             'is_miss', 'pred_rank',
             'pred_class_id', 'pred_class_name', 'pred_score', 'match_iou',
             'pred_x1', 'pred_y1', 'pred_x2', 'pred_y2',
@@ -589,6 +594,18 @@ def main():
         all_records_df.to_csv(combined_detection_records_csv, index=False)
         
         print(f"  Saved {len(all_records_df)} total records (all models) to {combined_detection_records_csv}")
+        
+        # A4: Sanity check (miss_rate 버그 재발 방지) - object_uid 기준, severity별
+        if 'object_uid' in all_records_df.columns and 'is_missed' in all_records_df.columns and 'is_detected' in all_records_df.columns:
+            n_obj = all_records_df['object_uid'].nunique()
+            print(f"\n  [A4] Sanity check: n_objects_unique = {n_obj} (expected 500)")
+            for (corr, sev), grp in all_records_df.groupby(['corruption', 'severity']):
+                n_rec = len(grp)
+                n_det = int(grp['is_detected'].sum())
+                n_miss = int(grp['is_missed'].sum())
+                ok = (n_det + n_miss == n_rec and n_rec == 500)
+                print(f"    {corr} sev{sev}: n_records={n_rec} n_detected={n_det} n_missed={n_miss}  {'OK' if ok else 'CHECK'}")
+            print("  (n_records_total per (corruption,severity) should be 500; 1500 indicates aggregation bug.)")
         
         # Final cleanup
         del all_records_df

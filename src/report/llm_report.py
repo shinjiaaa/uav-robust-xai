@@ -439,8 +439,8 @@ def summarize_metrics(metrics: Dict) -> Dict:
         # CRITICAL: Calculate unique objects (object_uid) for clarity
         n_objects_unique = df['object_uid'].nunique() if 'object_uid' in df.columns else (df['image_id'].nunique() if 'image_id' in df.columns else None)
         
-        # C-2: Miss rate = miss_total.mean() (GT object-level; no filtering). Prefer miss_total, then miss, then is_miss.
-        miss_col_overall = 'miss_total' if 'miss_total' in df.columns else ('miss' if 'miss' in df.columns else 'is_miss')
+        # A3: miss_rate = object-level. miss = no detection (is_missed). Use is_missed > miss_total > miss > is_miss.
+        miss_col_overall = 'is_missed' if 'is_missed' in df.columns else ('miss_total' if 'miss_total' in df.columns else ('miss' if 'miss' in df.columns else 'is_miss'))
         miss_rate_by_sev = df.groupby('severity')[miss_col_overall].mean().to_dict() if miss_col_overall in df.columns else {}
         
         overall_summary = {
@@ -466,8 +466,8 @@ def summarize_metrics(metrics: Dict) -> Dict:
             for corruption in df['corruption'].unique():
                 corr_df = df[df['corruption'] == corruption]
                 
-                # C-2: Miss rate from miss_total (then miss, then is_miss) - no filtering, GT object-level
-                miss_col = 'miss_total' if 'miss_total' in corr_df.columns else ('miss' if 'miss' in corr_df.columns else 'is_miss')
+                # A3: Miss rate = no detection (is_missed) only. Object-level.
+                miss_col = 'is_missed' if 'is_missed' in corr_df.columns else ('miss_total' if 'miss_total' in corr_df.columns else ('miss' if 'miss' in corr_df.columns else 'is_miss'))
                 score_col = 'pred_score' if 'pred_score' in corr_df.columns else 'score'
                 iou_col = 'match_iou' if 'match_iou' in corr_df.columns else 'iou'
                 matched_col = 'matched' if 'matched' in corr_df.columns else None
