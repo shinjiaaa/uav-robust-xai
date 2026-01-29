@@ -83,8 +83,12 @@ def main():
     
     print(f"Loaded {len(tiny_objects)} tiny objects")
     
-    # Process each model (only yolo_generic for pilot)
-    models = ['yolo_generic']  # Only Generic YOLO
+    # Process each model (all models from config)
+    # RQ1: Grad-CAM early-signal experiment uses YOLO only (2 models)
+    all_models = list(config['models'].keys())
+    models = [m for m in all_models if config['models'][m].get('type') == 'yolo']
+    if not models:
+        models = all_models
     corruptions = config['corruptions']['types']
     severities = config['corruptions']['severities']
     
@@ -94,11 +98,23 @@ def main():
     # Get dataset info
     dataset = "VisDrone2019-DET"
     split = config['evaluation']['splits'][0] if 'evaluation' in config and 'splits' in config['evaluation'] else "val"
-    model_family = "YOLO"  # Default, can be extended
     
-    records = []
+    print(f"\nProcessing {len(models)} models: {', '.join(models)}")
     
+    # Process each model separately and save per-model files
     for model_name in models:
+        model_config = config['models'][model_name]
+        model_type = model_config['type']
+        
+        # Determine model family for naming
+        if model_type == "yolo":
+            model_family = "YOLO"
+        elif model_type == "rtdetr":
+            model_family = "RT-DETR"
+        else:
+            model_family = model_type.upper()
+        
+        records = []  # Per-model records
         model_config = config['models'][model_name]
         model_type = model_config['type']
         
@@ -137,16 +153,17 @@ def main():
                     batch_end = min(batch_start + batch_size, len(tiny_objects))
                     batch_objects = tiny_objects[batch_start:batch_end]
                     
-                    for tiny_obj in batch_objects:
+                    for i_in_batch, tiny_obj in enumerate(batch_objects):
                         image_id = tiny_obj['image_id']
                         frame_rel_path = tiny_obj['frame_path']
+                        # Stable index for fallback object_uid (no hash)
+                        object_global_i = batch_start + i_in_batch
                         
-                        # Get image path
+                        # Get image path (Option A: level0 = original; level1-4 = generated/{corruption}/L{k}/images)
                         if severity == 0:
                             image_path = visdrone_root / frame_rel_path
                         else:
-                            # New structure: corruptions_root / corruption / severity / images
-                            image_path = corruptions_root / corruption / str(severity) / "images" / Path(frame_rel_path).name
+                            image_path = corruptions_root / corruption / f"L{severity}" / "images" / Path(frame_rel_path).name
                         
                         if not image_path.exists():
                             corruption_missing_image_count += 1
@@ -247,13 +264,10 @@ def main():
                         gt_y2 = gt_top + gt_height
                         gt_area = gt_width * gt_height
                         
-                        # Generate object_uid: unique identifier for this tiny object across all frames/severities
-                        # Format: {image_id}_obj{object_index}_{class_id}
-                        object_index = tiny_obj.get('object_index', tiny_obj.get('object_id', ''))
-                        if not object_index:
-                            # Fallback: use hash of bbox position
-                            object_index = hash((gt_x1, gt_y1, gt_x2, gt_y2)) % 10000
-                        object_uid = f"{image_id}_obj{object_index}_cls{class_id}"
+                        # object_uid: use 01's stored value for join stability (no hash, run-invariant)
+                        object_uid = tiny_obj.get('object_uid')
+                        if not object_uid:
+                            object_uid = f"{image_id}_obj_{class_id}_{object_global_i}"
                         
                         # Frame index (within clip) - for now, assume single image (frame_idx=0)
                         # TODO: If processing video clips, extract frame_idx from clip_id
@@ -271,6 +285,24 @@ def main():
                         
                         # Pred rank (1 if matched, None if miss)
                         pred_rank = 1 if matched == 1 else None
+                        
+                        # A-1: Miss definitions (standard 2-way)
+                        # miss_nd = no detection (no matched prediction for this GT)
+                        # miss_loc = prediction exists but IoU < threshold
+                        # miss_total = miss_nd OR miss_loc (same as current "miss")
+                        if matched == 1:
+                            detected = 1
+                            best_iou_val = iou  # actual IoU of matched prediction
+                            miss_nd = 0
+                            miss_loc = 0
+                            miss_total = 0
+                        else:
+                            detected = 0
+                            best_iou_val = best_iou_any_pred if (best_iou_any_pred is not None and best_iou_any_pred > 0) else None  # NaN when no overlap
+                            no_overlap = (best_iou_any_pred is None or best_iou_any_pred == 0)
+                            miss_nd = 1 if no_overlap else 0
+                            miss_loc = 0 if no_overlap else 1  # overlap but below threshold
+                            miss_total = 1
                         
                         # CRITICAL: Standard schema for RQ1 automatic report generation
                         record = {
@@ -305,6 +337,11 @@ def main():
                             
                             # C. 매칭 & 성능 원시값 (모든 curve의 원천)
                             'matched': matched,
+                            'detected': detected,
+                            'best_iou': best_iou_val,  # NaN when no match (no overlap)
+                            'miss_nd': miss_nd,
+                            'miss_loc': miss_loc,
+                            'miss_total': miss_total,
                             'is_miss': 1 if matched == 0 or (iou is not None and iou < iou_threshold) else 0,
                             'pred_rank': pred_rank,
                             'pred_class_id': pred_class_id,
@@ -460,8 +497,60 @@ def main():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()  # Second pass
+        
+        # CRITICAL: Save per-model records after processing all corruptions for this model
+        print(f"\nSaving detection records for model: {model_name}...")
+        model_records = [r for r in records if r.get('model_id') == model_name or r.get('model') == model_name]
+        
+        if len(model_records) == 0:
+            print(f"  [WARN] No records found for model {model_name}, skipping save")
+            continue
+        
+        model_records_df = pd.DataFrame(model_records)
+        
+        # CRITICAL: Reorder columns to match standard schema (RQ1 automatic report generation)
+        standard_columns = [
+            'run_id', 'model_id', 'model_family', 'dataset', 'split', 'corruption', 'severity',
+            'clip_id', 'frame_idx', 'image_id', 'image_path', 'corrupted_image_path',
+            'object_uid', 'gt_class_id', 'gt_class_name', 'gt_x1', 'gt_y1', 'gt_x2', 'gt_y2', 'gt_area', 'is_tiny',
+            'match_policy', 'iou_threshold', 'matched', 'detected', 'best_iou', 'miss_nd', 'miss_loc', 'miss_total',
+            'is_miss', 'pred_rank',
+            'pred_class_id', 'pred_class_name', 'pred_score', 'match_iou',
+            'pred_x1', 'pred_y1', 'pred_x2', 'pred_y2',
+            'n_preds_total', 'best_iou_any_pred', 'best_score_any_pred',
+            'base_pred_score', 'base_match_iou', 'delta_score', 'delta_iou',
+            'is_score_drop', 'is_iou_drop', 'failure_type', 'failure_event_id', 'notes'
+        ]
+        
+        # Add any extra columns that exist but aren't in standard schema (legacy columns)
+        extra_columns = [col for col in model_records_df.columns if col not in standard_columns]
+        all_columns = standard_columns + extra_columns
+        
+        # Reorder DataFrame
+        available_columns = [col for col in all_columns if col in model_records_df.columns]
+        model_records_df = model_records_df[available_columns]
+        
+        # CRITICAL: Save per-model files
+        model_timeseries_csv = results_dir / f"tiny_records_timeseries_{model_name}.csv"
+        model_detection_records_csv = results_dir / f"detection_records_{model_name}.csv"
+        
+        model_records_df.to_csv(model_timeseries_csv, index=False)
+        model_records_df.to_csv(model_detection_records_csv, index=False)
+        
+        print(f"  Saved {len(model_records_df)} records to {model_detection_records_csv}")
+        print(f"  Standard schema columns: {len([c for c in standard_columns if c in model_records_df.columns])}/{len(standard_columns)}")
+        
+        # Also save combined file (all models) for backward compatibility
+        # This will be overwritten by each model, so final model's data will be in combined file
+        # Better: aggregate all models at the end
+        combined_timeseries_csv = results_dir / "tiny_records_timeseries.csv"
+        combined_detection_records_csv = results_dir / "detection_records.csv"
+        
+        # Cleanup per-model DataFrame
+        del model_records_df
+        gc.collect()
     
-    # CRITICAL: Final cleanup before saving
+    # CRITICAL: Final cleanup before saving combined file
     from src.eval.tiny_match import clear_model_cache
     clear_model_cache()
     gc.collect()
@@ -470,52 +559,42 @@ def main():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
     
-    # Save records
-    print("\nSaving detection records...")
-    records_df = pd.DataFrame(records)
+    # Save combined file (all models) for backward compatibility
+    print("\nSaving combined detection records (all models)...")
+    all_records_df = pd.DataFrame(records)
     
-    # CRITICAL: Reorder columns to match standard schema (RQ1 automatic report generation)
-    standard_columns = [
-        'run_id', 'model_id', 'model_family', 'dataset', 'split', 'corruption', 'severity',
-        'clip_id', 'frame_idx', 'image_id', 'image_path', 'corrupted_image_path',
-        'object_uid', 'gt_class_id', 'gt_class_name', 'gt_x1', 'gt_y1', 'gt_x2', 'gt_y2', 'gt_area', 'is_tiny',
-        'match_policy', 'iou_threshold', 'matched', 'is_miss', 'pred_rank',
-        'pred_class_id', 'pred_class_name', 'pred_score', 'match_iou',
-        'pred_x1', 'pred_y1', 'pred_x2', 'pred_y2',
-        'n_preds_total', 'best_iou_any_pred', 'best_score_any_pred',
-        'base_pred_score', 'base_match_iou', 'delta_score', 'delta_iou',
-        'is_score_drop', 'is_iou_drop', 'failure_type', 'failure_event_id', 'notes'
-    ]
+    if len(all_records_df) > 0:
+        # Reorder columns
+        standard_columns = [
+            'run_id', 'model_id', 'model_family', 'dataset', 'split', 'corruption', 'severity',
+            'clip_id', 'frame_idx', 'image_id', 'image_path', 'corrupted_image_path',
+            'object_uid', 'gt_class_id', 'gt_class_name', 'gt_x1', 'gt_y1', 'gt_x2', 'gt_y2', 'gt_area', 'is_tiny',
+            'match_policy', 'iou_threshold', 'matched', 'detected', 'best_iou', 'miss_nd', 'miss_loc', 'miss_total',
+            'is_miss', 'pred_rank',
+            'pred_class_id', 'pred_class_name', 'pred_score', 'match_iou',
+            'pred_x1', 'pred_y1', 'pred_x2', 'pred_y2',
+            'n_preds_total', 'best_iou_any_pred', 'best_score_any_pred',
+            'base_pred_score', 'base_match_iou', 'delta_score', 'delta_iou',
+            'is_score_drop', 'is_iou_drop', 'failure_type', 'failure_event_id', 'notes'
+        ]
+        extra_columns = [col for col in all_records_df.columns if col not in standard_columns]
+        all_columns = standard_columns + extra_columns
+        available_columns = [col for col in all_columns if col in all_records_df.columns]
+        all_records_df = all_records_df[available_columns]
+        
+        combined_timeseries_csv = results_dir / "tiny_records_timeseries.csv"
+        combined_detection_records_csv = results_dir / "detection_records.csv"
+        
+        all_records_df.to_csv(combined_timeseries_csv, index=False)
+        all_records_df.to_csv(combined_detection_records_csv, index=False)
+        
+        print(f"  Saved {len(all_records_df)} total records (all models) to {combined_detection_records_csv}")
+        
+        # Final cleanup
+        del all_records_df
+        gc.collect()
     
-    # Add any extra columns that exist but aren't in standard schema (legacy columns)
-    extra_columns = [col for col in records_df.columns if col not in standard_columns]
-    all_columns = standard_columns + extra_columns
-    
-    # Reorder DataFrame
-    available_columns = [col for col in all_columns if col in records_df.columns]
-    records_df = records_df[available_columns]
-    
-    # CRITICAL: Save as both tiny_records_timeseries.csv (for backward compatibility)
-    # and detection_records.csv (for explicit report usage with standard schema)
-    timeseries_csv = results_dir / "tiny_records_timeseries.csv"
-    detection_records_csv = results_dir / "detection_records.csv"
-    
-    records_df.to_csv(timeseries_csv, index=False)
-    records_df.to_csv(detection_records_csv, index=False)
-    
-    print(f"  Saved {len(records_df)} records to {detection_records_csv}")
-    print(f"  Standard schema columns: {len([c for c in standard_columns if c in records_df.columns])}/{len(standard_columns)}")
-    
-    print(f"  Saved to {timeseries_csv}")
-    print(f"  Saved to {detection_records_csv}")
-    print(f"  Total records: {len(records)}")
-    
-    # Final cleanup
-    del records_df
-    del records
-    gc.collect()
-    
-    print("\n[OK] Detection complete!")
+    print("\n[OK] Detection complete for all models!")
 
 
 if __name__ == "__main__":

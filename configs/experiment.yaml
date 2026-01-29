@@ -17,13 +17,15 @@ visdrone:
   val_url: "http://aiskyeye.com/download/object-detection-2/VisDrone2019-DET-val.zip"
   test_url: "http://aiskyeye.com/download/object-detection-2/VisDrone2019-DET-test-dev.zip"
   
-# Experiment mode
+# Experiment mode (Option A - reviewer-friendly)
+# Tiny object 샘플 N개에 대해 3개 변조 유형(fog/lowlight/motion_blur)을 5단계(Level 0-4)로 적용.
+# N=500: 500 × 3 × 5 = 7500 frames (2500 per corruption). Level 0 = reference only (no duplicate file).
 experiment:
   pilot_mode: false  # Full experiment mode: use standard severities [0,1,2,3,4]
-  sample_size: 100  # Legacy: number of tiny objects to sample (overridden by target_tiny_objects)
-  target_tiny_objects: 461  # RQ1: target unique objects (Table 2 n_objects_unique). Use null or large to use all available.
-  max_images: null  # Max images to scan for tiny objects (null = no limit, process all)
-  one_per_image: true  # Sample only one tiny bbox per image (avoid duplicate images)
+  sample_size: 500   # Legacy: overridden by target_tiny_objects
+  target_tiny_objects: 500  # Tiny object sample size. 500 × 3 × 5 = 7500 frames (2500 per corruption).
+  max_images: null   # Max images to scan for tiny objects (null = no limit)
+  one_per_image: false  # Allow multiple tiny bboxes per image when sampling 500 objects
   
 # Tiny object definition
 # Based on empirical testing: YOLO can detect 2500+ px² objects with >50% rate
@@ -57,7 +59,7 @@ corruptions:
     angle: 0  # degrees, or use hash-based per image
     
 # Models
-# Full experiment: can enable all models
+# Full experiment: 3 models (Generic, Fine-tuned, RT-DETR)
 models:
   yolo_generic:
     type: "yolo"
@@ -66,23 +68,22 @@ models:
     fine_tuned: false
     checkpoint: null
   
-  # Disabled for pilot experiment
-  # yolo_ft:
-  #   type: "yolo"
-  #   architecture: "yolov8s"
-  #   pretrained: "yolov8s.pt"
-  #   fine_tuned: true
-  #   checkpoint: "results/models/yolo_ft_visdrone.pt"
-  #   train_epochs: 100
-  #   train_imgsz: 640
-  #   train_batch: 16
-  # 
-  # rt_detr:
-  #   type: "rtdetr"
-  #   architecture: "rtdetr-l"
-  #   pretrained: "rtdetr-l.pt"
-  #   fine_tuned: false
-  #   checkpoint: null
+  yolo_ft:
+    type: "yolo"
+    architecture: "yolov8s"
+    pretrained: "yolov8s.pt"
+    fine_tuned: true
+    checkpoint: "results/models/yolo_ft_visdrone.pt"
+    train_epochs: 100
+    train_imgsz: 640
+    train_batch: 16
+  
+  rt_detr:
+    type: "rtdetr"
+    architecture: "rtdetr-l"
+    pretrained: "rtdetr-l.pt"
+    fine_tuned: false
+    checkpoint: null
     
 # Inference settings
 inference:
@@ -112,6 +113,8 @@ risk_detection:
   instability_threshold: 0.3  # variance threshold for instability detection (across severities)
   
 # Grad-CAM (failure-event based)
+# B-1/B-3: CAM coverage - n_expected_frames = severity window length (not always 5).
+# cam_mode: full (all 0..4) | risk_window (onset-1..onset+1) | stratified (sample). Currently risk_events define window.
 gradcam:
   enabled: true
   # Layer configuration (primary/secondary approach)

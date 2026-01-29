@@ -103,10 +103,25 @@ def main():
     tiny_objects_file = results_dir / "tiny_objects_samples.json"
     tiny_objects = load_json(tiny_objects_file)
     
-    # Create tiny object lookup
+    # object_uid-based tiny_obj join: primary by object_uid, fallback by (image_id, class_id)
+    # Avoids overwriting when multiple tiny objects share same (image_id, class_id) -> fewer "missing tiny_obj" / CAM 0
+    tiny_obj_by_uid = {}
+    tiny_obj_by_ic = {}  # (image_id, class_id) -> list of objs (first used as fallback for legacy events)
+    for obj in tiny_objects:
+        uid = obj.get('object_uid')
+        if uid:
+            tiny_obj_by_uid[uid] = obj
+        image_id = obj.get('image_id', '')
+        class_id = obj.get('class_id', obj.get('gt_class_id'))
+        if image_id != '' and class_id is not None:
+            key_ic = (image_id, int(class_id))
+            if key_ic not in tiny_obj_by_ic:
+                tiny_obj_by_ic[key_ic] = []
+            tiny_obj_by_ic[key_ic].append(obj)
+    # Legacy single-key lookup (last writer wins) - only used if both uid and ic fallback fail
     tiny_obj_lookup = {}
     for obj in tiny_objects:
-        key = (obj['image_id'], obj['class_id'])
+        key = (obj.get('image_id', ''), obj.get('class_id', obj.get('gt_class_id')))
         tiny_obj_lookup[key] = obj
     
     visdrone_root = Path(config['dataset']['visdrone_root'])
@@ -258,6 +273,10 @@ def main():
         if event_model != model_name:
             continue
         
+        # Ensure class_id/image_id/object_uid exist so post-loop or later use does not raise UnboundLocalError
+        class_id = event.get('class_id', 0)
+        image_id = event.get('image_id', '')
+        object_uid = event.get('object_uid', '')
         corruption = event['corruption']
         
         # CRITICAL: Use risk_events format if available (has object_uid, cam_sev_from, cam_sev_to)
@@ -269,30 +288,33 @@ def main():
             failure_type = event.get('failure_type', 'unknown')
             failure_event_id = event.get('failure_event_id', '')
             
-            # Get tiny object from object_uid (parse image_id and class_id from object_uid)
-            # object_uid format: {image_id}_obj{object_index}_cls{class_id}
+            # Parse image_id, class_id from object_uid for fallback lookup
+            # object_uid format from 01/03: {image_id}_obj_{class_id}_{index} (e.g. 0000213_05745_d_0000247_obj_4_0)
             try:
                 if '_cls' in object_uid:
                     parts = object_uid.split('_cls')
                     image_id = parts[0].rsplit('_obj', 1)[0] if '_obj' in parts[0] else parts[0]
                     class_id = int(parts[1])
                 elif '_obj' in object_uid:
-                    parts = object_uid.split('_obj')
+                    parts = object_uid.split('_obj', 1)
                     image_id = parts[0]
-                    class_id = int(parts[1]) if len(parts) > 1 else 0
+                    rest = parts[1] if len(parts) > 1 else ''
+                    class_id = int(rest.split('_')[0]) if rest and rest.split('_')[0].isdigit() else 0
                 else:
-                    # Fallback: use object_uid as image_id
                     image_id = object_uid
                     class_id = 0
             except Exception as e:
-                # Fallback: try to get from event if available
                 image_id = event.get('image_id', object_uid)
                 class_id = event.get('class_id', 0)
                 print(f"[WARN] Failed to parse object_uid {object_uid}: {e}, using image_id={image_id}, class_id={class_id}")
             
-            # Get tiny object bbox
-            key = (image_id, class_id)
-            tiny_obj = tiny_obj_lookup.get(key)
+            # Lookup: object_uid first (tiny_obj_by_uid), then (image_id, class_id) first match (tiny_obj_by_ic)
+            tiny_obj = tiny_obj_by_uid.get(object_uid) if object_uid else None
+            if tiny_obj is None and image_id is not None and class_id is not None:
+                objs_ic = tiny_obj_by_ic.get((image_id, int(class_id)), [])
+                tiny_obj = objs_ic[0] if objs_ic else None
+            if tiny_obj is None:
+                tiny_obj = tiny_obj_lookup.get((image_id, class_id))
             if not tiny_obj:
                 print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id} (object_uid={object_uid})")
                 continue
@@ -309,16 +331,20 @@ def main():
             failure_severity = int(event['failure_severity'])
             failure_event_id = event.get('failure_event_id', '')
             failure_type = 'unknown'
+            object_uid = event.get('object_uid', '') or f"{image_id}_obj_{class_id}"
             
-            # Get tiny object bbox
-            key = (image_id, class_id)
-            tiny_obj = tiny_obj_lookup.get(key)
+            # Lookup: object_uid first, then (image_id, class_id) first from list
+            tiny_obj = tiny_obj_by_uid.get(object_uid) if object_uid else None
+            if tiny_obj is None and image_id is not None and class_id is not None:
+                objs_ic = tiny_obj_by_ic.get((image_id, int(class_id)), [])
+                tiny_obj = objs_ic[0] if objs_ic else None
+            if tiny_obj is None:
+                tiny_obj = tiny_obj_lookup.get((image_id, class_id))
             if not tiny_obj:
                 print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id}")
                 continue
             
             frame_rel_path = tiny_obj['frame_path']
-            object_uid = f"{image_id}_obj_{class_id}"  # Generate object_uid if missing
             
             # Legacy: Process all severities 0 to failure_severity
             severity_range = range(0, failure_severity + 1)
@@ -339,6 +365,20 @@ def main():
                 image_path = corruptions_root / corruption / str(severity) / "images" / Path(frame_rel_path).name
             
             if not image_path.exists():
+                # B-2: Log skipped attempt so n_expected = n_ok + n_failed + n_skipped
+                rec_skip = create_cam_record(
+                    model=model_name, corruption=corruption, severity=severity,
+                    image_id=image_id, class_id=class_id, object_id=object_uid,
+                    bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                    bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                    layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                    cam_status='skipped', fail_reason='image_missing', exc_type=None, exc_msg=None,
+                    failure_severity=failure_severity
+                )
+                if use_risk_events and 'failure_event_id' in event:
+                    rec_skip['failure_event_id'] = event['failure_event_id']
+                    rec_skip['failure_type'] = failure_type
+                cam_records.append(rec_skip)
                 continue
             
             # Load image with memory-efficient approach
@@ -366,6 +406,20 @@ def main():
                             'exc_type': 'ImageTooLarge',
                             'exc_msg': f'Image size {w}x{h} exceeds {MAX_PIXELS//1_000_000}MP limit'
                         })
+                        rec_skip = create_cam_record(
+                            model=model_name, corruption=corruption, severity=severity,
+                            image_id=image_id, class_id=class_id, object_id=object_uid,
+                            bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                            bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                            layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                            cam_status='skipped', fail_reason='image_too_large',
+                            exc_type='ImageTooLarge', exc_msg=f'Image size {w}x{h} exceeds {MAX_PIXELS//1_000_000}MP limit',
+                            failure_severity=failure_severity
+                        )
+                        if use_risk_events and 'failure_event_id' in event:
+                            rec_skip['failure_event_id'] = event['failure_event_id']
+                            rec_skip['failure_type'] = failure_type
+                        cam_records.append(rec_skip)
                         continue
                     
                     # CRITICAL: Very aggressive resizing for memory-constrained systems
@@ -405,7 +459,19 @@ def main():
                     'exc_type': type(e).__name__,
                     'exc_msg': str(e)[:200]
                 })
-                # Clean up and skip
+                rec_fail = create_cam_record(
+                    model=model_name, corruption=corruption, severity=severity,
+                    image_id=image_id, class_id=class_id, object_id=object_uid,
+                    bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                    bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                    layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                    cam_status='fail', fail_reason='oom', exc_type=type(e).__name__, exc_msg=str(e)[:200],
+                    failure_severity=failure_severity
+                )
+                if use_risk_events and 'failure_event_id' in event:
+                    rec_fail['failure_event_id'] = event['failure_event_id']
+                    rec_fail['failure_type'] = failure_type
+                cam_records.append(rec_fail)
                 gc.collect()
                 continue
             except (OSError, IOError, ValueError) as e:
@@ -424,6 +490,19 @@ def main():
                     'exc_type': type(e).__name__,
                     'exc_msg': str(e)[:200]
                 })
+                rec_fail = create_cam_record(
+                    model=model_name, corruption=corruption, severity=severity,
+                    image_id=image_id, class_id=class_id, object_id=object_uid,
+                    bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                    bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                    layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                    cam_status='fail', fail_reason='image_load_failed', exc_type=type(e).__name__, exc_msg=str(e)[:200],
+                    failure_severity=failure_severity
+                )
+                if use_risk_events and 'failure_event_id' in event:
+                    rec_fail['failure_event_id'] = event['failure_event_id']
+                    rec_fail['failure_type'] = failure_type
+                cam_records.append(rec_fail)
                 gc.collect()
                 continue
             
@@ -740,6 +819,38 @@ def main():
         cam_records_csv = results_dir / "cam_records.csv"
         save_cam_records(cam_records, cam_records_csv)
         
+        # B-2: CAM fail/skip aggregate table (severity x corruption: n_expected, n_ok, n_failed, n_skipped, top_fail_reason)
+        cam_df = pd.DataFrame(cam_records)
+        if 'cam_status' in cam_df.columns and 'fail_reason' in cam_df.columns:
+            # One row per (model, corruption, severity) - primary layer only to avoid double count
+            cam_primary = cam_df[cam_df['layer_role'] == 'primary'] if 'layer_role' in cam_df.columns else cam_df
+            if len(cam_primary) == 0 and 'layer_role' in cam_df.columns:
+                cam_primary = cam_df
+            grp = cam_primary.groupby(['model', 'corruption', 'severity'], dropna=False)
+            n_expected = grp.size()
+            n_ok = cam_primary.groupby(['model', 'corruption', 'severity'], dropna=False)['cam_status'].apply(lambda s: (s == 'ok').sum())
+            n_failed = cam_primary.groupby(['model', 'corruption', 'severity'], dropna=False)['cam_status'].apply(lambda s: (s == 'fail').sum())
+            n_skipped = cam_primary.groupby(['model', 'corruption', 'severity'], dropna=False)['cam_status'].apply(lambda s: (s == 'skipped').sum())
+            def _top_fail_reason(s):
+                s = s.dropna()
+                if len(s) == 0:
+                    return None
+                vc = s.value_counts()
+                return vc.index[0] if len(vc) > 0 else None
+            failed_skipped = cam_primary[cam_primary['cam_status'].isin(['fail', 'skipped'])]
+            top_fail = failed_skipped.groupby(['model', 'corruption', 'severity'], dropna=False)['fail_reason'].agg(_top_fail_reason) if len(failed_skipped) > 0 else pd.Series(dtype=object)
+            top_fail = top_fail.reindex(n_expected.index)  # align with all groups
+            summary_df = pd.DataFrame({
+                'n_expected': n_expected,
+                'n_ok': n_ok,
+                'n_failed': n_failed,
+                'n_skipped': n_skipped,
+                'top_fail_reason': top_fail
+            }).reset_index()
+            summary_csv = results_dir / "cam_fail_summary.csv"
+            summary_df.to_csv(summary_csv, index=False)
+            print(f"  Saved CAM fail summary to {summary_csv}")
+        
         # Also save legacy format for backward compatibility
         # CRITICAL: Use primary ok → secondary ok → any ok fallback strategy
         # 1) Collect all OK records
@@ -931,9 +1042,14 @@ def main():
                         torch.cuda.empty_cache()
                     continue
                 
-                # Get tiny object
-                key = (image_id, class_id)
-                tiny_obj = tiny_obj_lookup.get(key)
+                # Get tiny object (same join as main loop: object_uid -> (image_id, class_id) first)
+                object_uid_ref = region.get('object_uid', '') or (f"{image_id}_obj_{class_id}" if image_id else '')
+                tiny_obj = tiny_obj_by_uid.get(object_uid_ref) if object_uid_ref else None
+                if tiny_obj is None and image_id is not None and class_id is not None:
+                    objs_ic = tiny_obj_by_ic.get((image_id, int(class_id)), [])
+                    tiny_obj = objs_ic[0] if objs_ic else None
+                if tiny_obj is None:
+                    tiny_obj = tiny_obj_lookup.get((image_id, class_id))
                 if not tiny_obj:
                     print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id}")
                     continue

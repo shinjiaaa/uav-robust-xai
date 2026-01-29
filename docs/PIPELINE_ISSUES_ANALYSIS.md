@@ -1,5 +1,18 @@
 # 파이프라인 문제 분석 및 해결책
 
+## D. 3문장 진단 (Miss Rate=0 / n_records / CAM)
+
+1. **detection_records에 detected=0 또는 iou=NaN 같은 미탐지 흔적이 존재하니?**  
+   → **있음.** `matched=0`, `is_miss=1`, `miss=1` 행이 있으며, matched-only 저장이 아님. 따라서 Miss Rate=0은 **집계 쪽** 문제(예: Table 2에서 사용하는 miss 컬럼/필터). 해결: `miss_total` 컬럼 도입 후 Table 2에서 `miss_rate = miss_total.mean()` 사용(구현 완료).
+
+2. **Table 2에서 n_records_total이 severity마다 항상 1500인 이유가 뭐니?**  
+   → **정상.** 500 objects × 3 corruptions = 1500. severity별로 1500은 “해당 severity의 (object, corruption) 조합 수”와 일치. 집계 버그가 아니라 설계대로임.
+
+3. **CAM이 0~4개만 나온 건, 이벤트 몇 개에만 뽑도록 설계된 거니, 아니면 실패해서 못 뽑힌 거니?**  
+   → **fail_reason 집계표로 판별.** `cam_fail_summary.csv`(severity×corruption별 n_expected, n_ok, n_failed, n_skipped, top_fail_reason)를 추가했으므로, 이 표를 보면 “설계상 소수만 시도”인지 “대부분 실패”인지 바로 확인 가능.
+
+---
+
 ## 1️⃣ lowlight/motion_blur가 detection_records에 없는 원인
 
 ### 진단 결과

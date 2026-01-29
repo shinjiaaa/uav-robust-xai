@@ -48,8 +48,8 @@ def main():
     tiny_config = config['tiny_objects']
     experiment_config = config.get('experiment', {})
     one_per_image = experiment_config.get('one_per_image', False)
-    # RQ1: No sample limit - use all images unless max_images is set
-    target_tiny_objects = experiment_config.get('target_tiny_objects', 500)
+    # Option A: 100 tiny objects fixed for reproducibility (100 × 3 × 5 = 1500 frames)
+    target_tiny_objects = experiment_config.get('target_tiny_objects', 100)
     max_images = experiment_config.get('max_images')  # null = no limit
     image_list = image_files if max_images is None else image_files[:max_images]
     
@@ -110,6 +110,7 @@ def main():
                         except ValueError:
                             frame_rel_path = str(image_path)
                         
+                        # object_uid: unique per object (image_id + _obj_ + class_id; index for uniqueness if needed)
                         tiny_obj = {
                             'image_id': image_stem,
                             'frame_path': frame_rel_path,
@@ -117,9 +118,8 @@ def main():
                             'class_id': object_category,
                             'area': area,
                             'img_width': img_width,
-                            'img_height': img_height
+                            'img_height': img_height,
                         }
-                        
                         image_tiny_list.append(tiny_obj)
                 except (ValueError, IndexError):
                     continue
@@ -143,6 +143,12 @@ def main():
         random.seed(config['seed'])
         all_tiny_objects = random.sample(all_tiny_objects, actual_sample_size)
     
+    # Option A: assign object_uid, frame_id, clip_id for reproducibility
+    for i, obj in enumerate(all_tiny_objects):
+        obj['object_uid'] = f"{obj['image_id']}_obj_{obj['class_id']}_{i}"
+        obj['frame_id'] = obj['image_id']
+        obj['clip_id'] = ""
+    
     print(f"   Sampled {len(all_tiny_objects)} tiny objects (target: {target_tiny_objects or 'all'}, available: {len(all_tiny_objects)})")
     
     # Save results
@@ -153,6 +159,26 @@ def main():
     tiny_objects_file = results_dir / "tiny_objects_samples.json"
     save_json(all_tiny_objects, tiny_objects_file)
     print(f"   Saved to {tiny_objects_file}")
+    
+    # Save tiny_objects.csv for reproducibility (object_uid, image_path, bbox, frame_id, clip_id)
+    import csv
+    tiny_csv = results_dir / "tiny_objects.csv"
+    with open(tiny_csv, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=['object_uid', 'image_id', 'frame_path', 'bbox', 'frame_id', 'clip_id', 'class_id', 'area'])
+        w.writeheader()
+        for o in all_tiny_objects:
+            row = {
+                'object_uid': o['object_uid'],
+                'image_id': o['image_id'],
+                'frame_path': o['frame_path'],
+                'bbox': f"{o['bbox'][0]},{o['bbox'][1]},{o['bbox'][2]},{o['bbox'][3]}",
+                'frame_id': o['frame_id'],
+                'clip_id': o['clip_id'],
+                'class_id': o['class_id'],
+                'area': o['area'],
+            }
+            w.writerow(row)
+    print(f"   Saved to {tiny_csv}")
     
     print("\n[OK] Tiny object sampling complete!")
 

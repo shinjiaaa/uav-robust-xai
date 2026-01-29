@@ -1,5 +1,6 @@
 """Full experiment: standard severities [0, 1, 2, 3, 4] with full sample size."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -81,11 +82,18 @@ def main():
         print(f"{'='*60}")
         
         try:
+            # TOP 6 (1): UTF-8 for child to avoid cp949/Unicode errors on Windows
+            env = os.environ.copy()
+            env.setdefault('PYTHONUTF8', '1')
+            env.setdefault('PYTHONIOENCODING', 'utf-8')
             result = subprocess.run(
                 [sys.executable, step['script']],
                 check=step['required'],
                 capture_output=True,
-                text=True
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                env=env
             )
             print(result.stdout)
             print(f"[OK] {step['name']} completed")
@@ -98,7 +106,10 @@ def main():
                         [sys.executable, step['fallback']],
                         check=step['required'],
                         capture_output=True,
-                        text=True
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                        env=env
                     )
                     print(result.stdout)
                     print(f"[OK] Fallback script completed")

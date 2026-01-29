@@ -31,10 +31,11 @@ from src.utils.seed import set_seed
 IOU_MISS_TH = 0.5  # IoU threshold for miss detection
 SCORE_DROP_RATIO_DEFAULT = 0.5  # Default: 50% of baseline. Use 0.9 for more events (RQ1).
 IOU_DROP_ABSOLUTE = 0.2  # IoU drop threshold (absolute)
-# RQ1 severity window: [perf_start_sev-1, perf_start_sev, perf_start_sev+1] for CAM (Stage A)
-SEV_WINDOW_PRE = 1  # severities before start
-SEV_WINDOW_POST = 1  # severities after start
-MAX_SEVERITY = 4  # cap so cam_sev_to does not exceed dataset max (e.g. VisDrone 0..4)
+# RQ1 severity window for CAM: ensure high-severity coverage (fix Table 7 sev2~4 N/A)
+# Option A: [0, 1, 2, 3, 4] always. Option B (compromise): [0 .. min(4, perf_start_sev+3)]
+SEV_WINDOW_FULL = True  # If True: cam_sev_from=0, cam_sev_to=4 always. If False: use POST below.
+SEV_WINDOW_POST = 3   # severities after start when not full (min 4 levels: 0..min(4, s_star+3))
+MAX_SEVERITY = 4      # dataset max (e.g. VisDrone 0..4)
 
 
 def make_risk_events(detection_df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
@@ -142,9 +143,13 @@ def make_risk_events(detection_df: pd.DataFrame, config: dict = None) -> pd.Data
         else:
             s_star, ftype = s_iou, "iou_drop"
         
-        # CAM severity window: [perf_start_sev - 1, perf_start_sev, perf_start_sev + 1]
-        cam_s_from = max(0, s_star - SEV_WINDOW_PRE)
-        cam_s_to = min(MAX_SEVERITY, s_star + SEV_WINDOW_POST)
+        # CAM severity window: full [0..4] or [0..min(4, s_star+3)] for high-sev coverage (Table 7)
+        if SEV_WINDOW_FULL:
+            cam_s_from = 0
+            cam_s_to = MAX_SEVERITY
+        else:
+            cam_s_from = 0
+            cam_s_to = min(MAX_SEVERITY, s_star + SEV_WINDOW_POST)
         
         run_id, model_id, corr, clip_id, frame_idx, obj = k
         event_id = f"{run_id}|{model_id}|{corr}|{clip_id}|{frame_idx}|{obj}|S{s_star}|{ftype}"
@@ -189,54 +194,97 @@ def main():
     
     results_dir = Path(config['results']['root'])
     
-    # Load detection records (prefer detection_records.csv, fallback to tiny_records_timeseries.csv)
-    detection_records_csv = results_dir / "detection_records.csv"
-    legacy_csv = results_dir / "tiny_records_timeseries.csv"
+    # Process each model separately
+    # RQ1: Risk events for Grad-CAM alignment; YOLO only (2 models)
+    all_models = list(config['models'].keys())
+    models = [m for m in all_models if config['models'][m].get('type') == 'yolo']
+    if not models:
+        models = all_models
+    print(f"\nProcessing {len(models)} models: {', '.join(models)}")
     
-    if detection_records_csv.exists() and detection_records_csv.stat().st_size > 0:
-        records_df = pd.read_csv(detection_records_csv)
-        print(f"Loaded {len(records_df)} records from detection_records.csv")
-    elif legacy_csv.exists() and legacy_csv.stat().st_size > 0:
-        records_df = pd.read_csv(legacy_csv)
-        print(f"Loaded {len(records_df)} records from tiny_records_timeseries.csv (legacy)")
-    else:
-        print("Error: Neither detection_records.csv nor tiny_records_timeseries.csv found.")
-        print("Please run scripts/03_detect_tiny_objects_timeseries.py first")
-        sys.exit(1)
+    all_risk_events = []  # For combined file
     
-    # Generate risk events (pass config for score_drop_ratio, etc.)
-    print("\nDetecting risk events...")
-    risk_events_df = make_risk_events(records_df, config=config)
-    print(f"Found {len(risk_events_df)} risk events")
-    
-    if len(risk_events_df) > 0:
-        # Print summary by failure type
-        print("\nRisk events by failure type:")
-        for ftype, count in risk_events_df['failure_type'].value_counts().items():
-            print(f"  {ftype}: {count} events")
+    for model_name in models:
+        print(f"\n{'='*60}")
+        print(f"Processing model: {model_name}")
+        print(f"{'='*60}")
         
-        print("\nRisk events by corruption:")
-        for corr, count in risk_events_df['corruption'].value_counts().items():
-            print(f"  {corr}: {count} events")
+        # Load per-model detection records
+        model_detection_records_csv = results_dir / f"detection_records_{model_name}.csv"
+        model_legacy_csv = results_dir / f"tiny_records_timeseries_{model_name}.csv"
         
-        # Save risk events
-        risk_events_csv = results_dir / "risk_events.csv"
-        risk_events_df.to_csv(risk_events_csv, index=False)
-        print(f"\nSaved {len(risk_events_df)} risk events to {risk_events_csv}")
+        # Fallback to combined file if per-model file doesn't exist
+        if not model_detection_records_csv.exists() and not model_legacy_csv.exists():
+            combined_detection_records_csv = results_dir / "detection_records.csv"
+            combined_legacy_csv = results_dir / "tiny_records_timeseries.csv"
+            
+            if combined_detection_records_csv.exists() and combined_detection_records_csv.stat().st_size > 0:
+                print(f"[INFO] Per-model file not found, using combined file and filtering by model_id={model_name}")
+                records_df = pd.read_csv(combined_detection_records_csv)
+                records_df = records_df[records_df['model_id'] == model_name].copy()
+            elif combined_legacy_csv.exists() and combined_legacy_csv.stat().st_size > 0:
+                print(f"[INFO] Per-model file not found, using combined legacy file and filtering by model_id={model_name}")
+                records_df = pd.read_csv(combined_legacy_csv)
+                records_df = records_df[records_df['model_id'] == model_name].copy()
+            else:
+                print(f"[WARN] No detection records found for model {model_name}, skipping")
+                continue
+        elif model_detection_records_csv.exists() and model_detection_records_csv.stat().st_size > 0:
+            records_df = pd.read_csv(model_detection_records_csv)
+            print(f"Loaded {len(records_df)} records from detection_records_{model_name}.csv")
+        elif model_legacy_csv.exists() and model_legacy_csv.stat().st_size > 0:
+            records_df = pd.read_csv(model_legacy_csv)
+            print(f"Loaded {len(records_df)} records from tiny_records_timeseries_{model_name}.csv (legacy)")
+        else:
+            print(f"[WARN] Detection records file exists but is empty for model {model_name}, skipping")
+            continue
         
-        # Print CAM computation scope
-        print("\nCAM computation scope (from risk_events):")
-        print(f"  Total events: {len(risk_events_df)}")
-        print(f"  CAM severity range: {risk_events_df['cam_sev_from'].min()} to {risk_events_df['cam_sev_to'].max()}")
-        print(f"  This reduces CAM computation from all frames×all severities to risk regions only")
-    else:
-        print("\n[WARN] No risk events detected. This may indicate:")
-        print("  - All objects detected successfully across all severities")
-        print("  - Or detection_records.csv may be incomplete")
+        if len(records_df) == 0:
+            print(f"[WARN] No records found for model {model_name}, skipping")
+            continue
+        
+        # Generate risk events (pass config for score_drop_ratio, etc.)
+        print(f"\nDetecting risk events for {model_name}...")
+        risk_events_df = make_risk_events(records_df, config=config)
+        print(f"Found {len(risk_events_df)} risk events")
+        
+        if len(risk_events_df) > 0:
+            # Print summary by failure type
+            print(f"\nRisk events by failure type ({model_name}):")
+            for ftype, count in risk_events_df['failure_type'].value_counts().items():
+                print(f"  {ftype}: {count} events")
+            
+            print(f"\nRisk events by corruption ({model_name}):")
+            for corr, count in risk_events_df['corruption'].value_counts().items():
+                print(f"  {corr}: {count} events")
+            
+            # Save per-model risk events
+            model_risk_events_csv = results_dir / f"risk_events_{model_name}.csv"
+            risk_events_df.to_csv(model_risk_events_csv, index=False)
+            print(f"\nSaved {len(risk_events_df)} risk events to {model_risk_events_csv}")
+            
+            # Collect for combined file
+            all_risk_events.append(risk_events_df)
+            
+            # Print CAM computation scope
+            print(f"\nCAM computation scope ({model_name}):")
+            print(f"  Total events: {len(risk_events_df)}")
+            print(f"  CAM severity range: {risk_events_df['cam_sev_from'].min()} to {risk_events_df['cam_sev_to'].max()}")
+        else:
+            print(f"\n[WARN] No risk events detected for {model_name}. This may indicate:")
+            print("  - All objects detected successfully across all severities")
+            print("  - Or detection_records may be incomplete")
     
-    print("\n[OK] Risk event detection complete!")
+    # Save combined risk events file (all models) for backward compatibility
+    if len(all_risk_events) > 0:
+        combined_risk_events_df = pd.concat(all_risk_events, ignore_index=True)
+        combined_risk_events_csv = results_dir / "risk_events.csv"
+        combined_risk_events_df.to_csv(combined_risk_events_csv, index=False)
+        print(f"\nSaved {len(combined_risk_events_df)} total risk events (all models) to {combined_risk_events_csv}")
+    
+    print("\n[OK] Risk event detection complete for all models!")
     print("\nNext steps:")
-    print("  1. Run scripts/05_gradcam_failure_analysis.py (will use risk_events.csv to compute CAM only for risk regions)")
+    print("  1. Run scripts/05_gradcam_failure_analysis.py (will use risk_events_{model}.csv to compute CAM only for risk regions)")
     print("  2. Run scripts/06_llm_report.py (will generate alignment analysis from risk_events + cam_records)")
 
 

@@ -118,6 +118,13 @@ def main():
                     score_drop = None
                     iou_drop = None
                 
+                n_samples = len(subset)
+                n_missed = int((subset['miss'] == 1).sum())
+                n_detected = int((subset['miss'] == 0).sum())
+                std_score = matched['score'].std() if len(matched) > 1 and 'score' in matched.columns else None
+                std_iou = matched['iou'].std() if len(matched) > 1 and 'iou' in matched.columns else None
+                seed = config.get('seed', 42)
+                
                 tiny_curves.append({
                     'model': model,
                     'corruption': corruption,
@@ -126,7 +133,13 @@ def main():
                     'avg_score': avg_score,
                     'avg_iou': avg_iou,
                     'score_drop': score_drop,
-                    'iou_drop': iou_drop
+                    'iou_drop': iou_drop,
+                    'n_samples': n_samples,
+                    'n_missed': n_missed,
+                    'n_detected': n_detected,
+                    'std_score': std_score,
+                    'std_iou': std_iou,
+                    'seed': seed,
                 })
     
     tiny_curves_df = pd.DataFrame(tiny_curves)

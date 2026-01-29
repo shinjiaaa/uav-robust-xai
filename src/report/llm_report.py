@@ -439,21 +439,26 @@ def summarize_metrics(metrics: Dict) -> Dict:
         # CRITICAL: Calculate unique objects (object_uid) for clarity
         n_objects_unique = df['object_uid'].nunique() if 'object_uid' in df.columns else (df['image_id'].nunique() if 'image_id' in df.columns else None)
         
+        # C-2: Miss rate = miss_total.mean() (GT object-level; no filtering). Prefer miss_total, then miss, then is_miss.
+        miss_col_overall = 'miss_total' if 'miss_total' in df.columns else ('miss' if 'miss' in df.columns else 'is_miss')
+        miss_rate_by_sev = df.groupby('severity')[miss_col_overall].mean().to_dict() if miss_col_overall in df.columns else {}
+        
         overall_summary = {
             'total_records': len(detection_records),
-            'n_records_total': len(detection_records),  # Total detection records (row count: objects × severities)
+            'n_records_total': len(detection_records),  # Total detection records (row count: objects x severities)
             'n_objects_unique': int(n_objects_unique) if n_objects_unique is not None else None,  # Unique object_uid count
             'n_frames_valid': int(n_frames_valid),  # Unique frames (frame_id or image_id based)
             'frame_count_column': frame_count_column,  # Which column was used for counting
             # Legacy alias for backward compatibility
             'n_objects_total': len(detection_records),  # DEPRECATED: Use n_records_total instead
-            'by_model': df.groupby('model').size().to_dict() if 'model' in df.columns else {},
+            'by_model': df.groupby('model_id').size().to_dict() if 'model_id' in df.columns else (df.groupby('model').size().to_dict() if 'model' in df.columns else {}),
             'by_corruption': df.groupby('corruption').size().to_dict() if 'corruption' in df.columns else {},
             'by_severity': df.groupby('severity').size().to_dict() if 'severity' in df.columns else {},
             'n_objects_by_corruption_severity': n_objects_by_corruption_severity,
-            'miss_rate_by_severity': df.groupby('severity')['miss'].mean().to_dict() if 'miss' in df.columns else {},
-            'avg_score_by_severity': df.groupby('severity')['score'].mean().to_dict() if 'score' in df.columns else {},
-            'avg_iou_by_severity': df.groupby('severity')['iou'].mean().to_dict() if 'iou' in df.columns else {},
+            'miss_rate_by_severity': miss_rate_by_sev,
+            'miss_rate_column_used': miss_col_overall,
+            'avg_score_by_severity': df.groupby('severity')['pred_score'].mean().to_dict() if 'pred_score' in df.columns else (df.groupby('severity')['score'].mean().to_dict() if 'score' in df.columns else {}),
+            'avg_iou_by_severity': df.groupby('severity')['match_iou'].mean().to_dict() if 'match_iou' in df.columns else (df.groupby('severity')['iou'].mean().to_dict() if 'iou' in df.columns else {}),
         }
 
         per_corruption = {}
@@ -461,9 +466,8 @@ def summarize_metrics(metrics: Dict) -> Dict:
             for corruption in df['corruption'].unique():
                 corr_df = df[df['corruption'] == corruption]
                 
-                # CRITICAL: Use new column names (is_miss, is_score_drop, delta_score, is_iou_drop)
-                # Fallback to legacy names (miss, score, iou) for backward compatibility
-                miss_col = 'is_miss' if 'is_miss' in corr_df.columns else 'miss'
+                # C-2: Miss rate from miss_total (then miss, then is_miss) - no filtering, GT object-level
+                miss_col = 'miss_total' if 'miss_total' in corr_df.columns else ('miss' if 'miss' in corr_df.columns else 'is_miss')
                 score_col = 'pred_score' if 'pred_score' in corr_df.columns else 'score'
                 iou_col = 'match_iou' if 'match_iou' in corr_df.columns else 'iou'
                 matched_col = 'matched' if 'matched' in corr_df.columns else None
@@ -1521,7 +1525,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         # Both None → invalid event, but still include in detail
                         alignment = None
                         lead_steps = None
-                        cam_change_metric = None
+                        cam_change_metric = None  # explicit per row (no carryover)
                     
                     detail_events_list.append({
                         'failure_event_id': event_row.get('failure_event_id', ''),
@@ -1540,6 +1544,19 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 detail_events_df = pd.DataFrame(detail_events_list)
                 detail_total = len(detail_events_df)
                 total_events = len(events_df)  # Original count from risk_events
+                
+                # TOP 6 (6): Schema validation after merge/build - fail fast with clear message
+                if detail_total > 0:
+                    required_cols = [
+                        'object_uid', 'performance_start_severity', 'cam_change_severity',
+                        'alignment', 'failure_type'
+                    ]
+                    missing = [c for c in required_cols if c not in detail_events_df.columns]
+                    if missing:
+                        raise KeyError(
+                            f"alignment detail table missing columns: {missing}. "
+                            f"Available: {list(detail_events_df.columns)}"
+                        )
                 
                 # CRITICAL: Verify detail_events_df has correct alignment values
                 # Debug: Print alignment distribution to verify
@@ -1564,6 +1581,23 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 lead_events = detail_events_df[detail_events_df['alignment'] == 'lead']
                 avg_lead_steps = float(lead_events['lead_steps'].mean()) if len(lead_events) > 0 else None
                 
+                # CRITICAL: Assert Summary ↔ Detail consistency (one unit = (corruption, object_uid, failure_type))
+                detail_lead_count = sum(1 for e in detail_events_list if e.get('alignment') == 'lead')
+                detail_coincident_count = sum(1 for e in detail_events_list if e.get('alignment') == 'coincident')
+                detail_lag_count = sum(1 for e in detail_events_list if e.get('alignment') == 'lag')
+                assert lead_count == detail_lead_count, (
+                    f"{corruption}: summary lead_count={lead_count} != detail lead count={detail_lead_count}"
+                )
+                assert coincident_count == detail_coincident_count, (
+                    f"{corruption}: summary coincident_count={coincident_count} != detail={detail_coincident_count}"
+                )
+                assert lag_count == detail_lag_count, (
+                    f"{corruption}: summary lag_count={lag_count} != detail={detail_lag_count}"
+                )
+                assert len(detail_events_list) == total_events, (
+                    f"{corruption}: total_events={total_events} != len(detail_events)={len(detail_events_list)}"
+                )
+                
                 alignment_summary[corruption] = {
                     'total_events': total_events,  # ALL events (including CAM missing)
                     'total_events_with_cam': events_with_cam,  # Events that have CAM data
@@ -1578,7 +1612,19 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     'avg_lead_steps': avg_lead_steps,
                     'by_failure_type': {},
                     'detail_events': detail_events_list,  # Store detail for Table X-detail (ALL events)
-                    'note': f'Total {total_events} events, {events_with_cam} events have CAM data' if events_with_cam < total_events else f'All {total_events} events have CAM data'
+                    'note': f'Total {total_events} events, {events_with_cam} events have CAM data' if events_with_cam < total_events else f'All {total_events} events have CAM data',
+                    # Pre-computed table rows: use these EXACT values in the report (no recomputation)
+                    'table_x_summary_row': {
+                        'corruption': corruption,
+                        'total_events': total_events,
+                        'events_with_cam': events_with_cam,
+                        'lead_count': lead_count,
+                        'coincident_count': coincident_count,
+                        'lag_count': lag_count,
+                        'lead_percentage': round(float(lead_count / events_with_cam * 100), 2) if events_with_cam > 0 else 0.0,
+                        'avg_lead_steps': round(avg_lead_steps, 2) if avg_lead_steps is not None else None,
+                    },
+                    'event_unit': 'corruption, object_uid, failure_type',
                 }
                 
                 # Breakdown by failure type (from detail_events_df)
@@ -1690,6 +1736,7 @@ The research has TWO AXES that must be aligned on the TIME AXIS (corruption seve
    - Prove: "CAM changes occur BEFORE performance collapse"
    - This requires detection_records.csv to define the performance degradation timeline FIRST
    - Then CAM analysis can show if CAM changes precede or co-occur with performance drops
+   - CRITICAL (terminology): In this experiment, "performance degradation" is defined as **confidence degradation (score drop)**, not necessarily detection miss. IoU and miss rate may remain stable while confidence drops; we analyze the first severity where confidence falls below the threshold (score_drop). If Table 2 shows Miss Rate = 0.000, state: "IoU and miss were relatively stable; performance degradation is defined here as confidence degradation (score drop), not detection failure."
 
 CRITICAL: Without detection_records.csv:
 - Performance degradation timeline is unknown
@@ -1717,6 +1764,8 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - DO NOT include "Unified Failure Severity" column in the Failure Summary table
     - Format: | Corruption | Total Events | Miss Events | Score Drop Events | IoU Drop Events |
 12. CRITICAL: Table 2 (Detection Summary / Performance Metrics) - THE PERFORMANCE AXIS:
+    - Experiment design (Option A): 500 tiny objects × 3 corruptions × 5 levels = 7500 frames; level 0 = common baseline (reference only, no duplicate file).
+    - Level 0 is the clean baseline per corruption; when reporting, baseline can be noted as "clean (level 0)".
     - REQUIRES detection_records.csv to exist (created by scripts/03_detect_tiny_objects_timeseries.py)
     - detection_records.csv is the "Performance Axis" - it defines WHEN performance degrades
     - This file contains frame-level evidence: matched, is_miss, pred_score, match_iou for each tiny object
@@ -1818,6 +1867,9 @@ Experiment Configuration:
 - Corruptions: {', '.join(config['corruptions']['types'])}
 - Severities: {config['corruptions']['severities']}
 - Tiny object threshold: {config['tiny_objects']['area_threshold']} pixels²
+- CRITICAL (pilot / sample size): If n_objects_unique or n_frames_valid is small (e.g. < 50), add one line: "These results are from a small pilot run for pipeline validation; full-scale analysis (≈461 objects, ≥30 events per corruption) is in progress."
+- CRITICAL (score trend): Do NOT state that score decreases monotonically. Use "overall decreasing trend" or "score tends to decrease with severity"; if score increases slightly at some severity (e.g. sev1), note it as local variation.
+- CRITICAL (Methods): In Methods, state exactly: "cam_change_sev is defined as the first severity where the z-score of activation_spread (vs severity-0 baseline) exceeds the threshold (|z|≥2)."
 
 Metrics Data (Summarized, JSON format - compact):
 {json.dumps(summarized_metrics, indent=None, separators=(',', ':'))}
@@ -1843,63 +1895,14 @@ REPORT STRUCTURE:
      * Shows: energy_in_bbox, activation_spread, entropy, center_shift by corruption×severity
      * From: cam_records.csv (cam_status='ok' only)
    - Table X-summary (NEW): Alignment Analysis Summary (Performance vs Cognition)
-     * CRITICAL: This table MUST be calculated from Table X-detail (not manually)
-     * CRITICAL: Event unit = (corruption, object_uid, failure_type) - one event per unique combination
-     * CRITICAL: You MUST count the actual rows in Table X-detail to determine Total Events
-     * CRITICAL: DO NOT use any pre-computed summary values - count directly from X-detail table
-     * Shows: For each corruption, how many events show lead/coincident/lag
+     * CRITICAL: Use EXACT values from alignment_analysis.summary[corruption].table_x_summary_row for each corruption. DO NOT recompute. Event unit = (corruption, object_uid, failure_type).
      * Format: | Corruption | Total Events | Events with CAM | Lead Count | Coincident Count | Lag Count | Lead % | Avg Lead Steps |
-     * Calculation rules (MUST follow - count from X-detail table):
-       * Step 1: Count rows in X-detail for each corruption
-         * fog: Count rows where corruption='fog' in X-detail → this is Total Events for fog
-         * lowlight: Count rows where corruption='lowlight' in X-detail → this is Total Events for lowlight
-         * motion_blur: Count rows where corruption='motion_blur' in X-detail → this is Total Events for motion_blur
-       * Step 2: For each corruption, count events with CAM data
-         * Events with CAM = count rows where cam_change_severity != N/A (or != None) in X-detail for that corruption
-       * Step 3: Count alignment types from X-detail
-         * Lead Count = count rows where alignment == 'lead' in X-detail for that corruption
-         * Coincident Count = count rows where alignment == 'coincident' in X-detail for that corruption
-         * Lag Count = count rows where alignment == 'lag' in X-detail for that corruption
-       * Step 4: Calculate percentages
-         * Lead % = (Lead Count / Events with CAM) * 100 (NOT total events, use Events with CAM as denominator)
-         * Avg Lead Steps = mean(lead_steps) where alignment == 'lead' (only lead events, for lead strength interpretation)
-     * CRITICAL EXAMPLE: If X-detail shows fog has 2 rows (event 1, event 2), then:
-       * Total Events for fog = 2 (NOT 3, NOT any other number)
-       * Events with CAM = count of rows where cam_change_severity is not N/A (if both have CAM, then = 2)
-       * Lead Count = count of rows where alignment == 'lead' (e.g., if event 1 is lead, then = 1)
-       * Coincident Count = count of rows where alignment == 'coincident' (e.g., if event 2 is coincident, then = 1)
-       * Lead % = (Lead Count / Events with CAM) * 100 = (1 / 2) * 100 = 50.00 (NOT 33.33)
-     * CRITICAL: If Total Events > Events with CAM, note: "Some events missing CAM data (N/A in detail table)"
-     * CRITICAL: If Total Events == Events with CAM, do NOT show "missing CAM data" note
-     * Breakdown by failure_type (miss / score_drop / iou_drop) if available
-     * This table directly answers: "Do CAM changes occur before performance collapse?"
-     * Example: "fog: 73% of events (73/100) show CAM changes 1-2 severity steps before performance degradation"
-     * CRITICAL: If perf_start_sev == cam_change_sev, then lead_steps = 0 and alignment = 'coincident' (NOT 'lead')
-     * CRITICAL: DO NOT trust pre-computed summary values - always count from X-detail table rows
-   
+     * Copy: total_events, events_with_cam, lead_count, coincident_count, lag_count, lead_percentage, avg_lead_steps from table_x_summary_row. Summary and detail are pre-computed and consistent.
+     * If Total Events > Events with CAM, note: "Some events missing CAM data (N/A in detail table)". Breakdown from by_failure_type if available.
    - Table X-detail (NEW - REQUIRED): Alignment Analysis Detail (Reviewer Evidence Table)
-     * CRITICAL: This table provides evidence for each alignment conclusion
-     * CRITICAL: Event unit = (corruption, object_uid, failure_type) - one row per event
-     * Format: | event_id | corruption | object_uid | failure_type | perf_start_sev | cam_change_sev | cam_metric | alignment | lead_steps |
-     * CRITICAL: lead_steps calculation MUST be: lead_steps = perf_start_sev - cam_change_sev
-     * CRITICAL: alignment MUST match lead_steps:
-       * lead_steps > 0 → alignment = 'lead'
-       * lead_steps == 0 → alignment = 'coincident'
-       * lead_steps < 0 → alignment = 'lag'
-       * cam_change_sev = N/A → alignment = N/A, lead_steps = N/A
-     * Examples:
-       * perf_start_sev=1, cam_change_sev=1 → lead_steps=0 → alignment='coincident' (NOT 'lead')
-       * perf_start_sev=1, cam_change_sev=0 → lead_steps=1 → alignment='lead'
-       * perf_start_sev=1, cam_change_sev=2 → lead_steps=-1 → alignment='lag'
-       * perf_start_sev=1, cam_change_sev=N/A → lead_steps=N/A → alignment=N/A (CAM missing)
-     * perf_start_sev = performance_start_severity (from risk_events.csv)
-     * cam_change_sev = cam_change_severity (from cam_records.csv: z-score detector |z|>=2 on activation_spread vs severity-0 baseline)
-     * cam_metric = representative CAM metric used (activation_spread, or 'ensemble' if USE_CAM_ENSEMBLE)
-     * CRITICAL: Show ALL events from risk_events.csv (including CAM missing events with N/A values)
-     * CRITICAL: Total rows in X-detail MUST match Total Events in X-summary (one row per event)
-     * If some events have N/A for cam_change_sev, they still appear in detail table (with N/A values)
-     * Data source: alignment_analysis.summary[corruption]['detail_events'] for each corruption
-     * If detail_events is empty, note: "No detail events available (alignment analysis requires risk_events.csv)"
+     * CRITICAL: List EXACTLY alignment_analysis.summary[corruption].detail_events for each corruption (one row per event). Keys: failure_event_id, object_uid, failure_type, performance_start_severity, cam_change_severity, cam_change_metric, alignment, lead_steps. Map to columns: event_id, corruption, object_uid, failure_type, perf_start_sev, cam_change_sev, cam_metric, alignment, lead_steps.
+     * Detail row count per corruption MUST equal that corruption's total_events; rows with alignment='lead' MUST equal lead_count. cam_change_sev definition (Methods): "cam_change_sev is the first severity where |z(sev)|>=2 on activation_spread vs severity-0 baseline."
+     * Data source: alignment_analysis.summary[corruption].detail_events. If empty, note: "No detail events available."
      * This table can be in appendix if too long for main text, but MUST be included somewhere
 
 Generate a markdown report with TABLES ONLY. All text descriptions should be commented out with <!-- -->.
