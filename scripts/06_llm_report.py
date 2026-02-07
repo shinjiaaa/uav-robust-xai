@@ -72,9 +72,17 @@ def load_metrics(config):
     else:
         metrics['instability'] = []
     
-    # CAM metrics (time-series)
+    # CAM records (prefer cam_records.csv for Table 7 and correct n_expected_frames)
+    cam_records_csv = results_root / "cam_records.csv"
+    if cam_records_csv.exists() and cam_records_csv.stat().st_size > 0:
+        metrics['cam_records'] = pd.read_csv(cam_records_csv).to_dict('records')
+        print(f"  CAM records source: cam_records.csv ({len(metrics['cam_records'])} records)")
+    else:
+        metrics['cam_records'] = []
+    
+    # CAM metrics (legacy time-series fallback)
     cam_metrics_csv = results_root / "gradcam_metrics_timeseries.csv"
-    if cam_metrics_csv.exists():
+    if cam_metrics_csv.exists() and cam_metrics_csv.stat().st_size > 0:
         metrics['cam_metrics'] = pd.read_csv(cam_metrics_csv).to_dict('records')
     else:
         metrics['cam_metrics'] = []
@@ -105,7 +113,8 @@ def main():
         print(f"  Tiny curves: {len(metrics['tiny_curves'])} records")
         print(f"  Failure events: {len(metrics['failure_events'])} events")
         print(f"  Risk regions: {len(metrics['risk_regions'])} regions")
-        print(f"  CAM metrics: {len(metrics['cam_metrics'])} records")
+        print(f"  CAM records: {len(metrics.get('cam_records', []))} records")
+        print(f"  CAM metrics (legacy): {len(metrics.get('cam_metrics', []))} records")
     except Exception as e:
         print(f"  Error loading metrics: {e}")
         import traceback

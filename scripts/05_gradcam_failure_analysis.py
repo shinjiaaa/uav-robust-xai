@@ -317,6 +317,20 @@ def main():
                 tiny_obj = tiny_obj_lookup.get((image_id, class_id))
             if not tiny_obj:
                 print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id} (object_uid={object_uid})")
+                # B4: Record missing_tiny_obj so it appears in fail reason counts (one per severity)
+                for sev in range(cam_sev_from, cam_sev_to + 1):
+                    rec_skip = create_cam_record(
+                        model=model_name, corruption=corruption, severity=sev,
+                        image_id=image_id, class_id=class_id, object_id=object_uid,
+                        bbox_x1=None, bbox_y1=None, bbox_x2=None, bbox_y2=None,
+                        layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                        cam_status='skipped', fail_reason='missing_tiny_obj', exc_type=None, exc_msg=None,
+                        failure_severity=start_severity
+                    )
+                    if use_risk_events and 'failure_event_id' in event:
+                        rec_skip['failure_event_id'] = event['failure_event_id']
+                        rec_skip['failure_type'] = failure_type
+                    cam_records.append(rec_skip)
                 continue
             
             frame_rel_path = tiny_obj['frame_path']
@@ -342,6 +356,20 @@ def main():
                 tiny_obj = tiny_obj_lookup.get((image_id, class_id))
             if not tiny_obj:
                 print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id}")
+                # B4: Record missing_tiny_obj for fail reason counts
+                for sev in range(0, failure_severity + 1):
+                    rec_skip = create_cam_record(
+                        model=model_name, corruption=corruption, severity=sev,
+                        image_id=image_id, class_id=class_id, object_id=object_uid,
+                        bbox_x1=None, bbox_y1=None, bbox_x2=None, bbox_y2=None,
+                        layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                        cam_status='skipped', fail_reason='missing_tiny_obj', exc_type=None, exc_msg=None,
+                        failure_severity=failure_severity
+                    )
+                    if use_risk_events and 'failure_event_id' in event:
+                        rec_skip['failure_event_id'] = event['failure_event_id']
+                        rec_skip['failure_type'] = failure_type
+                    cam_records.append(rec_skip)
                 continue
             
             frame_rel_path = tiny_obj['frame_path']
@@ -850,6 +878,31 @@ def main():
             summary_csv = results_dir / "cam_fail_summary.csv"
             summary_df.to_csv(summary_csv, index=False)
             print(f"  Saved CAM fail summary to {summary_csv}")
+            
+            # B4: CAM fail reason 5 categories - corruption x severity x fail_reason count
+            FAIL_REASON_5 = ['missing_tiny_obj', 'invalid_bbox', 'target_layer_error', 'cuda_oom', 'model_type_unsupported']
+            def _normalize_fail_reason(r):
+                if pd.isna(r) or r is None:
+                    return 'other'
+                r = str(r).strip().lower()
+                if r == 'missing_tiny_obj':
+                    return 'missing_tiny_obj'
+                if r in ('image_missing', 'image_too_large', 'image_load_failed'):
+                    return 'invalid_bbox'
+                if r in ('oom', 'memory_error', 'cpu_memoryerror'):
+                    return 'cuda_oom'
+                if r in ('layer_not_configured', 'nan_cam', 'no_activation', 'no_grad', 'shape_mismatch', 'cam_extraction_failed'):
+                    return 'target_layer_error'
+                if r == 'model_type_unsupported':
+                    return 'model_type_unsupported'
+                return 'other'
+            failed_skipped = cam_primary[cam_primary['cam_status'].isin(['fail', 'skipped'])].copy()
+            if len(failed_skipped) > 0 and 'fail_reason' in failed_skipped.columns:
+                failed_skipped['fail_reason_normalized'] = failed_skipped['fail_reason'].map(_normalize_fail_reason)
+                reason_counts = failed_skipped.groupby(['corruption', 'severity', 'fail_reason_normalized'], dropna=False).size().reset_index(name='count')
+                reason_csv = results_dir / "cam_fail_reasons.csv"
+                reason_counts.to_csv(reason_csv, index=False)
+                print(f"  Saved CAM fail reasons (5 categories) to {reason_csv}")
         
         # Also save legacy format for backward compatibility
         # CRITICAL: Use primary ok → secondary ok → any ok fallback strategy

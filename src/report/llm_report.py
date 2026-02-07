@@ -927,7 +927,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
 
         summarized['cam_metrics_by_corruption_severity'] = cam_metrics_by_corruption_severity
         summarized['failure_severity_distribution'] = failure_severity_distribution  # Add distribution stats
-        
+
         # CRITICAL: Add severity 4 missing reason summary
         severity_4_missing_summary = {}
         for corruption in all_expected_corruptions:
@@ -954,7 +954,43 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     }
         summarized['severity_4_missing_summary'] = severity_4_missing_summary
 
-        # ---- cam_pattern_summary (Table 5)
+    elif detection_records and len(det_df) > 0 and 'corruption' in det_df.columns and 'severity' in det_df.columns:
+        # CRITICAL: When no CAM data, still fill n_expected_frames from detection_records
+        # so Table 7 can be built with correct n_expected_frames (not LLM-guessed 5)
+        all_expected_corruptions = ['fog', 'lowlight', 'motion_blur']
+        all_severities = [0, 1, 2, 3, 4]
+        cam_metrics_by_corruption_severity = {}
+        for corruption in all_expected_corruptions:
+            if corruption not in available_corruptions_from_det:
+                continue
+            corr_det = det_df[det_df['corruption'] == corruption].copy()
+            cam_metrics_by_corruption_severity[corruption] = {}
+            for sev in all_severities:
+                sev_det = corr_det[corr_det['severity'] == sev].copy() if len(corr_det) > 0 and 'severity' in corr_det.columns else pd.DataFrame()
+                if 'frame_id' in sev_det.columns:
+                    n_expected_frames = sev_det['frame_id'].nunique()
+                elif 'image_id' in sev_det.columns:
+                    n_expected_frames = sev_det['image_id'].nunique()
+                else:
+                    n_expected_frames = len(sev_det) if len(sev_det) > 0 else None
+                cam_metrics_by_corruption_severity[corruption][sev] = {
+                    'energy_in_bbox_mean': None,
+                    'activation_spread_mean': None,
+                    'entropy_mean': None,
+                    'center_shift_mean': None,
+                    'n_cam_frames': 0,
+                    'n_expected_frames': int(n_expected_frames) if n_expected_frames is not None else None,
+                    'cam_valid_ratio': None,
+                    'failure_severity': None,
+                    'cam_failure_rate': None,
+                    'note': 'N/A (no CAM data; n_expected_frames from detection_records)'
+                }
+        summarized['cam_metrics_by_corruption_severity'] = cam_metrics_by_corruption_severity
+        summarized['failure_severity_distribution'] = {}
+        summarized['severity_4_missing_summary'] = {}
+
+    # ---- cam_pattern_summary (Table 5) - only when we have CAM data (uses cam_df)
+    if has_cam_data and len(cam_df) > 0:
         # CRITICAL: Only include corruptions that have actual detection records
         cam_pattern_summary: Dict[str, Dict] = {}
         available_corruptions = cam_df['corruption'].unique().tolist() if 'corruption' in cam_df.columns else []
@@ -1689,6 +1725,102 @@ def normalize_for_json(obj):
         return obj
 
 
+def build_table2_markdown(summarized: Dict) -> str:
+    """Build Table 2 (Performance Metrics) markdown from summarized data.
+    CRITICAL: Ensures miss_rate and n_records_total come from data, not LLM.
+    """
+    det = summarized.get('detection_summary', {})
+    if not det.get('has_data') or not det.get('per_corruption'):
+        return ""
+    n_objs = det.get('n_objects_by_corruption_severity', {})
+    lines = [
+        "<!-- Table 2: Performance Metrics from detection_records.csv -->",
+        "| Corruption   | Severity | Miss Rate | Avg Score | Avg IoU | n_records_total | n_objects_unique |",
+        "|--------------|----------|------------|-----------|---------|-----------------|-------------------|",
+    ]
+    for corruption in sorted(det.get('per_corruption', {}).keys()):
+        pc = det['per_corruption'][corruption]
+        miss_by_sev = pc.get('miss_rate_by_severity') or {}
+        score_by_sev = pc.get('avg_score_by_severity') or {}
+        iou_by_sev = pc.get('avg_iou_by_severity') or {}
+        for sev in sorted(miss_by_sev.keys(), key=lambda x: int(x) if x is not None else -1):
+            n_rec = n_objs.get(corruption, {}).get(sev)
+            n_rec = int(n_rec) if n_rec is not None else ""
+            n_uq = det.get('n_objects_unique')
+            n_uq = int(n_uq) if n_uq is not None else ""
+            mr = miss_by_sev.get(sev)
+            mr = f"{float(mr):.3f}" if mr is not None else "N/A"
+            sc = score_by_sev.get(sev)
+            sc = f"{float(sc):.3f}" if sc is not None else "N/A"
+            iou = iou_by_sev.get(sev)
+            iou = f"{float(iou):.3f}" if iou is not None else "N/A"
+            corr_pad = str(corruption).ljust(12)
+            lines.append(f"| {corr_pad} | {sev}        | {mr}      | {sc}     | {iou}   | {n_rec}            | {n_uq}               |")
+    lines.append("")
+    lines.append("**Definition note:** Score Drop Rate is computed at the record level per severity (fraction of records whose confidence falls below the drop threshold relative to the severity-0 baseline), while `score_drop` events in Table X are derived at the object level as the first severity where the drop condition is met.")
+    return "\n".join(lines)
+
+
+def build_table7_markdown(summarized: Dict) -> str:
+    """Build Table 7 (CAM Metrics) markdown from summarized data.
+    CRITICAL: Ensures n_expected_frames comes from detection_records (e.g. 500), not 5.
+    """
+    cam = summarized.get('cam_metrics_by_corruption_severity', {})
+    if not cam:
+        return ""
+    lines = [
+        "<!-- Table 7: CAM Metrics from cam_records.csv -->",
+        "| Corruption   | Severity | n_cam_frames | n_expected_frames | cam_valid_ratio | Energy in BBox Mean | Activation Spread Mean | Entropy Mean | Center Shift Mean |",
+        "|--------------|----------|---------------|--------------------|------------------|---------------------|-----------------------|--------------|-------------------|",
+    ]
+    corruptions = sorted(cam.keys())
+    severities = [0, 1, 2, 3, 4]
+    for corruption in corruptions:
+        for sev in severities:
+            row = cam.get(corruption, {}).get(sev, {})
+            n_cam = row.get('n_cam_frames', 0) or 0
+            n_exp = row.get('n_expected_frames')
+            ratio = row.get('cam_valid_ratio')
+            ratio_str = f"{float(ratio):.3f}" if ratio is not None and n_cam > 0 else ("N/A" if n_cam == 0 and ratio is None else (f"{float(ratio):.3f}" if ratio is not None else "N/A"))
+            ebb = row.get('energy_in_bbox_mean')
+            ebb_str = f"{float(ebb):.6f}" if ebb is not None else "N/A"
+            asp = row.get('activation_spread_mean')
+            asp_str = f"{float(asp):.3f}" if asp is not None else "N/A"
+            ent = row.get('entropy_mean')
+            ent_str = f"{float(ent):.3f}" if ent is not None else "N/A"
+            csh = row.get('center_shift_mean')
+            csh_str = f"{float(csh):.3f}" if csh is not None else "N/A"
+            n_exp_str = str(int(n_exp)) if n_exp is not None else "N/A"
+            corr_pad = str(corruption).ljust(12)
+            lines.append(f"| {corr_pad} | {sev}        | {n_cam}             | {n_exp_str}                  | {ratio_str}            | {ebb_str}            | {asp_str}                 | {ent_str}       | {csh_str}             |")
+    return "\n".join(lines)
+
+
+def inject_programmatic_tables(report: str, summarized: Dict) -> str:
+    """Replace Table 2 and Table 7 in the report with programmatically built versions.
+    Fixes: (1) miss_rate shown as 0.000 when data has non-zero is_missed,
+    (2) n_expected_frames shown as 5 when it should be from detection_records (e.g. 500).
+    """
+    import re
+    table2_md = build_table2_markdown(summarized)
+    table7_md = build_table7_markdown(summarized)
+    if table2_md:
+        # Replace full Table 2 block (comment + table + definition note) up to next section
+        # Match up to "<!-- Table 7" (may be mid-line) or "<!-- Table X"
+        table2_pattern = re.compile(
+            r'<!--\s*Table 2[^>]*>[\s\S]*?(?=<!--\s*Table 7|<!--\s*Table X|\Z)',
+            re.IGNORECASE
+        )
+        report = table2_pattern.sub(table2_md + "\n\n", report, count=1)
+    if table7_md:
+        table7_pattern = re.compile(
+            r'<!--\s*Table 7[^>]*>[\s\S]*?(?=<!--\s*Table X|<!--\s*Alignment|\Z)',
+            re.IGNORECASE
+        )
+        report = table7_pattern.sub(table7_md + "\n\n", report, count=1)
+    return report
+
+
 def generate_report_with_llm(config: Dict, metrics: Dict) -> str:
     """Generate report using LLM.
 
@@ -1801,7 +1933,8 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
       - DO NOT create Table 6 or any other performance table if detection_summary.has_data is False
     - If detection_summary.has_data is True:
       - Create Table 2 with data from detection_records
-      - n_objects_total comes from detection_records (sum of all detection records)
+      - CRITICAL: For each (Corruption, Severity) row, n_records_total MUST be the value from n_objects_by_corruption_severity[corruption][severity] (typically 500 per row). Do NOT use by_severity (1500) for n_records_total.
+      - Miss Rate = mean(is_missed) by severity, where is_missed = no detection (object-level).
       - Report n_objects_by_corruption_severity if available
       - NOT from metrics_dataset.csv pred_count
       - Emphasize that this table shows the PERFORMANCE TIMELINE (severity 0→4) which is the reference for CAM analysis
@@ -1918,6 +2051,9 @@ Generate a markdown report with TABLES ONLY. All text descriptions should be com
     )
 
     report = response.choices[0].message.content
+    # CRITICAL: Replace Table 2 and Table 7 with programmatic versions so miss_rate and n_expected_frames are correct
+    raw_summarized = summarize_metrics(metrics)
+    report = inject_programmatic_tables(report, raw_summarized)
     return report
 
 

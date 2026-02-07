@@ -603,9 +603,10 @@ def main():
                 n_rec = len(grp)
                 n_det = int(grp['is_detected'].sum())
                 n_miss = int(grp['is_missed'].sum())
-                ok = (n_det + n_miss == n_rec and n_rec == 500)
+                ok = (n_det + n_miss == n_rec)
                 print(f"    {corr} sev{sev}: n_records={n_rec} n_detected={n_det} n_missed={n_miss}  {'OK' if ok else 'CHECK'}")
-            print("  (n_records_total per (corruption,severity) should be 500; 1500 indicates aggregation bug.)")
+            n_models = all_records_df['model_id'].nunique() if 'model_id' in all_records_df.columns else 1
+            print(f"  (n_records per (corruption,severity) should be 500*models={500*n_models}; 1500 with 1 model = bug.)")
         
         # Final cleanup
         del all_records_df
