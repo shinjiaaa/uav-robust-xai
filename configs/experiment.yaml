@@ -1,13 +1,27 @@
-# Experiment configuration for VisDrone robustness evaluation
+# DASC Experiment Configuration
+# 연구 질문: 객체 탐지 모델의 성능 저하가 일어나기 전, XAI(Grad-CAM)가 성능 저하 전조를 잡을 수 있는가?
+# - 정량적: IoU/mAP curve, 모델 저하 단계 vs Grad-CAM 붕괴 단계 비교, 노이즈별 일관성
+# - 정성적: Heatmap 시각화로 인지적 도움 평가
+# 변조: 안개(fog), 모션 블러(motion_blur), 저조도(lowlight) | 단계: 0(원본)~4
 
 # Reproducibility
 seed: 42
+
+# DASC experiment mode: YOLO base model + Grad-CAM only
+dasc:
+  enabled: true
+  models: ["yolo_generic"]  # DASC uses only base YOLO
+  model_degradation_threshold: 0.25  # miss_rate >= 0.25 -> 성능 저하 단계
+  gradcam_breakdown_threshold: 0.3   # energy_in_bbox baseline 대비 30% 이상 감소 -> 패턴 붕괴
+  save_heatmap_overlays: true       # Heatmap 이미지 저장 (프로토타입용)
 
 # Dataset paths
 dataset:
   visdrone_root: "datasets/visdrone"
   visdrone_yolo_root: "datasets/visdrone_yolo"
   corruptions_root: "datasets/visdrone_corrupt"
+  # Optional: 항공기 시점 추가 데이터셋 (UAVDT 등) - 추후 결합 시 사용
+  # uavdt_root: "datasets/uavdt"
   
 # VisDrone download
 visdrone:
@@ -22,8 +36,8 @@ visdrone:
 # N=500: 500 × 3 × 5 = 7500 frames (2500 per corruption). Level 0 = reference only (no duplicate file).
 experiment:
   pilot_mode: false  # Full experiment mode: use standard severities [0,1,2,3,4]
-  sample_size: 500   # Legacy: overridden by target_tiny_objects
-  target_tiny_objects: 500  # Tiny object sample size. 500 × 3 × 5 = 7500 frames (2500 per corruption).
+  sample_size: 5     # [TEST] Legacy: overridden by target_tiny_objects
+  target_tiny_objects: 5  # [TEST] Tiny object sample size. Revert to 500 for full run.
   max_images: null   # Max images to scan for tiny objects (null = no limit)
   one_per_image: false  # Allow multiple tiny bboxes per image when sampling 500 objects
   
@@ -58,8 +72,7 @@ corruptions:
     kernel_length: [0, 5, 10, 15, 20]  # kernel length for severities [0, 1, 2, 3, 4] - INCREASED from [0, 3, 6, 9, 12]
     angle: 0  # degrees, or use hash-based per image
     
-# Models
-# Full experiment: 3 models (Generic, Fine-tuned, RT-DETR)
+# Models (DASC: yolo_generic만 사용)
 models:
   yolo_generic:
     type: "yolo"
@@ -154,6 +167,10 @@ results:
   tiny_records_csv: "results/tiny_records.csv"
   gradcam_metrics_csv: "results/gradcam_metrics.csv"
   report_md: "results/report.md"
+  # DASC 산출물
+  dasc_curves_dir: "results/dasc_curves"
+  dasc_summary_json: "results/dasc_summary.json"
+  heatmap_samples_dir: "results/heatmap_samples"
   
 # LLM report
 llm_report:

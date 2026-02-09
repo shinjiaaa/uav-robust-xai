@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DASC 실험 프로토타입 - Input/Output 확인</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --accent: #00d4aa;
+      --text: #e6edf3;
+      --muted: #8b949e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+      line-height: 1.6;
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 8px; color: var(--accent); }
+    h2 { font-size: 1.1rem; margin: 24px 0 12px; color: var(--muted); }
+    .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .grid { display: grid; gap: 16px; }
+    .grid-3 { grid-template-columns: repeat(3, 1fr); }
+    .grid-corr { grid-template-columns: repeat(3, 1fr); }
+    @media (max-width: 900px) {
+      .grid-3, .grid-corr { grid-template-columns: 1fr; }
+    }
+    .img-cell {
+      text-align: center;
+      padding: 8px;
+      background: rgba(0,0,0,0.2);
+      border-radius: 8px;
+    }
+    .img-cell img { max-width: 100%; height: auto; border-radius: 4px; }
+    .img-cell .label { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
+    .upload-zone {
+      border: 2px dashed var(--muted);
+      border-radius: 8px;
+      padding: 40px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .upload-zone:hover { border-color: var(--accent); }
+    .upload-zone.dragover { border-color: var(--accent); background: rgba(0,212,170,0.05); }
+    input[type="file"] { display: none; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid rgba(139,148,158,0.2); }
+    th { color: var(--muted); font-weight: 500; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; }
+    .badge-ok { background: rgba(0,212,170,0.2); color: var(--accent); }
+    .badge-warn { background: rgba(255,170,0,0.2); color: #ffaa00; }
+    .curve-img { max-width: 100%; border-radius: 8px; }
+    .error { color: #f85149; font-size: 0.9rem; }
+    .empty-state { color: var(--muted); text-align: center; padding: 40px; }
+    .section-title { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+  <h1>DASC 실험 프로토타입</h1>
+  <p class="subtitle">객체 탐지 모델 성능 저하 전 Grad-CAM 전조 붕괴 예측 · Input/Output 확인</p>
+
+  <!-- Input: 원본 이미지 -->
+  <div class="card">
+    <h2>1. Input: 원본 이미지</h2>
+    <div class="upload-zone" id="uploadZone">
+      <input type="file" id="fileInput" accept="image/*">
+      <p id="uploadHint">원본 이미지를 드래그하거나 클릭하여 선택</p>
+      <img id="previewImg" style="max-width: 320px; margin-top: 12px; display: none;">
+    </div>
+  </div>
+
+  <!-- Output: 변조별 이미지 + Heatmap -->
+  <div class="card">
+    <h2>2. Output: 변조별 이미지 + Grad-CAM Heatmap</h2>
+    <p class="subtitle" style="margin-bottom: 12px;">원본(0) / 안개 / 모션블러 / 저조도 각 severity 0~4</p>
+    <div id="imageGrid" class="grid grid-corr">
+      <div class="empty-state">파이프라인 실행 후 results/heatmap_samples/ 에서 Heatmap 이미지가 생성됩니다.<br>실험 실행: <code>python scripts/00_full_experiment.py</code></div>
+    </div>
+  </div>
+
+  <!-- 성능 곡선 -->
+  <div class="card">
+    <h2>3. 이미지 변조 단계별 모델 성능 (IoU, mAP)</h2>
+    <div id="curveSection" class="grid grid-3">
+      <div class="empty-state">dasc_summary.json 로드 후 표시</div>
+    </div>
+  </div>
+
+  <!-- 성능 저하 vs Grad-CAM 붕괴 -->
+  <div class="card">
+    <h2>4. 성능 저하 단계 vs Grad-CAM 패턴 붕괴 단계</h2>
+    <p class="subtitle" style="margin-bottom: 12px;">Grad-CAM이 모델 성능 저하를 예측하는가? (붕괴 단계 &lt; 저하 단계)</p>
+    <div id="degradationTable"></div>
+  </div>
+
+  <!-- 일관성 -->
+  <div class="card">
+    <h2>5. 노이즈 유형별 Grad-CAM 전조 패턴 일관성</h2>
+    <div id="consistencyTable"></div>
+  </div>
+
+  <script>
+    // File upload
+    const uploadZone = document.getElementById('uploadZone');
+    const fileInput = document.getElementById('fileInput');
+    const previewImg = document.getElementById('previewImg');
+    const uploadHint = document.getElementById('uploadHint');
+
+    uploadZone.addEventListener('click', () => fileInput.click());
+    uploadZone.addEventListener('dragover', (e) => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+    uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+    uploadZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      uploadZone.classList.remove('dragover');
+      const f = e.dataTransfer.files[0];
+      if (f && f.type.startsWith('image/')) handleFile(f);
+    });
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files[0];
+      if (f) handleFile(f);
+    });
+
+    function handleFile(file) {
+      const url = URL.createObjectURL(file);
+      previewImg.src = url;
+      previewImg.style.display = 'block';
+      uploadHint.textContent = file.name;
+    }
+
+    // Load DASC summary
+    async function loadDascSummary() {
+      try {
+        const r = await fetch('../results/dasc_summary.json');
+        if (!r.ok) throw new Error('File not found');
+        return await r.json();
+      } catch (e) {
+        console.warn('dasc_summary.json not found. Run pipeline first.');
+        return null;
+      }
+    }
+
+    // Render curves
+    function renderCurves(data) {
+      const section = document.getElementById('curveSection');
+      if (!data || !data.iou_curve?.length) {
+        section.innerHTML = '<div class="empty-state">IoU curve 데이터 없음 (파이프라인 실행 후 08_dasc_deliverables 생성)</div>';
+        return;
+      }
+      const base = '../';
+      section.innerHTML = `
+        <div>
+          <div class="img-cell">
+            <img src="${base}results/dasc_curves/iou_curve.png" alt="IoU" class="curve-img" onerror="this.parentElement.innerHTML='IoU curve 이미지 없음'">
+            <div class="label">IoU Curve (변조 단계별)</div>
+          </div>
+        </div>
+        <div>
+          <div class="img-cell">
+            <img src="${base}results/dasc_curves/miss_rate_curve.png" alt="Miss Rate" class="curve-img" onerror="this.parentElement.innerHTML='Miss rate curve 이미지 없음'">
+            <div class="label">Miss Rate Curve</div>
+          </div>
+        </div>
+      `;
+    }
+
+    // Render heatmap image grid
+    function renderHeatmapGrid(data) {
+      const grid = document.getElementById('imageGrid');
+      const samples = data?.heatmap_samples || [];
+      if (samples.length === 0) {
+        grid.innerHTML = '<div class="empty-state">Heatmap 이미지 없음. Grad-CAM 분석(05) 완료 후 results/heatmap_samples/ 에 저장됩니다.</div>';
+        return;
+      }
+      const base = location.pathname.includes('/prototype') ? '../' : '';
+      const byCorr = {};
+      samples.forEach(s => {
+        if (!byCorr[s.corruption]) byCorr[s.corruption] = [];
+        byCorr[s.corruption].push(s);
+      });
+      let html = '';
+      ['fog', 'lowlight', 'motion_blur'].forEach(c => {
+        if (!byCorr[c]) return;
+        html += `<div class="img-cell"><div class="label">${c.replace('_',' ')}</div>`;
+        byCorr[c].slice(0, 5).forEach(s => {
+          const src = s.path.startsWith('http') ? s.path : (base + s.path);
+          html += `<img src="${src}" alt="${c} L${s.severity}" class="curve-img" style="max-height: 120px; margin: 4px;" onerror="this.style.display='none'">`;
+        });
+        html += '</div>';
+      });
+      grid.innerHTML = html || '<div class="empty-state">Heatmap 없음</div>';
+    }
+
+    // Render degradation table
+    function renderDegradationTable(data) {
+      const el = document.getElementById('degradationTable');
+      if (!data?.model_degradation_stage) {
+        el.innerHTML = '<div class="empty-state">데이터 없음</div>';
+        return;
+      }
+      const corruptions = data.corruptions || ['fog', 'lowlight', 'motion_blur'];
+      const mDeg = data.model_degradation_stage;
+      const gDeg = data.gradcam_breakdown_stage || {};
+      let html = '<table><tr><th>변조 유형</th><th>모델 성능 저하 단계</th><th>Grad-CAM 패턴 붕괴 단계</th><th>예측 여부</th></tr>';
+      corruptions.forEach(c => {
+        const m = mDeg[c] != null ? `Severity ${mDeg[c]}` : '-';
+        const g = gDeg[c] != null ? `Severity ${gDeg[c]}` : '-';
+        const predicts = gDeg[c] != null && (mDeg[c] == null || gDeg[c] < mDeg[c]);
+        html += `<tr>
+          <td>${c.replace('_',' ')}</td>
+          <td>${m}</td>
+          <td>${g}</td>
+          <td><span class="badge ${predicts ? 'badge-ok' : 'badge-warn'}">${predicts ? '예측함' : '예측 안함'}</span></td>
+        </tr>`;
+      });
+      html += '</table>';
+      el.innerHTML = html;
+    }
+
+    // Render consistency table
+    function renderConsistencyTable(data) {
+      const el = document.getElementById('consistencyTable');
+      if (!data?.consistency) {
+        el.innerHTML = '<div class="empty-state">데이터 없음</div>';
+        return;
+      }
+      const cons = data.consistency;
+      let html = '<table><tr><th>변조 유형</th><th>Grad-CAM 전조 패턴</th></tr>';
+      Object.entries(cons).forEach(([c, v]) => {
+        let status = '-';
+        if (v.predicts_degradation === true) status = `선행 ${v.lead ?? ''} 단계`;
+        else if (v.predicts_degradation === false) status = '선행하지 않음';
+        html += `<tr><td>${c.replace('_',' ')}</td><td>${status}</td></tr>`;
+      });
+      html += '</table>';
+      el.innerHTML = html;
+    }
+
+    // Init
+    loadDascSummary().then(data => {
+      if (data) {
+        renderCurves(data);
+        renderHeatmapGrid(data);
+        renderDegradationTable(data);
+        renderConsistencyTable(data);
+      }
+    });
+  </script>
+</body>
+</html>

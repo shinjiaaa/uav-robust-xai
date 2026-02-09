@@ -23,6 +23,7 @@ from src.corruption.corruptions import corrupt_image
 from src.data.bbox_conversion import visdrone_to_yolo_bbox, get_image_dimensions, extract_letterbox_meta
 from src.utils.io import load_yaml, load_json
 from src.utils.seed import set_seed
+from src.utils.plot import save_cam_overlay
 from ultralytics import YOLO
 from tqdm import tqdm
 
@@ -780,6 +781,14 @@ def main():
                     cam_records.append(record)
                     if layer_role == 'primary':
                         corruption_cam_stats[corruption]['success'] += 1
+                        # DASC: Save heatmap overlay for prototype (원본/변조별 이미지+Heatmap)
+                        dasc_cfg = config.get('dasc', {})
+                        save_overlays = dasc_cfg.get('save_heatmap_overlays', False) or gradcam_config.get('save_samples', False)
+                        if save_overlays and cam is not None and letterbox_meta is not None:
+                            heatmap_dir = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples'))
+                            safe_uid = str(object_uid).replace('/', '_').replace('\\', '_')[:80]
+                            overlay_path = heatmap_dir / model_name / corruption / f"L{severity}" / f"{image_id}_{safe_uid}.png"
+                            save_cam_overlay(cam, image, letterbox_meta, overlay_path)
                 
                 # Clean up CAM for this layer
                 if cam is not None:

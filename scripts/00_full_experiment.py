@@ -26,13 +26,18 @@ def main():
         print("Set experiment.pilot_mode: false in configs/experiment.yaml for full experiment")
         return
     
+    dasc_cfg = config.get('dasc', {})
+    is_dasc = dasc_cfg.get('enabled', False)
+    
     print("=" * 60)
-    print("Full Experiment: Standard Severities [0, 1, 2, 3, 4]")
+    print("DASC Experiment" if is_dasc else "Full Experiment: Standard Severities [0, 1, 2, 3, 4]")
     print("=" * 60)
     print()
     print("This will run the full experiment with:")
-    print(f"  - Sample size: {experiment_config.get('sample_size', 100)} tiny objects")
+    print(f"  - Sample size: {experiment_config.get('target_tiny_objects', 100)} tiny objects")
     print(f"  - Severities: {config['corruptions']['severities']}")
+    print(f"  - Corruptions: {config['corruptions']['types']}")
+    print(f"  - Models: {dasc_cfg.get('models', list(config['models'].keys())) if is_dasc else list(config['models'].keys())}")
     print(f"  - One tiny bbox per image: {experiment_config.get('one_per_image', False)}")
     print()
     
@@ -70,7 +75,12 @@ def main():
             'required': True  # Required for complete analysis
         },
         {
-            'name': '6. Generate LLM report',
+            'name': '6. DASC 산출물 생성 (IoU curve, mAP, 성능 저하 vs Grad-CAM 붕괴 비교)',
+            'script': 'scripts/08_dasc_deliverables.py',
+            'required': True
+        },
+        {
+            'name': '7. Generate LLM report',
             'script': 'scripts/06_llm_report.py',
             'required': False  # Optional: may fail if API key is not set
         }
@@ -138,9 +148,11 @@ def main():
     print("Results saved in results/ directory:")
     print("  - metrics_dataset.csv: Dataset-wide metrics")
     print("  - tiny_records_timeseries.csv: Detection records")
-    print("  - failure_events.csv: Failure event analysis")
+    print("  - risk_events.csv: Risk event analysis")
     print("  - gradcam_metrics_timeseries.csv: CAM distribution metrics")
-    print("  - gradcam_errors.csv: CAM error log (for bias analysis)")
+    print("  - heatmap_samples/: Grad-CAM Heatmap overlay images (DASC)")
+    print("  - dasc_curves/: IoU curve, Miss rate curve (DASC)")
+    print("  - dasc_summary.json: DASC 산출물 요약 (프로토타입용)")
     print("  - report.md: LLM-generated report")
 
 

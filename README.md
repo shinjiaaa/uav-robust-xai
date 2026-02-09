@@ -2,6 +2,16 @@
 
 End-to-end reproducible experiment pipeline for robustness evaluation of object detectors on VisDrone with controlled image corruptions and XAI (Explainable AI), focusing on **single-image evaluation** and **failure-event based Grad-CAM analysis**.
 
+## DASC 실험 모드
+
+**연구 질문**: 객체 탐지 모델의 성능 저하가 일어나기 전, XAI(Grad-CAM)가 성능 저하의 전조 붕괴를 잡을 수 있는가?
+
+- **정량적 평가**: IoU curve, mAP, 모델 저하 단계 vs Grad-CAM 패턴 붕괴 단계, 노이즈별 일관성
+- **정성적 평가**: Heatmap 시각화로 인지적 도움 평가
+- **모델**: YOLO base (yolo_generic)
+- **변조**: 안개(fog), 모션 블러(motion_blur), 저조도(lowlight) | 단계 0(원본)~4
+- **프로토타입**: `prototype/index.html` — Input/Output 확인용
+
 ## Research Question (RQ)
 
 **RQ**: In single-image object detection, when image corruption severity increases, does the resulting detection performance degradation co-occur with consistent changes in Grad-CAM distribution patterns? Can these CAM-based changes serve as generalizable risk signals across different corruption types and models?

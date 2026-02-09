@@ -5,6 +5,8 @@ import seaborn as sns
 from pathlib import Path
 from typing import Dict, List, Optional
 import pandas as pd
+import numpy as np
+import cv2
 
 # Set style
 sns.set_style("whitegrid")
@@ -105,3 +107,58 @@ def plot_tiny_object_curves(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, bbox_inches='tight')
     plt.close()
+
+
+def save_cam_overlay(
+    cam: np.ndarray,
+    image: np.ndarray,
+    letterbox_meta: Optional[Dict],
+    output_path: Path,
+    alpha: float = 0.5
+) -> bool:
+    """Save Grad-CAM heatmap overlay on image (DASC prototype용).
+    
+    Args:
+        cam: CAM heatmap (H, W) in letterbox/preprocessed space
+        image: Original image (H, W, 3) RGB or BGR
+        letterbox_meta: Dict with scale, pad_left, pad_top, target_size
+        output_path: Path to save overlay image
+        alpha: Blend factor for heatmap (0-1)
+    Returns:
+        True if saved successfully
+    """
+    try:
+        orig_h, orig_w = image.shape[:2]
+        cam_h, cam_w = cam.shape[:2]
+        
+        if letterbox_meta:
+            scale = letterbox_meta.get('scale', 1.0)
+            pad_left = int(letterbox_meta.get('pad_left', 0))
+            pad_top = int(letterbox_meta.get('pad_top', 0))
+            new_w = int(orig_w * scale)
+            new_h = int(orig_h * scale)
+            y1, y2 = pad_top, min(pad_top + new_h, cam_h)
+            x1, x2 = pad_left, min(pad_left + new_w, cam_w)
+            cam_crop = cam[y1:y2, x1:x2]
+            cam_resized = cv2.resize(cam_crop, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            cam_resized = cv2.resize(cam, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        
+        cam_uint8 = (cam_resized * 255).astype(np.uint8)
+        heatmap = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET)
+        if len(image.shape) >= 3 and image.shape[2] == 3:
+            heatmap_rgb = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+            img_rgb = image if image.shape[2] == 3 else cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            heatmap_rgb = heatmap
+            img_rgb = image
+        overlay = np.clip(
+            alpha * heatmap_rgb.astype(np.float32) + (1 - alpha) * img_rgb.astype(np.float32),
+            0, 255
+        ).astype(np.uint8)
+        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(output_path), overlay_bgr)
+        return True
+    except Exception:
+        return False

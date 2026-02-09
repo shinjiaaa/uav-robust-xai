@@ -83,12 +83,15 @@ def main():
     
     print(f"Loaded {len(tiny_objects)} tiny objects")
     
-    # Process each model (all models from config)
-    # RQ1: Grad-CAM early-signal experiment uses YOLO only (2 models)
-    all_models = list(config['models'].keys())
-    models = [m for m in all_models if config['models'][m].get('type') == 'yolo']
+    # Process models: DASC mode uses yolo_generic only
+    dasc_cfg = config.get('dasc', {})
+    if dasc_cfg.get('enabled') and dasc_cfg.get('models'):
+        models = [m for m in dasc_cfg['models'] if m in config['models']]
+    else:
+        all_models = list(config['models'].keys())
+        models = [m for m in all_models if config['models'][m].get('type') == 'yolo']
     if not models:
-        models = all_models
+        models = list(config['models'].keys())
     corruptions = config['corruptions']['types']
     severities = config['corruptions']['severities']
     
