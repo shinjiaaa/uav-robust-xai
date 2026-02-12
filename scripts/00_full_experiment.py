@@ -105,7 +105,13 @@ def main():
                 errors='replace',
                 env=env
             )
-            print(result.stdout)
+            # On Windows, print() may fail on Unicode (e.g. box-drawing); encode for console
+            out = result.stdout or ""
+            try:
+                print(out)
+            except UnicodeEncodeError:
+                enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                print(out.encode(enc, errors="replace").decode(enc))
             print(f"[OK] {step['name']} completed")
         except subprocess.CalledProcessError as e:
             # Try fallback script if available
@@ -121,7 +127,12 @@ def main():
                         errors='replace',
                         env=env
                     )
-                    print(result.stdout)
+                    out = result.stdout or ""
+                    try:
+                        print(out)
+                    except UnicodeEncodeError:
+                        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                        print(out.encode(enc, errors="replace").decode(enc))
                     print(f"[OK] Fallback script completed")
                 except subprocess.CalledProcessError as e2:
                     if step['required']:

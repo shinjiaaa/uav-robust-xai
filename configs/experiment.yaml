@@ -36,8 +36,8 @@ visdrone:
 # N=500: 500 × 3 × 5 = 7500 frames (2500 per corruption). Level 0 = reference only (no duplicate file).
 experiment:
   pilot_mode: false  # Full experiment mode: use standard severities [0,1,2,3,4]
-  sample_size: 5     # [TEST] Legacy: overridden by target_tiny_objects
-  target_tiny_objects: 5  # [TEST] Tiny object sample size. Revert to 500 for full run.
+  sample_size: 500   # Legacy: overridden by target_tiny_objects
+  target_tiny_objects: 500  # Tiny object sample size (full run)
   max_images: null   # Max images to scan for tiny objects (null = no limit)
   one_per_image: false  # Allow multiple tiny bboxes per image when sampling 500 objects
   
