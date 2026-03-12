@@ -337,8 +337,14 @@ def main():
             frame_rel_path = tiny_obj['frame_path']
             failure_severity = start_severity  # Use start_severity as failure_severity
             
-            # CRITICAL: Process only CAM computation scope (cam_sev_from to cam_sev_to)
+            # Process only CAM computation scope (cam_sev_from to cam_sev_to) for metrics/records
             severity_range = range(cam_sev_from, cam_sev_to + 1)
+            # When saving heatmap overlays, use full severity range (0..4) so every sample has L0–L4 for the viewer
+            _save_overlays = config.get('dasc', {}).get('save_heatmap_overlays', False) or config.get('gradcam', {}).get('save_samples', False)
+            if _save_overlays:
+                sev_list = config.get('corruptions', {}).get('severities', [0, 1, 2, 3, 4])
+                if sev_list:
+                    severity_range = range(min(sev_list), max(sev_list) + 1)
         else:
             # Legacy format: use failure_events.csv structure
             image_id = event['image_id']
@@ -377,6 +383,12 @@ def main():
             
             # Legacy: Process all severities 0 to failure_severity
             severity_range = range(0, failure_severity + 1)
+            # When saving heatmap overlays, use full 0..4 so every sample has L0–L4
+            _save_overlays = config.get('dasc', {}).get('save_heatmap_overlays', False) or config.get('gradcam', {}).get('save_samples', False)
+            if _save_overlays:
+                sev_list = config.get('corruptions', {}).get('severities', [0, 1, 2, 3, 4])
+                if sev_list:
+                    severity_range = range(min(sev_list), max(sev_list) + 1)
         
         # Store baseline CAMs per layer (primary/secondary)
         baseline_cams = {}  # {layer_role: cam}
@@ -394,21 +406,51 @@ def main():
                 image_path = corruptions_root / corruption / str(severity) / "images" / Path(frame_rel_path).name
             
             if not image_path.exists():
-                # B-2: Log skipped attempt so n_expected = n_ok + n_failed + n_skipped
-                rec_skip = create_cam_record(
-                    model=model_name, corruption=corruption, severity=severity,
-                    image_id=image_id, class_id=class_id, object_id=object_uid,
-                    bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
-                    bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
-                    layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
-                    cam_status='skipped', fail_reason='image_missing', exc_type=None, exc_msg=None,
-                    failure_severity=failure_severity
-                )
-                if use_risk_events and 'failure_event_id' in event:
-                    rec_skip['failure_event_id'] = event['failure_event_id']
-                    rec_skip['failure_type'] = failure_type
-                cam_records.append(rec_skip)
-                continue
+                # For severity >= 1: generate corruption on-the-fly so L0–L4 are always complete
+                if severity >= 1:
+                    orig_path = visdrone_root / frame_rel_path
+                    if orig_path.exists():
+                        try:
+                            image_path.parent.mkdir(parents=True, exist_ok=True)
+                            corrupt_image(
+                                orig_path,
+                                corruption,
+                                severity,
+                                image_path,
+                                seed=config['seed']
+                            )
+                        except Exception as e:
+                            rec_skip = create_cam_record(
+                                model=model_name, corruption=corruption, severity=severity,
+                                image_id=image_id, class_id=class_id, object_id=object_uid,
+                                bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                                bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                                layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                                cam_status='skipped', fail_reason='image_missing', exc_type=None, exc_msg=None,
+                                failure_severity=failure_severity
+                            )
+                            if use_risk_events and 'failure_event_id' in event:
+                                rec_skip['failure_event_id'] = event['failure_event_id']
+                                rec_skip['failure_type'] = failure_type
+                            cam_records.append(rec_skip)
+                            continue
+                    # else: orig missing, fall through to skip
+                if not image_path.exists():
+                    # B-2: Log skipped attempt
+                    rec_skip = create_cam_record(
+                        model=model_name, corruption=corruption, severity=severity,
+                        image_id=image_id, class_id=class_id, object_id=object_uid,
+                        bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                        bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                        layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                        cam_status='skipped', fail_reason='image_missing', exc_type=None, exc_msg=None,
+                        failure_severity=failure_severity
+                    )
+                    if use_risk_events and 'failure_event_id' in event:
+                        rec_skip['failure_event_id'] = event['failure_event_id']
+                        rec_skip['failure_type'] = failure_type
+                    cam_records.append(rec_skip)
+                    continue
             
             # Load image with memory-efficient approach
             try:
