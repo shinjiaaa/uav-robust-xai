@@ -3,9 +3,30 @@
 from typing import Dict, Optional, Tuple, List
 import numpy as np
 import torch
+import cv2
 
 from src.xai.gradcam_yolo import YOLOGradCAM
 from src.xai.cam_qc import get_qc_status, check_cam_quality
+
+
+def _crop_to_bbox(
+    image: np.ndarray,
+    bbox_xyxy: Tuple[float, float, float, float],
+    padding: int = 32,
+) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    """Crop image to bbox with padding. Returns (crop, (x1,y1,x2,y2) used)."""
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = [int(round(v)) for v in bbox_xyxy]
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    pad = max(padding, int(0.1 * min(bw, bh)))
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(w, x2 + pad)
+    y2 = min(h, y2 + pad)
+    if x2 <= x1 or y2 <= y1:
+        return image, (0, 0, w, h)
+    return image[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
 
 
 def extract_cam_multi_layer(
@@ -14,7 +35,9 @@ def extract_cam_multi_layer(
     yolo_bbox: Tuple[float, float, float, float],
     class_id: int,
     layer_config: Dict,
-    qc_config: Dict
+    qc_config: Dict,
+    bbox_xyxy: Optional[Tuple[float, float, float, float]] = None,
+    orig_shape: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Dict]:
     """Extract CAM from multiple layers (primary/secondary) simultaneously.
     
@@ -30,11 +53,10 @@ def extract_cam_multi_layer(
                 'secondary': {'name': str, 'role': str, 'required': bool}
             }
         qc_config: Dict with QC thresholds:
-            {
-                'finite_ratio_threshold': float,
-                'cam_sum_epsilon': float,
-                'cam_var_epsilon': float
-            }
+            {'finite_ratio_threshold', 'cam_sum_epsilon', 'cam_var_epsilon'}
+        bbox_xyxy: Optional (x1, y1, x2, y2) in image pixels. If set with orig_shape,
+            Grad-CAM is run on a crop of this region only (gradient only inside bbox).
+        orig_shape: Optional (height, width) of the full image. Required when bbox_xyxy is set.
     
     Returns:
         Dict mapping layer_role -> result dict:
@@ -50,6 +72,14 @@ def extract_cam_multi_layer(
         }
     """
     results = {}
+    # Bbox-ROI mode: run Grad-CAM on crop so gradient flows only inside bbox
+    use_bbox_roi = bbox_xyxy is not None and orig_shape is not None
+    if use_bbox_roi:
+        crop_img, _ = _crop_to_bbox(image, bbox_xyxy)
+        roi_yolo_bbox = (0.5, 0.5, 1.0, 1.0)  # whole crop = object
+    else:
+        crop_img = image
+        roi_yolo_bbox = yolo_bbox
     
     for layer_role, layer_info in layer_config.items():
         if layer_role not in gradcam_instances:
@@ -74,9 +104,23 @@ def extract_cam_multi_layer(
         exc_msg = None
         traceback_last_lines = None
         
-        # Try to extract CAM
+        # Try to extract CAM (on crop in bbox-ROI mode, else full image)
         try:
-            cam, letterbox_meta = gradcam.generate_cam(image, yolo_bbox, class_id)
+            cam, letterbox_meta = gradcam.generate_cam(crop_img, roi_yolo_bbox, class_id)
+            if use_bbox_roi and cam is not None:
+                # Build full-image CAM: zeros except bbox region (resized crop CAM)
+                orig_h, orig_w = orig_shape
+                x1, y1, x2, y2 = [int(round(v)) for v in bbox_xyxy]
+                x1 = max(0, min(x1, orig_w - 1))
+                y1 = max(0, min(y1, orig_h - 1))
+                x2 = max(0, min(x2, orig_w))
+                y2 = max(0, min(y2, orig_h))
+                bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+                cam_resized = cv2.resize(cam, (bw, bh), interpolation=cv2.INTER_LINEAR)
+                cam_full = np.zeros((orig_h, orig_w), dtype=cam.dtype)
+                cam_full[y1:y2, x1:x2] = cam_resized
+                cam = cam_full
+                letterbox_meta = None
         except RuntimeError as e:
             import traceback
             exc_type = type(e).__name__

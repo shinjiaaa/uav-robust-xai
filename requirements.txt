@@ -30,3 +30,6 @@ openai>=1.0.0
 # Utilities
 tqdm>=4.65.0
 requests>=2.31.0
+
+# Heatmap viewer UI
+flask>=3.0.0

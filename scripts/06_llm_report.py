@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.report.llm_report import generate_report_with_llm, save_report
 from src.utils.io import load_yaml
-import json
+import json  # for lead_stats.json
 
 
 def load_metrics(config):
@@ -86,6 +86,23 @@ def load_metrics(config):
         metrics['cam_metrics'] = pd.read_csv(cam_metrics_csv).to_dict('records')
     else:
         metrics['cam_metrics'] = []
+    
+    # Lead analysis (z-score collapse, sign test, permutation test)
+    lead_stats_json = results_root / "lead_stats.json"
+    if lead_stats_json.exists():
+        try:
+            with open(lead_stats_json, encoding='utf-8') as f:
+                metrics['lead_stats'] = json.load(f)
+        except Exception:
+            metrics['lead_stats'] = {}
+    else:
+        metrics['lead_stats'] = {}
+    
+    lead_table_csv = results_root / "lead_table.csv"
+    if lead_table_csv.exists() and lead_table_csv.stat().st_size > 0:
+        metrics['lead_table'] = pd.read_csv(lead_table_csv).to_dict('records')
+    else:
+        metrics['lead_table'] = []
     
     return metrics
 

@@ -54,6 +54,8 @@ def create_cam_record(
     activation_spread: Optional[float] = None,
     center_shift: Optional[float] = None,
     energy_in_bbox: Optional[float] = None,
+    activation_fragmentation: Optional[float] = None,  # Tiny-object: entropy within bbox
+    bbox_center_activation_distance: Optional[float] = None,  # Tiny-object: distance bbox center to activation CoM
     
     # Performance (from detection)
     detected: Optional[int] = None,  # 0 or 1
@@ -124,6 +126,8 @@ def create_cam_record(
         'activation_spread': activation_spread,
         'center_shift': center_shift,
         'energy_in_bbox': energy_in_bbox,
+        'activation_fragmentation': activation_fragmentation,
+        'bbox_center_activation_distance': bbox_center_activation_distance,
         
         # Performance
         'detected': detected,

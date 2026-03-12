@@ -1700,6 +1700,9 @@ def summarize_metrics(metrics: Dict) -> Dict:
     # Keep gradcam error summary (optional)
     summarized['gradcam_errors'] = metrics.get('gradcam_errors', [])[:200]
 
+    # Lead analysis statistics (sign test, permutation test) from 07_lead_analysis.py
+    summarized['lead_stats'] = metrics.get('lead_stats', {})
+
     return summarized
 
 import numpy as np

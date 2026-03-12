@@ -124,12 +124,24 @@ risk_detection:
   score_drop_relative_threshold: 0.15  # relative score drop threshold (15% of baseline) - useful for lowlight
   iou_drop_relative_threshold: 0.15  # relative IoU drop threshold (15% of baseline) - useful for lowlight
   instability_threshold: 0.3  # variance threshold for instability detection (across severities)
+  # Z-score performance collapse (baseline = severity 0): use when true for "collapse" definition
+  use_z_score_performance: true
+  perf_collapse_z_threshold: -2.0  # score_drop_z or iou_drop_z < this -> performance collapse
+
+# Collapse definition (z-score vs baseline severity 0) - for CAM lead analysis
+collapse_detection:
+  cam_z_threshold: 2.0  # |z| >= this -> CAM collapse (entropy_z, energy_z, etc.)
+  perf_z_threshold: -2.0  # score_drop_z or iou_drop_z < this -> performance collapse
+  cam_metrics: ["energy_in_bbox", "activation_spread", "entropy", "center_shift"]
+  min_metrics_for_ensemble: 2  # require this many metrics with |z|>=threshold for ensemble collapse
   
 # Grad-CAM (failure-event based)
 # B-1/B-3: CAM coverage - n_expected_frames = severity window length (not always 5).
 # cam_mode: full (all 0..4) | risk_window (onset-1..onset+1) | stratified (sample). Currently risk_events define window.
 gradcam:
   enabled: true
+  # Run Grad-CAM on bbox crop only (gradient flows only inside tiny object region)
+  use_bbox_roi: true
   # Layer configuration (primary/secondary approach)
   layers:
     primary:
@@ -151,7 +163,7 @@ gradcam:
   top_k_percent: 10
   save_samples: true
   max_samples: null  # RQ1: null = process all risk events. Set to number to cap (e.g. 20 for debug).
-  metrics: ["energy_in_bbox", "activation_spread", "entropy", "center_shift"]  # CAM distribution metrics
+  metrics: ["energy_in_bbox", "activation_spread", "entropy", "center_shift", "activation_fragmentation", "bbox_center_activation_distance"]  # CAM metrics (tiny-object friendly)
   # Dynamic refinement: analyze failure region in detail
   dynamic_refinement:
     enabled: true

@@ -75,6 +75,11 @@ def main():
             'required': True  # Required for complete analysis
         },
         {
+            'name': '5.5. Lead analysis (z-score collapse, t_cam/t_perf/lead, sign & permutation test)',
+            'script': 'scripts/07_lead_analysis.py',
+            'required': False  # Optional: needs cam_records and failure_events
+        },
+        {
             'name': '6. DASC 산출물 생성 (IoU curve, mAP, 성능 저하 vs Grad-CAM 붕괴 비교)',
             'script': 'scripts/08_dasc_deliverables.py',
             'required': True

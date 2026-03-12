@@ -416,6 +416,7 @@ def main():
                 with Image.open(image_path) as pil_image:
                     # Check image size before processing
                     w, h = pil_image.size
+                    orig_w, orig_h = w, h  # keep for bbox scaling (bbox is in original image coords)
                     pixel_count = w * h
                     
                     # CRITICAL: Very aggressive size limit for memory-constrained systems
@@ -545,8 +546,21 @@ def main():
                     print(f"[DBG] SHAPE MISMATCH: {image_id} severity {severity}: expected {baseline_shape}, got {current_shape}")
             
             # Stage B: Extract CAM from multiple layers (primary/secondary)
+            # visdrone_bbox is in ORIGINAL image pixels (annotation / tiny_obj from 01)
             visdrone_bbox = tiny_obj['bbox']  # (left, top, width, height) in pixels
-            yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
+            # If tiny_obj has stored dimensions, bbox is in that space; scale to loaded image if different
+            ref_w = tiny_obj.get('img_width') or orig_w
+            ref_h = tiny_obj.get('img_height') or orig_h
+            if (ref_w, ref_h) != (orig_w, orig_h):
+                # Scale bbox from (ref_w, ref_h) to (orig_w, orig_h)
+                visdrone_bbox = (
+                    visdrone_bbox[0] * orig_w / ref_w,
+                    visdrone_bbox[1] * orig_h / ref_h,
+                    visdrone_bbox[2] * orig_w / ref_w,
+                    visdrone_bbox[3] * orig_h / ref_h,
+                )
+            # Normalize to [0,1] using ORIGINAL loaded image size (not resized); aspect ratio preserved so same for model
+            yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, orig_w, orig_h)
             
             # CRITICAL (RQ1): Determine CAM target class_id based on matched status (per severity)
             # For RQ1, we need CAM even when matched=0 (miss) to analyze failure regions
@@ -577,6 +591,16 @@ def main():
                         cam_target_type = "gt_class_miss"
                         # Note: This allows CAM generation for miss cases, critical for RQ1
             
+            # Bbox-ROI: gradient only inside tiny object bbox (crop → CAM → paste to full-size)
+            use_bbox_roi = gradcam_config.get('use_bbox_roi', False)
+            bbox_xyxy_scaled = None
+            if use_bbox_roi:
+                bbox_xyxy_scaled = (
+                    visdrone_bbox[0] * img_width / orig_w,
+                    visdrone_bbox[1] * img_height / orig_h,
+                    (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
+                    (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
+                )
             # Extract CAMs from all configured layers
             cam_results = extract_cam_multi_layer(
                 gradcam_instances,
@@ -584,7 +608,9 @@ def main():
                 yolo_bbox,
                 cam_target_class_id,  # Use determined target class_id
                 layer_config,
-                qc_config
+                qc_config,
+                bbox_xyxy=bbox_xyxy_scaled,
+                orig_shape=(img_height, img_width) if use_bbox_roi else None,
             )
             
             # CRITICAL: Force garbage collection after CAM generation
@@ -691,12 +717,12 @@ def main():
                 # RQ1: Compute metrics for all CAMs (including flat/noisy/low_energy)
                 # Only skip if extraction failed (system error)
                 if cam is not None and baseline_cams.get(layer_role) is not None:
-                    # Convert visdrone bbox to xyxy format
+                    # Bbox in current image coords (image may be resized; visdrone_bbox is in original)
                     bbox_xyxy = (
-                        visdrone_bbox[0],
-                        visdrone_bbox[1],
-                        visdrone_bbox[0] + visdrone_bbox[2],
-                        visdrone_bbox[1] + visdrone_bbox[3]
+                        visdrone_bbox[0] * img_width / orig_w,
+                        visdrone_bbox[1] * img_height / orig_h,
+                        (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
+                        (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
                     )
                     
                     # Add original image dimensions to letterbox_meta
@@ -761,6 +787,8 @@ def main():
                         activation_spread=float(metrics['activation_spread']),
                         center_shift=float(metrics['center_shift']),
                         energy_in_bbox=float(metrics['energy_in_bbox']),
+                        activation_fragmentation=float(metrics.get('activation_fragmentation', 0.0)),
+                        bbox_center_activation_distance=float(metrics.get('bbox_center_activation_distance', 0.0)),
                         letterbox_meta=letterbox_meta,
                         # QC diagnostic stats (for consistency and debugging)
                         cam_min=cam_min,
@@ -788,7 +816,8 @@ def main():
                             heatmap_dir = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples'))
                             safe_uid = str(object_uid).replace('/', '_').replace('\\', '_')[:80]
                             overlay_path = heatmap_dir / model_name / corruption / f"L{severity}" / f"{image_id}_{safe_uid}.png"
-                            save_cam_overlay(cam, image, letterbox_meta, overlay_path)
+                            # Tiny object: apply heatmap only inside GT bbox, not full image
+                            save_cam_overlay(cam, image, letterbox_meta, overlay_path, bbox_xyxy=bbox_xyxy)
                 
                 # Clean up CAM for this layer
                 if cam is not None:
@@ -1156,7 +1185,15 @@ def main():
                     print(f"  [ERROR] Image loading error: {e}")
                     gc.collect()
                     continue
+                # Bbox in annotation/tiny_obj space; scale to current (possibly resized) image
                 visdrone_bbox = tiny_obj['bbox']
+                ref_w = tiny_obj.get('img_width') or img_width
+                ref_h = tiny_obj.get('img_height') or img_height
+                if (ref_w, ref_h) != (img_width, img_height):
+                    visdrone_bbox = (
+                        visdrone_bbox[0] * img_width / ref_w, visdrone_bbox[1] * img_height / ref_h,
+                        visdrone_bbox[2] * img_width / ref_w, visdrone_bbox[3] * img_height / ref_h,
+                    )
                 yolo_bbox = visdrone_to_yolo_bbox(visdrone_bbox, img_width, img_height)
                 
                 try:

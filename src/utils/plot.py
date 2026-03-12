@@ -114,9 +114,13 @@ def save_cam_overlay(
     image: np.ndarray,
     letterbox_meta: Optional[Dict],
     output_path: Path,
-    alpha: float = 0.5
+    alpha: float = 0.5,
+    bbox_xyxy: Optional[tuple] = None,
 ) -> bool:
-    """Save Grad-CAM heatmap overlay on image (DASC prototype용).
+    """Save Grad-CAM heatmap overlay on image.
+    
+    When bbox_xyxy is provided (tiny object), heatmap is applied ONLY inside that bbox;
+    the rest of the image stays unchanged. When bbox_xyxy is None, full-image overlay (legacy).
     
     Args:
         cam: CAM heatmap (H, W) in letterbox/preprocessed space
@@ -124,13 +128,14 @@ def save_cam_overlay(
         letterbox_meta: Dict with scale, pad_left, pad_top, target_size
         output_path: Path to save overlay image
         alpha: Blend factor for heatmap (0-1)
+        bbox_xyxy: Optional (x1, y1, x2, y2) in original image pixels. If set, only this region gets the heatmap.
     Returns:
         True if saved successfully
     """
     try:
         orig_h, orig_w = image.shape[:2]
         cam_h, cam_w = cam.shape[:2]
-        
+
         if letterbox_meta:
             scale = letterbox_meta.get('scale', 1.0)
             pad_left = int(letterbox_meta.get('pad_left', 0))
@@ -143,19 +148,38 @@ def save_cam_overlay(
             cam_resized = cv2.resize(cam_crop, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
         else:
             cam_resized = cv2.resize(cam, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-        
+
         cam_uint8 = (cam_resized * 255).astype(np.uint8)
         heatmap = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET)
         if len(image.shape) >= 3 and image.shape[2] == 3:
             heatmap_rgb = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-            img_rgb = image if image.shape[2] == 3 else cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # Assume image from cv2.imread is BGR; use RGB for blending
+            img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).copy()
         else:
             heatmap_rgb = heatmap
-            img_rgb = image
-        overlay = np.clip(
-            alpha * heatmap_rgb.astype(np.float32) + (1 - alpha) * img_rgb.astype(np.float32),
-            0, 255
-        ).astype(np.uint8)
+            img_rgb = image.copy()
+
+        if bbox_xyxy is not None and len(bbox_xyxy) == 4:
+            # Tiny object: apply heatmap ONLY inside bbox (original image coords)
+            x1, y1, x2, y2 = [int(round(v)) for v in bbox_xyxy]
+            x1 = max(0, min(x1, orig_w - 1))
+            y1 = max(0, min(y1, orig_h - 1))
+            x2 = max(0, min(x2, orig_w))
+            y2 = max(0, min(y2, orig_h))
+            if x2 > x1 and y2 > y1:
+                patch_heat = heatmap_rgb[y1:y2, x1:x2].astype(np.float32)
+                patch_img = img_rgb[y1:y2, x1:x2].astype(np.float32)
+                blended = np.clip(
+                    alpha * patch_heat + (1 - alpha) * patch_img, 0, 255
+                ).astype(np.uint8)
+                img_rgb[y1:y2, x1:x2] = blended
+            overlay = img_rgb
+        else:
+            overlay = np.clip(
+                alpha * heatmap_rgb.astype(np.float32) + (1 - alpha) * img_rgb.astype(np.float32),
+                0, 255
+            ).astype(np.uint8)
+
         overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(output_path), overlay_bgr)

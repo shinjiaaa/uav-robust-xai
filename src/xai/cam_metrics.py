@@ -149,6 +149,66 @@ def compute_center_shift(
     return distance / max_distance
 
 
+def compute_activation_fragmentation(
+    cam: np.ndarray,
+    bbox_xyxy_cam: Tuple[float, float, float, float],
+) -> float:
+    """
+    Fragmentation of activation inside bbox: entropy of the activation distribution
+    within the bbox (normalized to sum=1). Higher = more dispersed/fragmented.
+
+    Args:
+        cam: CAM heatmap (H, W)
+        bbox_xyxy_cam: (x1, y1, x2, y2) in CAM pixel coordinates
+
+    Returns:
+        Entropy value (non-negative)
+    """
+    x1, y1, x2, y2 = bbox_xyxy_cam
+    x1, x2 = int(max(0, x1)), int(min(cam.shape[1], x2))
+    y1, y2 = int(max(0, y1)), int(min(cam.shape[0], y2))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    crop = cam[y1:y2, x1:x2]
+    flat = crop.flatten() + 1e-10
+    flat = flat / flat.sum()
+    return float(entropy(flat))
+
+
+def compute_bbox_center_activation_distance(
+    cam: np.ndarray,
+    bbox_xyxy_cam: Tuple[float, float, float, float],
+    threshold: float = 0.1,
+) -> float:
+    """
+    Distance between bbox center and activation center of mass (single CAM).
+    Tiny-object friendly: measures how much activation drifts from the GT bbox center.
+
+    Args:
+        cam: CAM heatmap (H, W)
+        bbox_xyxy_cam: (x1, y1, x2, y2) in CAM pixel coordinates
+        threshold: relative threshold for activation (fraction of max)
+
+    Returns:
+        Normalized distance (0 = aligned, 1 = diagonal)
+    """
+    if cam.max() == 0:
+        return 0.0
+    cam_norm = cam / cam.max()
+    activated = cam_norm >= threshold
+    if not np.any(activated):
+        return 0.0
+    y_coords, x_coords = np.where(activated)
+    act_cy = np.mean(y_coords)
+    act_cx = np.mean(x_coords)
+    x1, y1, x2, y2 = bbox_xyxy_cam
+    bbox_cy = (y1 + y2) / 2.0
+    bbox_cx = (x1 + x2) / 2.0
+    dist = np.sqrt((act_cy - bbox_cy) ** 2 + (act_cx - bbox_cx) ** 2)
+    max_dist = np.sqrt(cam.shape[0] ** 2 + cam.shape[1] ** 2)
+    return float(dist / max_dist) if max_dist > 0 else 0.0
+
+
 def compute_cam_metrics(
     cam: np.ndarray,
     bbox_xyxy: Tuple[float, float, float, float],
@@ -214,5 +274,16 @@ def compute_cam_metrics(
         metrics['center_shift'] = compute_center_shift(baseline_cam, cam)
     else:
         metrics['center_shift'] = 0.0
-    
+
+    # Tiny-object structural metrics
+    bbox_cam_tuple = (x1_cam, y1_cam, x2_cam, y2_cam)
+    try:
+        metrics['activation_fragmentation'] = compute_activation_fragmentation(cam, bbox_cam_tuple)
+    except Exception:
+        metrics['activation_fragmentation'] = 0.0
+    try:
+        metrics['bbox_center_activation_distance'] = compute_bbox_center_activation_distance(cam, bbox_cam_tuple)
+    except Exception:
+        metrics['bbox_center_activation_distance'] = 0.0
+
     return metrics
