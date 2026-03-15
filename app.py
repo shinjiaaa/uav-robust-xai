@@ -110,17 +110,24 @@ def api_images(model, corruption, severity):
 
 @app.route("/api/models/<model>/<corruption>/samples")
 def api_samples(model, corruption):
-    """List sample IDs (same image across severities). Union from all L0..L4 folders."""
+    """List sample IDs that have L0–L4 all present (intersection). Only these are shown in the UI."""
     base = HEATMAP_DIR / model / corruption
     if not base.exists() or not base.is_dir():
         return jsonify(samples=[]), 404
-    seen = set()
+    by_level = {}
     for p in sorted(base.iterdir()):
         if p.is_dir() and p.name.startswith("L"):
-            for f in p.iterdir():
-                if f.suffix.lower() in (".png", ".jpg", ".jpeg"):
-                    seen.add(f.name)
-    return jsonify(samples=sorted(seen))
+            by_level[p.name] = {
+                f.name for f in p.iterdir()
+                if f.suffix.lower() in (".png", ".jpg", ".jpeg")
+            }
+    required = ["L0", "L1", "L2", "L3", "L4"]
+    if not all(lev in by_level for lev in required):
+        return jsonify(samples=[])
+    full = by_level["L0"]
+    for lev in required[1:]:
+        full = full & by_level[lev]
+    return jsonify(samples=sorted(full))
 
 
 @app.route("/api/models/<model>/<corruption>/sample/<path:sample_id>")

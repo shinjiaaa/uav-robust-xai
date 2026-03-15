@@ -131,6 +131,10 @@ def main():
     gradcam_config = config['gradcam']
     layer_config = gradcam_config.get('layers', {})
     qc_config = gradcam_config.get('quality_gate', {})
+    if gradcam_config.get('use_bbox_roi', False):
+        print("[INFO] Grad-CAM bbox-ROI mode: ON — heatmap is computed only for the selected tiny object (crop), not the whole image.")
+    else:
+        print("[INFO] Grad-CAM bbox-ROI mode: OFF — heatmap is computed on the full image. Set gradcam.use_bbox_roi: true for single-object CAM.")
     
     # New schema: cam_records (replaces cam_metrics_records)
     cam_records = []
@@ -755,6 +759,23 @@ def main():
                 if severity == 0:
                     baseline_cams[layer_role] = cam.copy() if cam is not None else None
                 
+                # L0–L4 heatmap 저장: 전체 이미지 반환, heatmap은 해당 tiny object bbox 안에만 적용
+                if layer_role == 'primary' and cam is not None:
+                    dasc_cfg = config.get('dasc', {})
+                    save_overlays = dasc_cfg.get('save_heatmap_overlays', False) or gradcam_config.get('save_samples', False)
+                    if save_overlays:
+                        bbox_xyxy_for_overlay = (
+                            visdrone_bbox[0] * img_width / orig_w,
+                            visdrone_bbox[1] * img_height / orig_h,
+                            (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
+                            (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
+                        )
+                        heatmap_dir = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples'))
+                        safe_uid = str(object_uid).replace('/', '_').replace('\\', '_')[:80]
+                        overlay_path = heatmap_dir / model_name / corruption / f"L{severity}" / f"{image_id}_{safe_uid}.png"
+                        # 전체 이미지 + bbox 안에만 heatmap (Grad-CAM은 해당 tiny object에 대해서만 계산됨)
+                        save_cam_overlay(cam, image, letterbox_meta, overlay_path, bbox_xyxy=bbox_xyxy_for_overlay)
+                
                 # Stage D: Compute metrics (layer-invariant)
                 # RQ1: Compute metrics for all CAMs (including flat/noisy/low_energy)
                 # Only skip if extraction failed (system error)
@@ -851,15 +872,6 @@ def main():
                     cam_records.append(record)
                     if layer_role == 'primary':
                         corruption_cam_stats[corruption]['success'] += 1
-                        # DASC: Save heatmap overlay for prototype (원본/변조별 이미지+Heatmap)
-                        dasc_cfg = config.get('dasc', {})
-                        save_overlays = dasc_cfg.get('save_heatmap_overlays', False) or gradcam_config.get('save_samples', False)
-                        if save_overlays and cam is not None and letterbox_meta is not None:
-                            heatmap_dir = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples'))
-                            safe_uid = str(object_uid).replace('/', '_').replace('\\', '_')[:80]
-                            overlay_path = heatmap_dir / model_name / corruption / f"L{severity}" / f"{image_id}_{safe_uid}.png"
-                            # Tiny object: apply heatmap only inside GT bbox, not full image
-                            save_cam_overlay(cam, image, letterbox_meta, overlay_path, bbox_xyxy=bbox_xyxy)
                 
                 # Clean up CAM for this layer
                 if cam is not None:
