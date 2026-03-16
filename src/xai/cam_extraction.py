@@ -72,7 +72,8 @@ def extract_cam_multi_layer(
         }
     """
     results = {}
-    # Bbox-ROI mode: run Grad-CAM on crop so gradient flows only inside bbox
+    # Bbox-ROI mode: run Grad-CAM on crop only (not recommended for gradual-curve analysis;
+    # use full-image CAM so attention leakage and distance metrics are meaningful).
     use_bbox_roi = bbox_xyxy is not None and orig_shape is not None
     if use_bbox_roi:
         crop_img, _ = _crop_to_bbox(image, bbox_xyxy)

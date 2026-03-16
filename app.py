@@ -36,6 +36,43 @@ HEATMAP_DIR = get_heatmap_dir()
 RESULTS_DIR = ROOT / "results"
 
 
+def get_xai_methods_from_config():
+    """Read gradcam.xai_methods from experiment.yaml so FastCAM etc. show even before folders exist."""
+    config_path = ROOT / "configs" / "experiment.yaml"
+    if not config_path.exists():
+        return ["gradcam"]
+    try:
+        config = load_yaml(config_path)
+        methods = config.get("gradcam", {}).get("xai_methods")
+        if isinstance(methods, list) and methods:
+            return list(methods)
+    except Exception:
+        pass
+    return ["gradcam"]
+
+
+def get_xai_methods():
+    """XAI methods to show in UI: config list + existing heatmap subdirs (so FastCAM shows if in config)."""
+    from_config = get_xai_methods_from_config()
+    existing = []
+    if HEATMAP_DIR.exists():
+        for p in sorted(HEATMAP_DIR.iterdir()):
+            if p.is_dir() and not p.name.startswith("."):
+                existing.append(p.name)
+    if not existing:
+        return from_config
+    if "gradcam" in existing or "fastcam" in existing:
+        return sorted(set(existing) | set(from_config))
+    return from_config
+
+
+def get_heatmap_base(xai_method=None):
+    """Heatmap root for an XAI method. If xai_method is set and HEATMAP_DIR/xai_method exists, use it; else HEATMAP_DIR (legacy)."""
+    if xai_method and (HEATMAP_DIR / xai_method).exists() and (HEATMAP_DIR / xai_method).is_dir():
+        return HEATMAP_DIR / xai_method
+    return HEATMAP_DIR
+
+
 def get_metrics():
     """Load lead_stats and dasc_summary from results dir if present."""
     out = {"lead_stats": None, "dasc_summary": None}
@@ -60,19 +97,31 @@ def get_metrics():
 def index():
     """Model list + viewer."""
     models = []
+    existing = []
     if HEATMAP_DIR.exists():
         for p in sorted(HEATMAP_DIR.iterdir()):
             if p.is_dir() and not p.name.startswith("."):
-                models.append(p.name)
-    return render_template_string(INDEX_HTML, models=models, heatmap_dir=str(HEATMAP_DIR))
+                existing.append(p.name)
+    xai_methods = get_xai_methods()
+    if existing and "gradcam" not in existing and "fastcam" not in existing:
+        models = existing
+    return render_template_string(INDEX_HTML, models=models, heatmap_dir=str(HEATMAP_DIR), xai_methods=xai_methods)
+
+
+@app.route("/api/xai_methods")
+def api_xai_methods():
+    """List XAI method names from config + existing heatmap subdirs (so FastCAM shows if in config)."""
+    return jsonify(xai_methods=get_xai_methods())
 
 
 @app.route("/api/models")
 def api_models():
-    """List model names (subdirs of heatmap_samples)."""
+    """List model names. Optional query: xai_method (e.g. gradcam, fastcam)."""
+    xai_method = request.args.get("xai_method", "").strip() or None
+    base = get_heatmap_base(xai_method)
     models = []
-    if HEATMAP_DIR.exists():
-        for p in sorted(HEATMAP_DIR.iterdir()):
+    if base.exists():
+        for p in sorted(base.iterdir()):
             if p.is_dir() and not p.name.startswith("."):
                 models.append(p.name)
     return jsonify(models=models)
@@ -80,18 +129,22 @@ def api_models():
 
 @app.route("/api/models/<model>/corruptions")
 def api_corruptions(model):
-    """List corruptions for a model."""
-    path = HEATMAP_DIR / model
+    """List corruptions for a model. Optional query: xai_method. Tries HEATMAP_DIR/model if method subdir missing (legacy)."""
+    xai_method = request.args.get("xai_method", "").strip() or None
+    path = get_heatmap_base(xai_method) / model
     if not path.exists() or not path.is_dir():
-        return jsonify(corruptions=[]), 404
+        path = HEATMAP_DIR / model
+    if not path.exists() or not path.is_dir():
+        return jsonify(corruptions=[]), 200
     corruptions = [p.name for p in sorted(path.iterdir()) if p.is_dir() and not p.name.startswith(".")]
     return jsonify(corruptions=corruptions)
 
 
 @app.route("/api/models/<model>/<corruption>/severities")
 def api_severities(model, corruption):
-    """List severity folders (L0..L4) for model/corruption."""
-    path = HEATMAP_DIR / model / corruption
+    """List severity folders (L0..L4) for model/corruption. Optional query: xai_method."""
+    xai_method = request.args.get("xai_method", "").strip() or None
+    path = get_heatmap_base(xai_method) / model / corruption
     if not path.exists() or not path.is_dir():
         return jsonify(severities=[]), 404
     severities = [p.name for p in sorted(path.iterdir()) if p.is_dir() and p.name.startswith("L")]
@@ -100,18 +153,32 @@ def api_severities(model, corruption):
 
 @app.route("/api/models/<model>/<corruption>/<severity>/images")
 def api_images(model, corruption, severity):
-    """List image filenames for model/corruption/severity."""
-    path = HEATMAP_DIR / model / corruption / severity
+    """List image filenames for model/corruption/severity. Optional query: xai_method."""
+    xai_method = request.args.get("xai_method", "").strip() or None
+    path = get_heatmap_base(xai_method) / model / corruption / severity
     if not path.exists() or not path.is_dir():
         return jsonify(images=[]), 404
     images = [p.name for p in sorted(path.iterdir()) if p.suffix.lower() in (".png", ".jpg", ".jpeg")]
     return jsonify(images=images)
 
 
+def _load_ideal_trend_samples():
+    """Load ideal_trend_samples.json (이상적 추세만 샘플 목록)."""
+    p = RESULTS_DIR / "ideal_trend_samples.json"
+    if not p.exists() or p.stat().st_size == 0:
+        return None
+    try:
+        from src.utils.io import load_json
+        return load_json(p)
+    except Exception:
+        return None
+
+
 @app.route("/api/models/<model>/<corruption>/samples")
 def api_samples(model, corruption):
-    """List sample IDs that have L0–L4 all present (intersection). Only these are shown in the UI."""
-    base = HEATMAP_DIR / model / corruption
+    """List sample IDs that have L0–L4 all present (intersection). ideal_only=1이면 이상적 추세만. Optional query: xai_method."""
+    xai_method = request.args.get("xai_method", "").strip() or None
+    base = get_heatmap_base(xai_method) / model / corruption
     if not base.exists() or not base.is_dir():
         return jsonify(samples=[]), 404
     by_level = {}
@@ -127,24 +194,207 @@ def api_samples(model, corruption):
     full = by_level["L0"]
     for lev in required[1:]:
         full = full & by_level[lev]
-    return jsonify(samples=sorted(full))
+    samples = sorted(full)
+    ideal_only = request.args.get("ideal_only", "").strip().lower() in ("1", "true", "yes")
+    if ideal_only:
+        ideal = _load_ideal_trend_samples()
+        if ideal and isinstance(ideal, dict):
+            ideal_list = ideal.get(str(model), {}).get(str(corruption))
+            if ideal_list:
+                ideal_set = set(ideal_list)
+                samples = sorted(s for s in samples if s in ideal_set)
+    return jsonify(samples=samples)
 
 
 @app.route("/api/models/<model>/<corruption>/sample/<path:sample_id>")
 def api_sample_severities(model, corruption, sample_id):
-    """For one sample (filename), return severities that have it and image URLs."""
-    base = HEATMAP_DIR / model / corruption
+    """For one sample (filename), return severities that have it and image URLs. Optional query: xai_method."""
+    xai_method = request.args.get("xai_method", "").strip() or None
+    base = get_heatmap_base(xai_method) / model / corruption
     if not base.exists() or not base.is_dir():
         return jsonify(severities=[]), 404
     if not (sample_id.endswith(".png") or sample_id.endswith(".jpg") or sample_id.endswith(".jpeg")):
         sample_id = sample_id + ".png"
+    prefix = f"{xai_method}/" if xai_method and (HEATMAP_DIR / xai_method).exists() else ""
     result = []
     for p in sorted(base.iterdir()):
         if p.is_dir() and p.name.startswith("L"):
             f = p / sample_id
             if f.exists() and f.is_file():
-                result.append({"severity": p.name, "url": f"/heatmaps/{model}/{corruption}/{p.name}/{sample_id}"})
+                result.append({"severity": p.name, "url": f"/heatmaps/{prefix}{model}/{corruption}/{p.name}/{sample_id}"})
     return jsonify(severities=result)
+
+
+def _load_cam_records_df():
+    """Load cam_records.csv once and cache per process."""
+    if not hasattr(_load_cam_records_df, "_df"):
+        p = RESULTS_DIR / "cam_records.csv"
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                import pandas as pd
+                _load_cam_records_df._df = pd.read_csv(p)
+            except Exception:
+                _load_cam_records_df._df = None
+        else:
+            _load_cam_records_df._df = None
+    return _load_cam_records_df._df
+
+
+# Grad-CAM metrics to show (and compute change rate from L0)
+CAM_METRIC_KEYS = [
+    "bbox_center_activation_distance", "peak_bbox_distance",
+    "entropy", "activation_spread", "center_shift",
+    "activation_fragmentation", "energy_in_bbox", "energy_in_bbox_1_1x", "energy_in_bbox_1_25x",
+    "ring_energy_ratio",
+    "full_cam_sum", "full_cam_entropy",
+]
+
+
+@app.route("/api/models/<model>/<corruption>/sample/<path:sample_id>/cam_metrics")
+def api_sample_cam_metrics(model, corruption, sample_id):
+    """Return Grad-CAM metrics per severity (L0..L4) and change rate from L0 for one sample. Optional query: xai_method."""
+    sample_id_base = sample_id
+    if sample_id_base.endswith(".png") or sample_id_base.endswith(".jpg") or sample_id_base.endswith(".jpeg"):
+        sample_id_base = sample_id_base.rsplit(".", 1)[0]
+    df = _load_cam_records_df()
+    if df is None or len(df) == 0:
+        return jsonify(severities=[])
+    xai_method = request.args.get("xai_method", "").strip() or None
+    model_col = "model_id" if "model_id" in df.columns else "model"
+    if model_col not in df.columns:
+        return jsonify(severities=[])
+    subset = df[
+        (df[model_col].astype(str) == str(model)) &
+        (df["corruption"].astype(str) == str(corruption))
+    ].copy()
+    if "xai_method" in subset.columns:
+        if xai_method:
+            subset = subset[subset["xai_method"].astype(str) == str(xai_method)]
+        else:
+            # 기본값: gradcam (fastcam이 먼저 있으면 0만 나오는 것 방지)
+            subset = subset[subset["xai_method"].astype(str) == "gradcam"]
+    if "object_id" not in subset.columns:
+        subset["_key"] = subset["image_id"].astype(str)
+    else:
+        subset["_key"] = subset["image_id"].astype(str) + "_" + subset["object_id"].astype(str)
+    subset = subset[subset["_key"] == sample_id_base]
+    if "cam_status" in subset.columns:
+        subset = subset[subset["cam_status"] == "ok"]
+    if "layer_role" in subset.columns:
+        subset = subset[subset["layer_role"] == "primary"]
+    if len(subset) == 0:
+        return jsonify(severities=[])
+    # severity 컬럼이 문자열이어도 비교되도록 int로 통일
+    if "severity" in subset.columns:
+        subset = subset.copy()
+        subset["_sev"] = subset["severity"].astype(int)
+    else:
+        subset["_sev"] = subset["severity"]
+    out = []
+    for sev in range(5):
+        rows = subset[subset["_sev"] == sev]
+        if len(rows) == 0:
+            out.append({"severity": f"L{sev}", "metrics": None, "change_pct": None})
+            continue
+        # 여러 행(예: gradcam+fastcam)이면 이미 xai_method로 필터됐으므로 첫 행 사용
+        row = rows.iloc[0]
+        metrics = {}
+        for k in CAM_METRIC_KEYS:
+            if k in row.index and row.get(k) is not None and str(row.get(k)) != "nan":
+                try:
+                    metrics[k] = round(float(row[k]), 6)
+                except (TypeError, ValueError):
+                    pass
+        out.append({"severity": f"L{sev}", "metrics": metrics if metrics else None, "change_pct": None})
+    # Compute change % from L0
+    l0_metrics = out[0]["metrics"] or {}
+    for i in range(1, 5):
+        m = out[i]["metrics"]
+        if not m or not l0_metrics:
+            continue
+        change = {}
+        for k in CAM_METRIC_KEYS:
+            if k not in l0_metrics or k not in m:
+                continue
+            base_val = l0_metrics[k]
+            if base_val is None or base_val == 0:
+                continue
+            try:
+                pct = 100.0 * (float(m[k]) - float(base_val)) / float(base_val)
+                change[k] = round(pct, 2)
+            except (TypeError, ValueError):
+                pass
+        out[i]["change_pct"] = change if change else None
+    return jsonify(severities=out)
+
+
+# 변조별 전체 집계용 메트릭 (그래프 4개와 동일)
+# Primary for gradual curves: distance (continuous); E_bbox is auxiliary (bimodal for tiny objects)
+AGGREGATE_METRIC_KEYS = [
+    "bbox_center_activation_distance", "peak_bbox_distance",
+    "entropy", "activation_spread",
+    "energy_in_bbox_1_25x", "ring_energy_ratio",
+]
+
+
+@app.route("/api/aggregate/cam_metrics")
+def api_aggregate_cam_metrics():
+    """변조(corruption)별 전체 샘플 집계: L0~L4별 mean, std, n. Optional: model, xai_method."""
+    df = _load_cam_records_df()
+    if df is None or len(df) == 0:
+        return jsonify(corruptions=[])
+    model = request.args.get("model", "").strip() or None
+    xai_method = request.args.get("xai_method", "").strip() or None
+    model_col = "model_id" if "model_id" in df.columns else "model"
+    if model_col not in df.columns:
+        return jsonify(corruptions=[])
+    subset = df.copy()
+    if model:
+        subset = subset[subset[model_col].astype(str) == str(model)]
+    if "xai_method" in subset.columns:
+        if xai_method:
+            subset = subset[subset["xai_method"].astype(str) == str(xai_method)]
+        else:
+            # gradcam만 있으면 gradcam, 없으면 전체 사용 (집계가 비지 않도록)
+            subset_g = subset[subset["xai_method"].astype(str) == "gradcam"]
+            subset = subset_g if len(subset_g) > 0 else subset
+    if "cam_status" in subset.columns:
+        subset = subset[subset["cam_status"] == "ok"]
+    if "layer_role" in subset.columns:
+        subset = subset[subset["layer_role"] == "primary"]
+    subset = subset.copy()
+    subset["_sev"] = subset["severity"].astype(int)
+    # 변조별 · severity별 집계
+    out_corruptions = []
+    for corruption in sorted(subset["corruption"].unique()):
+        cdf = subset[subset["corruption"].astype(str) == str(corruption)]
+        by_sev = []
+        for sev in range(5):
+            rows = cdf[cdf["_sev"] == sev]
+            mean_dict = {}
+            std_dict = {}
+            n_dict = {}
+            for k in AGGREGATE_METRIC_KEYS:
+                if k not in rows.columns:
+                    continue
+                try:
+                    vals = rows[k].astype(float)
+                except (TypeError, ValueError):
+                    continue
+                vals = vals.replace([float("inf"), float("-inf")], float("nan")).dropna()
+                if len(vals) == 0:
+                    continue
+                mean_dict[k] = round(float(vals.mean()), 6)
+                std_dict[k] = round(float(vals.std()), 6) if len(vals) > 1 else 0.0
+                n_dict[k] = int(len(vals))
+            by_sev.append({
+                "severity": f"L{sev}",
+                "mean": mean_dict,
+                "std": std_dict,
+                "n": n_dict,
+            })
+        out_corruptions.append({"corruption": str(corruption), "by_severity": by_sev})
+    return jsonify(corruptions=out_corruptions)
 
 
 @app.route("/api/metrics")
@@ -323,6 +573,70 @@ INDEX_HTML = """<!DOCTYPE html>
       display: block;
       cursor: pointer;
     }
+    .comparison-section {
+      margin-top: 24px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+    }
+    .comparison-section h3 {
+      font-size: 0.95rem;
+      color: var(--accent);
+      margin: 0 0 12px 0;
+    }
+    .metrics-table-wrap {
+      overflow-x: auto;
+      margin-bottom: 20px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .metrics-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }
+    .metrics-table th, .metrics-table td {
+      padding: 8px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    .metrics-table th {
+      background: var(--bg);
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .metrics-table tr:hover td { background: rgba(0,212,170,0.06); }
+    .metrics-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .metrics-table .pct-pos { color: #7ee787; }
+    .metrics-table .pct-neg { color: #f97583; }
+    .charts-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      margin-top: 12px;
+    }
+    .chart-cell {
+      position: relative;
+      height: 200px;
+      background: var(--bg);
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      padding: 10px;
+    }
+    .chart-cell .chart-title {
+      font-size: 0.75rem;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    .chart-cell .chart-hint {
+      font-size: 0.65rem;
+      color: var(--muted);
+      font-weight: normal;
+      margin-left: 6px;
+    }
+    .chart-cell canvas {
+      width: 100% !important;
+      height: 160px !important;
+    }
     .empty-main {
       color: var(--muted);
       text-align: center;
@@ -343,12 +657,21 @@ INDEX_HTML = """<!DOCTYPE html>
     .modal.show { display: flex; }
     .modal img { max-width: 100%; max-height: 90vh; border-radius: 8px; }
     .modal .close { position: absolute; top: 16px; right: 24px; color: #fff; font-size: 28px; cursor: pointer; }
+
+    .aggregate-section { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+    .aggregate-section h2 { font-size: 1rem; color: var(--accent); margin: 0 0 12px 0; }
+    .aggregate-corruption { margin-bottom: 28px; padding: 16px; background: var(--bg); border-radius: 12px; border: 1px solid var(--border); }
+    .aggregate-corruption h3 { font-size: 0.95rem; color: var(--text); margin: 0 0 12px 0; }
+    .aggregate-corruption .agg-table-wrap { overflow-x: auto; margin-bottom: 16px; border-radius: 8px; border: 1px solid var(--border); }
+    .aggregate-corruption .agg-charts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 12px; }
+    .aggregate-corruption .agg-chart-cell { height: 200px; background: var(--card); border-radius: 8px; border: 1px solid var(--border); padding: 10px; }
+    .aggregate-corruption .agg-chart-cell .chart-title { font-size: 0.75rem; color: var(--accent); margin-bottom: 6px; }
   </style>
 </head>
 <body>
   <div class="header">
     <h1>Heatmap Viewer</h1>
-    <p class="subtitle">샘플 선택 후 동일 이미지의 변조 단계(L0~L4)별 Grad-CAM 비교 · 전체 실험 지표</p>
+    <p class="subtitle">XAI 방법(Grad-CAM / FastCAM) 선택 후 샘플별 변조 단계(L0~L4) 비교 · 지표·그래프</p>
   </div>
 
   <div id="metrics" class="metrics"></div>
@@ -357,12 +680,18 @@ INDEX_HTML = """<!DOCTYPE html>
     <aside class="sidebar">
       <div class="filters-inline">
         <div>
-          <label>모델</label>
-          <select id="model">
+          <label>XAI 방법</label>
+          <select id="xaiMethod">
             <option value="">선택</option>
-            {% for m in models %}
-            <option value="{{ m }}">{{ m }}</option>
+            {% for method in xai_methods %}
+            <option value="{{ method }}">{{ method }}</option>
             {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>모델</label>
+          <select id="model" disabled>
+            <option value="">선택</option>
           </select>
         </div>
         <div>
@@ -370,6 +699,10 @@ INDEX_HTML = """<!DOCTYPE html>
           <select id="corruption" disabled>
             <option value="">선택</option>
           </select>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="idealOnlyCheckbox" style="cursor:pointer;">
+          <label for="idealOnlyCheckbox" style="margin:0;cursor:pointer;font-size:0.8rem;color:var(--muted);">이상적 추세만 보기</label>
         </div>
       </div>
       <div class="sidebar-head">샘플 목록 (선택 시 동일 이미지 L0~L4 표시)</div>
@@ -379,8 +712,14 @@ INDEX_HTML = """<!DOCTYPE html>
     <main class="main">
       <div id="sampleTitle" class="sample-title" style="display:none;"></div>
       <div id="severityRow" class="severity-row"></div>
-      <div id="emptyMain" class="empty-main">모델 · Corruption를 선택한 뒤, 왼쪽 목록에서 샘플을 선택하세요.</div>
+      <div id="emptyMain" class="empty-main">모델을 선택하면 변조별 전체 통계가 표시됩니다. 샘플 선택 시 L0~L4 히트맵만 표시됩니다.</div>
       <div id="loadingMain" class="loading" style="display:none;">로딩 중...</div>
+
+      <div id="aggregateSection" class="aggregate-section">
+        <h2>변조별 전체 통계 (전체 샘플 집계)</h2>
+        <p style="color:var(--muted);font-size:0.85rem;margin:0 0 16px 0;">모델·XAI 방법 기준으로 변조(corruption)별 L0~L4 평균±표준편차 및 그래프</p>
+        <div id="aggregateContent"></div>
+      </div>
     </main>
   </div>
 
@@ -389,7 +728,9 @@ INDEX_HTML = """<!DOCTYPE html>
     <img id="modalImg" src="" alt="">
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script>
+    const xaiMethodEl = document.getElementById('xaiMethod');
     const modelEl = document.getElementById('model');
     const corruptionEl = document.getElementById('corruption');
     const sampleListEl = document.getElementById('sampleList');
@@ -445,6 +786,43 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
+    function qs(extra) {
+      const method = (xaiMethodEl && xaiMethodEl.value) ? xaiMethodEl.value : '';
+      const s = method ? '?xai_method=' + encodeURIComponent(method) : '';
+      return (extra ? s + (s ? '&' : '?') + extra : s);
+    }
+    if (xaiMethodEl) xaiMethodEl.addEventListener('change', async () => {
+      modelEl.innerHTML = '<option value="">선택</option>';
+      modelEl.disabled = true;
+      corruptionEl.innerHTML = '<option value="">선택</option>';
+      corruptionEl.disabled = true;
+      sampleListEl.innerHTML = '';
+      severityRowEl.innerHTML = '';
+      emptyMainEl.style.display = 'block';
+      sampleTitleEl.style.display = 'none';
+      const method = xaiMethodEl.value;
+      if (!method) return;
+      const r = await fetch('/api/models' + qs());
+      const d = await r.json();
+      const modelList = d.models || [];
+      modelList.forEach(m => {
+        const o = document.createElement('option');
+        o.value = m;
+        o.textContent = m;
+        modelEl.appendChild(o);
+      });
+      modelEl.disabled = false;
+      if (modelList.length === 1) {
+        modelEl.value = modelList[0];
+        modelEl.dispatchEvent(new Event('change'));
+      } else {
+        loadAggregateSection();
+      }
+    }); else {
+      // No XAI dropdown (legacy): enable model dropdown and load models from root
+      modelEl.disabled = false;
+      if (modelEl.options.length > 1) modelEl.dispatchEvent(new Event('change'));
+    }
     modelEl.addEventListener('change', async () => {
       corruptionEl.innerHTML = '<option value="">선택</option>';
       corruptionEl.disabled = true;
@@ -453,40 +831,176 @@ INDEX_HTML = """<!DOCTYPE html>
       emptyMainEl.style.display = 'block';
       sampleTitleEl.style.display = 'none';
       const m = modelEl.value;
-      if (!m) return;
-      const r = await fetch('/api/models/' + encodeURIComponent(m) + '/corruptions');
-      const d = await r.json();
-      (d.corruptions || []).forEach(c => {
-        const o = document.createElement('option');
-        o.value = c;
-        o.textContent = c;
-        corruptionEl.appendChild(o);
-      });
+      if (!m) {
+        corruptionEl.disabled = false;
+        return;
+      }
+      try {
+        const url = '/api/models/' + encodeURIComponent(m) + '/corruptions' + qs();
+        const r = await fetch(url);
+        const d = r.ok ? await r.json() : { corruptions: [] };
+        const list = d.corruptions || [];
+        list.forEach(c => {
+          const o = document.createElement('option');
+          o.value = c;
+          o.textContent = c;
+          corruptionEl.appendChild(o);
+        });
+        if (list.length === 1) {
+          corruptionEl.value = list[0];
+          corruptionEl.dispatchEvent(new Event('change'));
+        }
+      } catch (e) { /* leave list empty */ }
       corruptionEl.disabled = false;
+      loadAggregateSection();
     });
 
+    let aggregateChartInstances = [];
+    const AGG_METRIC_KEYS = ['bbox_center_activation_distance', 'peak_bbox_distance', 'activation_spread', 'ring_energy_ratio'];
+    async function loadAggregateSection() {
+      const aggSection = document.getElementById('aggregateSection');
+      const aggContent = document.getElementById('aggregateContent');
+      if (!aggSection || !aggContent) return;
+      const model = modelEl.value;
+      aggregateChartInstances.forEach(function(ch) { if (ch) ch.destroy(); });
+      aggregateChartInstances = [];
+      aggContent.innerHTML = '<div class="loading">변조별 집계 로딩 중...</div>';
+      try {
+        const params = [];
+        if (model) params.push('model=' + encodeURIComponent(model));
+        const q = qs().replace(/^\?/, '');
+        if (q) params.push(q);
+        const url = '/api/aggregate/cam_metrics' + (params.length ? '?' + params.join('&') : '');
+        const r = await fetch(url);
+        const data = r.ok ? await r.json() : { corruptions: [] };
+        const corruptions = data.corruptions || [];
+        if (corruptions.length === 0) {
+          aggContent.innerHTML = '<p style="color:var(--muted);">집계 데이터 없음 (cam_records.csv 확인)</p>';
+          return;
+        }
+        aggContent.innerHTML = '';
+        corruptions.forEach(function(cobj) {
+          const corr = cobj.corruption;
+          const safeId = corr.replace(/\W/g, '_');
+          const bySev = cobj.by_severity || [];
+          const card = document.createElement('div');
+          card.className = 'aggregate-corruption';
+          let tableHtml = '<table class="metrics-table"><thead><tr><th>단계</th>';
+          AGG_METRIC_KEYS.forEach(function(k) {
+            tableHtml += '<th class="num">' + (METRIC_LABELS[k] || k) + '</th>';
+          });
+          tableHtml += '</tr></thead><tbody>';
+          bySev.forEach(function(s) {
+            tableHtml += '<tr><td>' + s.severity + '</td>';
+            AGG_METRIC_KEYS.forEach(function(k) {
+              const mean = (s.mean && s.mean[k] != null) ? s.mean[k] : null;
+              const std = (s.std && s.std[k] != null) ? s.std[k] : null;
+              let cell = '-';
+              if (mean != null) {
+                cell = Number(mean).toFixed(3);
+                if (std != null && std > 0) cell += ' ± ' + Number(std).toFixed(3);
+              }
+              tableHtml += '<td class="num">' + cell + '</td>';
+            });
+            tableHtml += '</tr>';
+          });
+          tableHtml += '</tbody></table>';
+          let chartsHtml = '';
+          AGG_METRIC_KEYS.forEach(function(k) {
+            const cid = 'agg_' + safeId + '_' + k;
+            chartsHtml += '<div class="agg-chart-cell"><div class="chart-title">' + (METRIC_LABELS[k] || k) + '</div><canvas id="' + cid + '"></canvas></div>';
+          });
+          card.innerHTML = '<h3>' + corr + '</h3><div class="agg-table-wrap">' + tableHtml + '</div><div class="agg-charts">' + chartsHtml + '</div>';
+          aggContent.appendChild(card);
+          // 차트 그리기
+          const labels = bySev.map(function(s) { return s.severity; });
+          AGG_METRIC_KEYS.forEach(function(k) {
+            const cid = 'agg_' + safeId + '_' + k;
+            const canvas = document.getElementById(cid);
+            if (!canvas) return;
+            const values = bySev.map(function(s) {
+              const v = (s.mean && s.mean[k] != null) ? s.mean[k] : null;
+              return v;
+            });
+            const hasData = values.some(function(v) { return v != null; });
+            if (!hasData) return;
+            const chart = new Chart(canvas, {
+              type: 'line',
+              data: {
+                labels: labels,
+                datasets: [{ label: METRIC_LABELS[k] || k, data: values, borderColor: '#00d4aa', backgroundColor: '#00d4aa20', fill: true, tension: 0.2, spanGaps: true }]
+              },
+              options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                  x: { grid: { color: 'rgba(139,148,158,0.2)' }, ticks: { color: '#8b949e', maxTicksLimit: 5 } },
+                  y: { grid: { color: 'rgba(139,148,158,0.2)' }, ticks: { color: '#8b949e' } }
+                }
+              }
+            });
+            aggregateChartInstances.push(chart);
+          });
+        });
+      } catch (e) {
+        aggContent.innerHTML = '<p style="color:var(--muted);">집계 로드 실패</p>';
+      }
+    }
+
+    function loadSampleList() {
+      const m = modelEl.value;
+      const c = corruptionEl.value;
+      if (!m || !c) return;
+      const idealOnly = document.getElementById('idealOnlyCheckbox').checked;
+      const url = '/api/models/' + encodeURIComponent(m) + '/' + encodeURIComponent(c) + '/samples' + qs(idealOnly ? 'ideal_only=1' : '');
+      fetch(url).then(r => r.json()).then(d => {
+        sampleListEl.innerHTML = '';
+        const samples = d.samples || [];
+        samples.forEach(name => {
+          const item = document.createElement('button');
+          item.type = 'button';
+          item.className = 'sample-item';
+          item.textContent = name.replace(/\\.(png|jpg|jpeg)$/i, '');
+          item.dataset.sample = name;
+          item.onclick = () => selectSample(m, c, name);
+          sampleListEl.appendChild(item);
+        });
+        if (samples.length === 0) sampleListEl.innerHTML = '<span style="color:var(--muted);font-size:0.85rem;">' + (idealOnly ? '이상적 추세 샘플 없음' : '샘플 없음') + '</span>';
+      });
+    }
     corruptionEl.addEventListener('change', async () => {
       sampleListEl.innerHTML = '';
       severityRowEl.innerHTML = '';
       emptyMainEl.style.display = 'block';
       sampleTitleEl.style.display = 'none';
-      const m = modelEl.value;
-      const c = corruptionEl.value;
-      if (!m || !c) return;
-      const r = await fetch('/api/models/' + encodeURIComponent(m) + '/' + encodeURIComponent(c) + '/samples');
-      const d = await r.json();
-      const samples = d.samples || [];
-      samples.forEach(name => {
-        const item = document.createElement('button');
-        item.type = 'button';
-        item.className = 'sample-item';
-        item.textContent = name.replace(/\\.(png|jpg|jpeg)$/i, '');
-        item.dataset.sample = name;
-        item.onclick = () => selectSample(m, c, name);
-        sampleListEl.appendChild(item);
-      });
-      if (samples.length === 0) sampleListEl.innerHTML = '<span style="color:var(--muted);font-size:0.85rem;">샘플 없음</span>';
+      loadSampleList();
     });
+    document.getElementById('idealOnlyCheckbox').addEventListener('change', () => {
+      if (modelEl.value && corruptionEl.value) loadSampleList();
+    });
+    // On load: if single xai_method (non-empty value), select it and load models → then Corruption loads if single model
+    (function initXai() {
+      if (!xaiMethodEl) return;
+      const opts = Array.from(xaiMethodEl.options).filter(function(o) { return o.value; });
+      if (opts.length === 1) { xaiMethodEl.value = opts[0].value; xaiMethodEl.dispatchEvent(new Event('change')); }
+      else loadAggregateSection();
+    })();
+
+    const METRIC_LABELS = {
+      energy_in_bbox: 'E_bbox',
+      energy_in_bbox_1_1x: 'E_bbox_1.1x',
+      energy_in_bbox_1_25x: 'E_bbox_1.25x',
+      ring_energy_ratio: 'E_ring_ratio',
+      activation_spread: 'spread',
+      entropy: 'entropy',
+      center_shift: 'center_shift',
+      activation_fragmentation: 'frag',
+      bbox_center_activation_distance: 'bbox_dist',
+      peak_bbox_distance: 'peak_dist',
+      full_cam_sum: 'full_sum',
+      full_cam_entropy: 'full_ent'
+    };
 
     function selectSample(model, corruption, sampleId) {
       document.querySelectorAll('.sample-item').forEach(el => { el.classList.remove('active'); if (el.dataset.sample === sampleId) el.classList.add('active'); });
@@ -495,30 +1009,32 @@ INDEX_HTML = """<!DOCTYPE html>
       emptyMainEl.style.display = 'none';
       loadingMainEl.style.display = 'block';
       severityRowEl.innerHTML = '';
-      fetch('/api/models/' + encodeURIComponent(model) + '/' + encodeURIComponent(corruption) + '/sample/' + encodeURIComponent(sampleId))
-        .then(r => r.json())
-        .then(d => {
-          loadingMainEl.style.display = 'none';
-          const sevs = d.severities || [];
-          severityRowEl.innerHTML = '';
-          sevs.forEach(({ severity, url }) => {
-            const cell = document.createElement('div');
-            cell.className = 'severity-cell';
-            cell.innerHTML = '<div class="sev-label">' + severity + '</div>';
-            const img = document.createElement('img');
-            img.src = url;
-            img.alt = severity;
-            img.loading = 'lazy';
-            img.onclick = () => { modalImg.src = url; modal.classList.add('show'); };
-            cell.appendChild(img);
-            severityRowEl.appendChild(cell);
-          });
-          if (sevs.length === 0) { emptyMainEl.textContent = '이 샘플에 대한 이미지가 없습니다.'; emptyMainEl.style.display = 'block'; }
-        })
-        .catch(() => { loadingMainEl.style.display = 'none'; emptyMainEl.textContent = '로드 실패'; emptyMainEl.style.display = 'block'; });
+      const base = '/api/models/' + encodeURIComponent(model) + '/' + encodeURIComponent(corruption) + '/sample/' + encodeURIComponent(sampleId) + qs();
+      fetch(base).then(r => r.json()).then(d => {
+        loadingMainEl.style.display = 'none';
+        const sevs = d.severities || [];
+        severityRowEl.innerHTML = '';
+        sevs.forEach(({ severity, url }) => {
+          const cell = document.createElement('div');
+          cell.className = 'severity-cell';
+          cell.innerHTML = '<div class="sev-label">' + severity + '</div>';
+          const img = document.createElement('img');
+          img.src = url;
+          img.alt = severity;
+          img.loading = 'lazy';
+          img.onclick = () => { modalImg.src = url; modal.classList.add('show'); };
+          cell.appendChild(img);
+          severityRowEl.appendChild(cell);
+        });
+        if (sevs.length === 0) {
+          emptyMainEl.textContent = '이 샘플에 대한 이미지가 없습니다.';
+          emptyMainEl.style.display = 'block';
+        }
+      }).catch(() => { loadingMainEl.style.display = 'none'; emptyMainEl.textContent = '로드 실패'; emptyMainEl.style.display = 'block'; });
     }
 
     loadMetrics();
+    loadAggregateSection();
   </script>
 </body>
 </html>

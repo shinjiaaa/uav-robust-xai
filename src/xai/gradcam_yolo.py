@@ -45,6 +45,12 @@ class YOLOGradCAM:
         # Use register_full_backward_hook (removes FutureWarning and more stable)
         self.target_layer.register_full_backward_hook(bwd_hook)
 
+    def _compute_cam(self, activations: torch.Tensor, gradients: torch.Tensor) -> torch.Tensor:
+        """Grad-CAM: global average pooling of gradients as weights. (1,C,h,w) -> (1,1,h,w)."""
+        w = gradients.mean(dim=(2, 3), keepdim=True)
+        cam = (w * activations).sum(dim=1, keepdim=True)
+        return F.relu(cam)
+
     def _get_target_layer(self, target_layer_name: str):
         layer = self.model # Already DetectionModel
         tokens = target_layer_name.split(".")
@@ -226,13 +232,10 @@ class YOLOGradCAM:
             # print("*"*100)
             # print("444")
             # print("*"*100)
-            # activations/gradients: (1,C,h,w)
-            w = self.gradients.mean(dim=(2, 3), keepdim=True)      # (1,C,1,1)
-            cam = (w * self.activations).sum(dim=1, keepdim=True)  # (1,1,h,w)
-            cam = F.relu(cam)
-
+            # activations/gradients: (1,C,h,w) — delegate to method for Grad-CAM vs Grad-CAM++
+            cam = self._compute_cam(self.activations, self.gradients)
             cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
-            cam = cam[0, 0]
+            cam = cam[0, 0].clone()
             cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
 
             # print("*"*100)
@@ -265,3 +268,21 @@ class YOLOGradCAM:
                     self.gradients.grad = None
             
             return cam_numpy, letterbox_meta
+
+
+class YOLOGradCAMPP(YOLOGradCAM):
+    """
+    Grad-CAM++ for YOLO: improved weighting (alpha) over spatial dimensions.
+    Same interface as YOLOGradCAM; use for FastCAM 비교 분석.
+    """
+
+    def _compute_cam(self, activations: torch.Tensor, gradients: torch.Tensor) -> torch.Tensor:
+        """Grad-CAM++: alpha-weighted gradients. (1,C,h,w) -> (1,1,h,w)."""
+        relu_grad = F.relu(gradients)
+        # sum_ab A_ab^k * ReLU(grad_ab^k) per channel -> (1,C,1,1)
+        sum_ab = (activations * relu_grad).sum(dim=(2, 3), keepdim=True)
+        denom = 2.0 * (relu_grad ** 2) + sum_ab
+        alpha = (relu_grad ** 2) / (denom + 1e-8)
+        w_k = (alpha * relu_grad).sum(dim=(2, 3))  # (1, C)
+        cam = (w_k.unsqueeze(2).unsqueeze(3) * activations).sum(dim=1, keepdim=True)
+        return F.relu(cam)

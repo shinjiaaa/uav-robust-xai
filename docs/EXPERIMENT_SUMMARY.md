@@ -102,6 +102,11 @@
 | **quality_gate.cam_sum_epsilon** | 1e-8 | CAM 합이 이보다 크면 “빈 CAM”이 아님 |
 | **quality_gate.cam_var_epsilon** | 1e-10 | 분산 하한 |
 
+**Explanation quality gate (CAM failure ≠ model behavior)**  
+- 각 레코드에 **cam_valid** 저장: `cam_sum >= 1e-8` 이고 `activation_spread > 0`일 때만 True.  
+- 패턴 분류(09)에서 `pattern_classification.use_quality_gate: true`면 cam_valid==True인 행만 사용해, “설명 측정 실패”를 주 분석에서 제외할 수 있음.  
+- 주 분석·뷰어에서는 **E_bbox_1.25x**를 기본 사용(ROI miss 감소). Raw CAM 저장은 `gradcam.save_raw_cam: true` 시 `results/raw_cam/`에 .npy 및 전체 오버레이 저장.
+
 ---
 
 ## 3. 산출 가능한 지표 전체 목록
@@ -116,7 +121,7 @@
 | **detection_records.csv** | 03_detect_tiny_objects_timeseries.py | 객체·severity별 매칭, score, IoU, miss |
 | **risk_events.csv** | 04_detect_risk_events.py | 리스크 이벤트 (object_uid, cam_sev_from, cam_sev_to, start_severity 등) |
 | **failure_events.csv** | 04_detect_failure_events.py | (레거시) 실패 이벤트 |
-| **cam_records.csv** | 05_gradcam_failure_analysis.py | CAM 메트릭 (energy_in_bbox, activation_spread, entropy, center_shift, activation_fragmentation, bbox_center_activation_distance, cam_quality 등) |
+| **cam_records.csv** | 05_gradcam_failure_analysis.py | CAM 메트릭 (energy_in_bbox, energy_in_bbox_1_25x, activation_spread, entropy, cam_quality, cam_valid 등) |
 | **gradcam_metrics.csv** | 05_gradcam_failure_analysis.py | (요약) Grad-CAM 관련 메트릭 |
 | **lead_table.csv** | 07_lead_analysis.py | 객체별 t_cam, t_perf, lead (프레임/단계) |
 | **lead_stats.json** | 07_lead_analysis.py | 선행 통계 (n_lead, n_coincident, n_lag, mean_lead, sign_test, permutation_test) |
@@ -248,6 +253,39 @@ motion_blur는 성능 저하가 상대적으로 적어서(보고서에서 “가
 6. **06_llm_report.py** — report.md 생성  
 7. **07_lead_analysis.py** — lead_table.csv, lead_stats.json  
 8. **08_dasc_deliverables.py** — dasc_summary.json, dasc_curves 등  
-9. **app.py** — Heatmap 뷰어 UI (5.1 내용)
+9. **09_cam_pattern_classification.py** — CAM 시계열 패턴 분류 (stable / persistent_collapse / transient_instability / oscillatory), pattern_summary.csv, pattern_counts.json, cam_pattern_report.md, lead_comparison_with_without_transient.json  
+10. **app.py** — Heatmap 뷰어 UI (5.1 내용)
+
+---
+
+## 8. CAM 시계열 패턴 분류 (논문용)
+
+**목적**: severity 증가에 따라 “중간에만 CAM이 붕괴했다가 회복하는” 비단조 패턴을 정량화하고, persistent collapse와 구분해 해석하기 위함.
+
+**Breakdown 정의 (1차 규칙)**  
+- `E_bbox <= 0.05` 또는 `activation_spread <= 1e-6` 또는 `cam_quality != 'high'`
+
+**패턴**  
+- **Stable**: 모든 severity에서 breakdown 없음  
+- **Persistent collapse**: 첫 breakdown 이후 더 높은 severity에서 회복 없음  
+- **Transient instability**: severity 1~3에서 한 덩어리 breakdown 발생 후, 이후 단계에서 전부 회복  
+- **Oscillatory**: breakdown과 회복이 두 번 이상 번갈아 나타남  
+
+**이상적 추세 샘플 (ideal_trend_samples.json)**  
+- 패턴이 stable 또는 persistent_collapse인 것 중, **L0→L4 구간에서 단조 추세**만 허용.  
+- **E_bbox**: 매 단계 비증가(연속 하강). **entropy, bbox_dist, spread**: 매 단계 비감소(연속 상승).  
+- 중간에 오락가락(반대로 튀는 구간)이 있으면 제외 → "측정 실패 없이 정상적으로 관측된" 연속·단조 열화만 이상적 추세로 분류.
+
+**산출물**  
+- `results/pattern_summary.csv`, `results/pattern_counts.json`  
+- `results/pattern_transient_instability.csv` 등 패턴별 CSV  
+- `results/ideal_trend_samples.json`: 단조 이상적 추세 샘플 ID (뷰어 "이상적 추세만 보기"에 사용)  
+- `results/cam_pattern_report.md`  
+- `results/lead_comparison_with_without_transient.json`: transient_instability 샘플을 제외한 lead 통계. “transient가 있어도 주 결론(선행 효과)이 유지되는지” 확인용.
+
+**논문 권장 프레이밍**  
+- 주 결과: CAM 변화가 성능 저하보다 선행하거나 동시인 경우가 많다.  
+- 부가 관찰: 일부 샘플에서는 severity가 단조 증가함에도 CAM이 중간 단계에서만 일시 붕괴했다가 회복하는 비단조적 불안정성(transient instability)이 관찰된다.  
+- 해석: Grad-CAM·ROI·품질 한계에서 비롯된 설명 불안정성일 가능성을 인정하고, persistent collapse와 transient instability를 구분해 해석한다.
 
 이 문서는 위 파이프라인과 설정(configs/experiment.yaml)을 기준으로 작성되었으며, 실제 수치는 실험 실행 결과(예: results/lead_stats.json, results/report.md)에 따라 달라질 수 있습니다.

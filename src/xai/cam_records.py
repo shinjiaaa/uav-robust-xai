@@ -31,6 +31,7 @@ def create_cam_record(
     cam_status: str = None,  # 'ok' or 'fail' (for backward compatibility)
     fail_reason: Optional[str] = None,  # Only for extraction errors (system errors)
     cam_quality: Optional[str] = None,  # RQ1: 'high' | 'flat' | 'noisy' | 'low_energy' | 'empty' | 'extraction_failed'
+    cam_valid: Optional[bool] = None,   # Explanation quality gate: True iff cam_sum >= 1e-8 and activation_spread > 0
     exc_type: Optional[str] = None,  # Exception type name (e.g., 'MemoryError', 'RuntimeError')
     exc_msg: Optional[str] = None,  # Exception message (first 200 chars)
     traceback_last_lines: Optional[str] = None,  # Last 1-3 lines of traceback
@@ -54,9 +55,15 @@ def create_cam_record(
     activation_spread: Optional[float] = None,
     center_shift: Optional[float] = None,
     energy_in_bbox: Optional[float] = None,
+    energy_in_bbox_1_1x: Optional[float] = None,   # 보완: 1.1x expanded bbox (ROI 민감도)
+    energy_in_bbox_1_25x: Optional[float] = None,  # 보완: 1.25x expanded bbox
+    ring_energy_ratio: Optional[float] = None,    # bbox vs ring(1.25x\bbox); >0.5 object-centric, <0.5 context
+    full_cam_sum: Optional[float] = None,         # 보완: full CAM sum (원인 분리용)
+    full_cam_entropy: Optional[float] = None,     # 보완: full CAM entropy
     activation_fragmentation: Optional[float] = None,  # Tiny-object: entropy within bbox
-    bbox_center_activation_distance: Optional[float] = None,  # Tiny-object: distance bbox center to activation CoM
-    
+    bbox_center_activation_distance: Optional[float] = None,  # Primary: distance(CAM CoM, bbox center); continuous
+    peak_bbox_distance: Optional[float] = None,  # distance(CAM peak, bbox center); continuous
+
     # Performance (from detection)
     detected: Optional[int] = None,  # 0 or 1
     conf: Optional[float] = None,
@@ -71,7 +78,9 @@ def create_cam_record(
     failure_type: Optional[str] = None,  # miss / score_drop / iou_drop
     # RQ1: CAM target selection (for miss cases)
     cam_target_class_id: Optional[int] = None,  # Class ID used for CAM generation (may differ from GT class_id)
-    cam_target_type: Optional[str] = None  # "gt_class", "pred_class", "gt_class_miss"
+    cam_target_type: Optional[str] = None,  # "gt_class", "pred_class", "gt_class_miss"
+    # XAI method (Grad-CAM vs FastCAM/Grad-CAM++ 비교)
+    xai_method: Optional[str] = None  # "gradcam" | "fastcam" (default gradcam)
 ) -> Dict:
     """Create a CAM record with standardized schema.
     
@@ -103,6 +112,7 @@ def create_cam_record(
         'cam_status': cam_status,
         'fail_reason': fail_reason,
         'cam_quality': cam_quality,  # RQ1: quality label for analysis
+        'cam_valid': cam_valid,      # Explanation quality gate (for filtering invalid CAMs)
         'exc_type': exc_type,
         'exc_msg': exc_msg,
         'traceback_last_lines': traceback_last_lines,
@@ -126,9 +136,15 @@ def create_cam_record(
         'activation_spread': activation_spread,
         'center_shift': center_shift,
         'energy_in_bbox': energy_in_bbox,
+        'energy_in_bbox_1_1x': energy_in_bbox_1_1x,
+        'energy_in_bbox_1_25x': energy_in_bbox_1_25x,
+        'ring_energy_ratio': ring_energy_ratio,
+        'full_cam_sum': full_cam_sum,
+        'full_cam_entropy': full_cam_entropy,
         'activation_fragmentation': activation_fragmentation,
         'bbox_center_activation_distance': bbox_center_activation_distance,
-        
+        'peak_bbox_distance': peak_bbox_distance,
+
         # Performance
         'detected': detected,
         'conf': conf,
@@ -142,7 +158,8 @@ def create_cam_record(
         'failure_type': failure_type,
         # RQ1: CAM target selection
         'cam_target_class_id': cam_target_class_id,
-        'cam_target_type': cam_target_type
+        'cam_target_type': cam_target_type,
+        'xai_method': xai_method,
     }
     
     # Store letterbox_meta as JSON string if provided

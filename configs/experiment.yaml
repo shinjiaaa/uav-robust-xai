@@ -128,33 +128,49 @@ risk_detection:
   use_z_score_performance: true
   perf_collapse_z_threshold: -2.0  # score_drop_z or iou_drop_z < this -> performance collapse
 
-# Collapse definition (z-score vs baseline severity 0) - for CAM lead analysis
+# Collapse definition: concepts separated into "CAM change onset" (warning) vs "CAM collapse" (strict).
+# Lead = t_perf - t_cam; use t_cam_warn (sensitive) or t_cam_collapse (conservative).
 collapse_detection:
-  cam_z_threshold: 2.0  # |z| >= this -> CAM collapse (entropy_z, energy_z, etc.)
-  perf_z_threshold: -2.0  # score_drop_z or iou_drop_z < this -> performance collapse
+  perf_z_threshold: -2.0  # score_drop_z or iou_drop_z < this -> performance collapse (unchanged)
+  # Legacy z-score CAM (optional; used only if use_delta_based: false)
+  cam_z_threshold: 2.0
   cam_metrics: ["energy_in_bbox", "activation_spread", "entropy", "center_shift"]
-  min_metrics_for_ensemble: 2  # require this many metrics with |z|>=threshold for ensemble collapse
+  min_metrics_for_ensemble: 2
+  # Delta-based CAM change onset (object-level; recommended over mean curve)
+  use_delta_based: true
+  # Method: "composite_score" = z(Δbbox)+z(Δpeak)+z(Δspread)+z(-Δring), threshold = top 25%. "two_axes" = 2 from different axes.
+  cam_change_method: "composite_score"
+  score_threshold_percentile: 0.75   # top 25% of score -> t_cam_change (onset)
+  axis_a_metrics: ["bbox_center_activation_distance", "peak_bbox_distance"]   # position displacement
+  axis_b_metrics: ["activation_spread", "ring_energy_ratio"]                 # diffusion / object-centeredness
+  warning_percentile: 0.75   # for two_axes: t_cam_warn
+  collapse_percentile: 0.90  # t_cam_collapse (strict)
+  min_conditions_warn: 2
+  min_conditions_collapse: 3
+  collapse_require_persistence: true
   
 # Grad-CAM (failure-event based)
 # B-1/B-3: CAM coverage - n_expected_frames = severity window length (not always 5).
 # cam_mode: full (all 0..4) | risk_window (onset-1..onset+1) | stratified (sample). Currently risk_events define window.
 gradcam:
   enabled: true
-  # Run Grad-CAM on bbox crop only (gradient flows only inside tiny object region)
-  use_bbox_roi: true
-  # Layer configuration (primary/secondary approach)
+  # XAI 방법 비교: gradcam만 쓰면 기존과 동일, fastcam 추가 시 Grad-CAM++(FastCAM)도 실행·저장
+  xai_methods: ["gradcam", "fastcam"]  # ["gradcam"] only | ["gradcam", "fastcam"] for 비교 분석
+  # CAM 생성: 전체 이미지(full-image) 권장. bbox는 지표 계산용(측정 창)으로만 사용.
+  # use_bbox_roi: true → bbox crop에만 CAM 씌우면 attention 이동/leakage를 못 봄, E_bbox≈1·distance 왜곡.
+  use_bbox_roi: false
+  # Layer configuration (primary = main CAM layer)
+  # model.9 = deep, ~20x20 FM -> bimodal 0/1. model.6 = too shallow -> CAM too spread, E_bbox=1, flat metrics.
+  # model.8 (or model.7) = sweet spot for gradual distance/entropy curves.
   layers:
     primary:
-      name: "model.9.cv2.conv"  # CRITICAL: Backbone layer (not detect head) - more stable than model.18
-      # YOLOv8 structure: model.0-9 = backbone, model.10-21 = neck, model.22-24 = head
-      # model.9 is the last backbone C2f block before neck - most stable for CAM
-      role: "primary"  # Main layer for analysis
-      required: true  # Must succeed
+      name: "model.8.cv2.conv"  # Backbone: between 9 (deep) and 6 (too shallow); was model.6
+      role: "primary"
+      required: true
     # secondary:
-    #   name: "model.6.cv2.conv"  # Alternative backbone layer (mid-backbone, optional)
-    #   role: "secondary"  # Supplementary layer
-    #   required: false  # Optional, can fail
-    # CRITICAL: Disabled secondary for quick success test - use primary only
+    #   name: "model.7.cv2.conv"
+    #   role: "secondary"
+    #   required: false
   # Quality Gate (QC) thresholds
   quality_gate:
     finite_ratio_threshold: 0.99  # >99% of values must be finite (not NaN/inf)
@@ -162,8 +178,10 @@ gradcam:
     cam_var_epsilon: 1e-10  # CRITICAL: Reduced from 1e-8 to 1e-10 for debugging (allow near-flat CAMs to pass)
   top_k_percent: 10
   save_samples: true
-  max_samples: null  # RQ1: null = process all risk events. Set to number to cap (e.g. 20 for debug).
-  metrics: ["energy_in_bbox", "activation_spread", "entropy", "center_shift", "activation_fragmentation", "bbox_center_activation_distance"]  # CAM metrics (tiny-object friendly)
+  save_raw_cam: false  # If true: save full CAM as .npy and full-image overlay _full.png (진짜 CAM 없음 vs ROI 구분)
+  max_samples: null  # null = process all. Or use CLI: python scripts/05_gradcam_failure_analysis.py --max-events 10 (quick test)
+  # Primary for gradual curves: bbox_dist, peak_dist, entropy, spread. ring_energy_ratio = bbox vs ring (tiny-object friendly).
+  metrics: ["bbox_center_activation_distance", "entropy", "activation_spread", "center_shift", "activation_fragmentation", "energy_in_bbox", "energy_in_bbox_1_25x", "ring_energy_ratio"]
   # Dynamic refinement: analyze failure region in detail
   dynamic_refinement:
     enabled: true
@@ -171,6 +189,13 @@ gradcam:
     subdivision_steps: 10  # Subdivide failure region into N steps
     failure_detection_threshold: 0.3  # CAM metric change threshold to detect failure
   
+# CAM pattern classification (09)
+pattern_classification:
+  use_relaxed_breakdown: true  # true(권장): E_bbox_1.25x<=0.2 + 2개 이상 지표 결합, 공식 붕괴=2단계 연속 또는 이후 미회복. false: 기존 단일 지표 붕괴
+  use_quality_gate: false      # If true: only object×corruption with cam_valid==True for all L0~L4
+  interpolate_invalid: false   # If true: replace invalid step metrics with linear interpolation → pattern_repaired
+  use_smoothing: false         # If true: 3-point moving average → pattern_smoothed (다른 XAI와 분포 맞출 때)
+
 # Results paths
 results:
   root: "results"
@@ -183,6 +208,7 @@ results:
   dasc_curves_dir: "results/dasc_curves"
   dasc_summary_json: "results/dasc_summary.json"
   heatmap_samples_dir: "results/heatmap_samples"
+  raw_cam_dir: "results/raw_cam"  # Full-image CAM .npy + _full.png (when gradcam.save_raw_cam: true)
   
 # LLM report
 llm_report:

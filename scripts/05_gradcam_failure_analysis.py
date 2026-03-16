@@ -1,6 +1,11 @@
-"""Grad-CAM analysis for failure events."""
+"""Grad-CAM analysis for failure events.
+
+Quick test: python scripts/05_gradcam_failure_analysis.py --max-events 10
+Full run:  python scripts/05_gradcam_failure_analysis.py
+"""
 
 import sys
+import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -13,7 +18,7 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # 40MP limit (adjust if needed)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.xai.gradcam_yolo import YOLOGradCAM
+from src.xai.gradcam_yolo import YOLOGradCAM, YOLOGradCAMPP
 from src.xai.cam_metrics import compute_cam_metrics
 from src.xai.cam_qc import get_qc_status
 from src.xai.cam_extraction import extract_cam_multi_layer
@@ -30,13 +35,21 @@ from tqdm import tqdm
 
 def main():
     """Main function."""
+    parser = argparse.ArgumentParser(description="Grad-CAM failure analysis. Use --max-events for quick test.")
+    parser.add_argument("--max-events", type=int, default=None, metavar="N",
+                        help="Process only first N events (quick test). Overrides config gradcam.max_samples for this run.")
+    args = parser.parse_args()
+
     config_path = Path("configs/experiment.yaml")
     if not config_path.exists():
         print(f"Error: Config file not found at {config_path}")
         sys.exit(1)
-    
+
     config = load_yaml(config_path)
-    set_seed(config['seed'])
+    if args.max_events is not None:
+        config["gradcam"]["max_samples"] = args.max_events
+        print(f"[INFO] Quick test: --max-events {args.max_events} (this run only)")
+    set_seed(config["seed"])
     
     print("=" * 60)
     print("Grad-CAM Failure Event Analysis")
@@ -132,9 +145,9 @@ def main():
     layer_config = gradcam_config.get('layers', {})
     qc_config = gradcam_config.get('quality_gate', {})
     if gradcam_config.get('use_bbox_roi', False):
-        print("[INFO] Grad-CAM bbox-ROI mode: ON — heatmap is computed only for the selected tiny object (crop), not the whole image.")
+        print("[INFO] Grad-CAM bbox-ROI mode: ON — heatmap on bbox crop only (not recommended for gradual-curve analysis; attention leakage invisible).")
     else:
-        print("[INFO] Grad-CAM bbox-ROI mode: OFF — heatmap is computed on the full image. Set gradcam.use_bbox_roi: true for single-object CAM.")
+        print("[INFO] Grad-CAM full-image mode: CAM on whole image; bbox used only for post-processing metrics (distance, E_bbox, etc.).")
     
     # New schema: cam_records (replaces cam_metrics_records)
     cam_records = []
@@ -246,31 +259,31 @@ def main():
         print(f"  Model on CPU (GPU not available)")
         print(f"  [WARN] CPU mode will use more RAM - ensure sufficient memory")
     
-    # Stage B: Initialize Grad-CAM for multiple layers (primary/secondary)
+    # Stage B: Initialize Grad-CAM (and FastCAM/Grad-CAM++) for multiple methods and layers
     device_str = str(device) if 'device' in locals() else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    gradcam_instances = {}
-    
-    for layer_role, layer_info in layer_config.items():
-        layer_name = layer_info['name']
-        required = layer_info.get('required', True)
-        
-        try:
-            gradcam = YOLOGradCAM(torch_model, target_layer_name=layer_name, device=device_str)
-            actual_device = next(gradcam.model.parameters()).device
-            gradcam_instances[layer_role] = gradcam
-            print(f"  [{layer_role.upper()}] CAM model device: {actual_device}")
-            print(f"  [{layer_role.upper()}] Using target layer: {layer_name}")
-        except Exception as e:
-            if required:
-                print(f"  [ERROR] Failed to initialize required {layer_role} layer {layer_name}: {e}")
-                sys.exit(1)
-            else:
-                print(f"  [WARN] Failed to initialize optional {layer_role} layer {layer_name}: {e}")
-                print(f"  [WARN] Continuing without {layer_role} layer")
-    
-    if len(gradcam_instances) == 0:
-        print("[ERROR] Failed to initialize any Grad-CAM layers")
-        sys.exit(1)
+    xai_methods = gradcam_config.get('xai_methods', ['gradcam'])  # ['gradcam', 'fastcam'] for 비교 분석
+    cam_class = {'gradcam': YOLOGradCAM, 'fastcam': YOLOGradCAMPP}
+    gradcam_instances = {}  # xai_method -> { layer_role -> instance }
+    for xai_method in xai_methods:
+        gradcam_instances[xai_method] = {}
+        for layer_role, layer_info in layer_config.items():
+            layer_name = layer_info['name']
+            required = layer_info.get('required', True)
+            cls = cam_class.get(xai_method, YOLOGradCAM)
+            try:
+                gradcam = cls(torch_model, target_layer_name=layer_name, device=device_str)
+                actual_device = next(gradcam.model.parameters()).device
+                gradcam_instances[xai_method][layer_role] = gradcam
+                print(f"  [{xai_method.upper()}] [{layer_role.upper()}] CAM device: {actual_device}, layer: {layer_name}")
+            except Exception as e:
+                if required:
+                    print(f"  [ERROR] Failed to initialize {xai_method} {layer_role} {layer_name}: {e}")
+                    sys.exit(1)
+                else:
+                    print(f"  [WARN] Failed optional {xai_method} {layer_role}: {e}")
+        if len(gradcam_instances[xai_method]) == 0:
+            print(f"[ERROR] No layers for {xai_method}")
+            sys.exit(1)
     
     for _, event in tqdm(sample_events.iterrows(), total=len(sample_events), desc="Processing events"):
         # Only process yolo_generic (already filtered by model loading)
@@ -395,7 +408,7 @@ def main():
                     severity_range = range(min(sev_list), max(sev_list) + 1)
         
         # Store baseline CAMs per layer (primary/secondary)
-        baseline_cams = {}  # {layer_role: cam}
+        baseline_cams = {m: {} for m in xai_methods}  # {xai_method: {layer_role: cam}}
         
         # CRITICAL (RQ1): Initialize CAM target variables (will be set per severity)
         cam_target_class_id = class_id  # Default: GT class_id
@@ -647,161 +660,33 @@ def main():
                     (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
                     (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
                 )
-            # Extract CAMs from all configured layers
-            cam_results = extract_cam_multi_layer(
-                gradcam_instances,
-                image,
-                yolo_bbox,
-                cam_target_class_id,  # Use determined target class_id
-                layer_config,
-                qc_config,
-                bbox_xyxy=bbox_xyxy_scaled,
-                orig_shape=(img_height, img_width) if use_bbox_roi else None,
-            )
-            
-            # CRITICAL: Force garbage collection after CAM generation
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # Process each layer's CAM result
-            for layer_role, layer_result in cam_results.items():
-                cam = layer_result['cam']
-                cam_status = layer_result['cam_status']
-                fail_reason = layer_result['fail_reason']
-                letterbox_meta = layer_result['letterbox_meta']
-                cam_shape = layer_result['cam_shape']
-                
-                # Extract QC diagnostic stats for debugging
-                cam_min = layer_result.get('cam_min')
-                cam_max = layer_result.get('cam_max')
-                cam_sum = layer_result.get('cam_sum')
-                cam_var = layer_result.get('cam_var')
-                cam_std = layer_result.get('cam_std')  # 추가: std for QC
-                cam_dtype = layer_result.get('cam_dtype')
-                finite_ratio = layer_result.get('finite_ratio')
-                preprocessed_shape = layer_result.get('preprocessed_shape')
-                
-                # Stage C: Quality Gate (RQ1: soft labels - all CAMs saved)
-                # CRITICAL (RQ1): All CAMs are saved with quality labels (no hard filtering)
-                # Only extraction errors (system errors) are marked as 'fail'
-                # Quality issues (flat/noisy/low_energy) are labels, not failures
-                cam_quality = layer_result.get('cam_quality', 'unknown')
-                
-                # Only skip if extraction failed (system error) - quality issues are still saved
-                extraction_errors = ['no_activation', 'no_grad', 'shape_mismatch', 'memory_error', 'cam_extraction_failed', 'layer_not_configured']
-                is_extraction_error = (cam_status == 'fail' and fail_reason in extraction_errors)
-                
-                if is_extraction_error:
-                    # Extract error information from layer_result
-                    exc_type = layer_result.get('exc_type')
-                    exc_msg = layer_result.get('exc_msg')
-                    traceback_last_lines = layer_result.get('traceback_last_lines')
-                    
-                    # Parse preprocessed_shape if it's a string
-                    preprocessed_shape_tuple = None
-                    if preprocessed_shape and isinstance(preprocessed_shape, str):
-                        try:
-                            h, w = map(int, preprocessed_shape.split('x'))
-                            preprocessed_shape_tuple = (h, w)
-                        except:
-                            pass
-                    elif preprocessed_shape:
-                        preprocessed_shape_tuple = preprocessed_shape
-                    
-                    # Create record for extraction failures (system errors)
-                    # CRITICAL: Include object_uid and failure_event_id for alignment analysis
-                    # RQ1: Include CAM target information and quality label
-                    record = create_cam_record(
-                        model=model_name,
-                        corruption=corruption,
-                        severity=severity,
-                        image_id=image_id,
-                        class_id=class_id,
-                        object_id=object_uid if 'object_uid' in locals() else None,  # Store object_uid
-                        cam_target_class_id=cam_target_class_id if 'cam_target_class_id' in locals() else class_id,  # RQ1
-                        cam_target_type=cam_target_type if 'cam_target_type' in locals() else "gt_class",  # RQ1
-                        bbox_x1=visdrone_bbox[0],
-                        bbox_y1=visdrone_bbox[1],
-                        bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
-                        bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
-                        layer_role=layer_role,
-                        layer_name=layer_config[layer_role]['name'],
-                        cam_status='fail',  # System error (extraction failed)
-                        fail_reason=fail_reason,
-                        cam_quality=cam_quality if 'cam_quality' in locals() else 'extraction_failed',  # RQ1: quality label
-                        exc_type=exc_type,
-                        exc_msg=exc_msg,
-                        traceback_last_lines=traceback_last_lines,
-                        # QC diagnostic stats
-                        cam_min=cam_min,
-                        cam_max=cam_max,
-                        cam_sum=cam_sum,
-                        cam_var=cam_var,
-                        cam_std=cam_std,  # 추가: std for QC
-                        cam_dtype=cam_dtype,
-                        finite_ratio=finite_ratio,
-                        preprocessed_shape=preprocessed_shape_tuple,
-                        failure_severity=failure_severity
-                    )
-                    
-                    # Add failure_event_id if available (for alignment analysis)
-                    if use_risk_events and 'failure_event_id' in event:
-                        record['failure_event_id'] = event['failure_event_id']
-                        record['failure_type'] = failure_type
-                    cam_records.append(record)
-                    if layer_role == 'primary':
-                        # RQ1: Only count extraction errors as "failed", not quality issues
-                        corruption_cam_stats[corruption]['failed'] += 1
-                    continue  # Skip metrics computation for extraction errors
-                
-                # Store baseline (severity 0) per layer
-                if severity == 0:
-                    baseline_cams[layer_role] = cam.copy() if cam is not None else None
-                
-                # L0–L4 heatmap 저장: 전체 이미지 반환, heatmap은 해당 tiny object bbox 안에만 적용
-                if layer_role == 'primary' and cam is not None:
-                    dasc_cfg = config.get('dasc', {})
-                    save_overlays = dasc_cfg.get('save_heatmap_overlays', False) or gradcam_config.get('save_samples', False)
-                    if save_overlays:
-                        bbox_xyxy_for_overlay = (
-                            visdrone_bbox[0] * img_width / orig_w,
-                            visdrone_bbox[1] * img_height / orig_h,
-                            (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
-                            (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
-                        )
-                        heatmap_dir = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples'))
-                        safe_uid = str(object_uid).replace('/', '_').replace('\\', '_')[:80]
-                        overlay_path = heatmap_dir / model_name / corruption / f"L{severity}" / f"{image_id}_{safe_uid}.png"
-                        # 전체 이미지 + bbox 안에만 heatmap (Grad-CAM은 해당 tiny object에 대해서만 계산됨)
-                        save_cam_overlay(cam, image, letterbox_meta, overlay_path, bbox_xyxy=bbox_xyxy_for_overlay)
-                
-                # Stage D: Compute metrics (layer-invariant)
-                # RQ1: Compute metrics for all CAMs (including flat/noisy/low_energy)
-                # Only skip if extraction failed (system error)
-                if cam is not None and baseline_cams.get(layer_role) is not None:
-                    # Bbox in current image coords (image may be resized; visdrone_bbox is in original)
-                    bbox_xyxy = (
-                        visdrone_bbox[0] * img_width / orig_w,
-                        visdrone_bbox[1] * img_height / orig_h,
-                        (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
-                        (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
-                    )
-                    
-                    # Add original image dimensions to letterbox_meta
-                    if letterbox_meta is not None:
-                        letterbox_meta['original_width'] = img_width
-                        letterbox_meta['original_height'] = img_height
-                    
-                    metrics = compute_cam_metrics(
-                        cam,
-                        bbox_xyxy,
-                        cam_shape,
-                        letterbox_meta=letterbox_meta,
-                        baseline_cam=baseline_cams[layer_role]
-                    )
-                    
-                    # Extract QC diagnostic stats (even for OK records, for consistency)
+            # Extract CAMs per XAI method (Grad-CAM, FastCAM/Grad-CAM++) for 비교 분석
+            for xai_method in xai_methods:
+                cam_results = extract_cam_multi_layer(
+                    gradcam_instances[xai_method],
+                    image,
+                    yolo_bbox,
+                    cam_target_class_id,
+                    layer_config,
+                    qc_config,
+                    bbox_xyxy=bbox_xyxy_scaled,
+                    orig_shape=(img_height, img_width) if use_bbox_roi else None,
+                )
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                heatmap_base = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples')) / xai_method
+
+                # Process each layer's CAM result
+                for layer_role, layer_result in cam_results.items():
+                    cam = layer_result['cam']
+                    cam_status = layer_result['cam_status']
+                    fail_reason = layer_result['fail_reason']
+                    letterbox_meta = layer_result['letterbox_meta']
+                    cam_shape = layer_result['cam_shape']
+
+                    # Extract QC diagnostic stats for debugging
                     cam_min = layer_result.get('cam_min')
                     cam_max = layer_result.get('cam_max')
                     cam_sum = layer_result.get('cam_sum')
@@ -810,72 +695,186 @@ def main():
                     cam_dtype = layer_result.get('cam_dtype')
                     finite_ratio = layer_result.get('finite_ratio')
                     preprocessed_shape = layer_result.get('preprocessed_shape')
-                    
-                    # Parse preprocessed_shape if it's a string
-                    preprocessed_shape_tuple = None
-                    if preprocessed_shape and isinstance(preprocessed_shape, str):
-                        try:
-                            h, w = map(int, preprocessed_shape.split('x'))
-                            preprocessed_shape_tuple = (h, w)
-                        except:
-                            pass
-                    elif preprocessed_shape:
-                        preprocessed_shape_tuple = preprocessed_shape
-                    
-                    # Create record with new schema (RQ1: all CAMs saved with quality labels)
-                    # CRITICAL: Include object_uid and failure_event_id for alignment analysis
-                    # RQ1: Include CAM target information and quality label
-                    cam_quality = layer_result.get('cam_quality', 'high')  # RQ1: quality label
-                    record = create_cam_record(
-                        model=model_name,
-                        corruption=corruption,
-                        severity=severity,
-                        image_id=image_id,
-                        class_id=class_id,
-                        object_id=object_uid if 'object_uid' in locals() else None,  # Store object_uid
-                        cam_target_class_id=cam_target_class_id,  # RQ1: track target class used for CAM
-                        cam_target_type=cam_target_type,  # RQ1: track target type (gt_class/pred_class/gt_class_miss)
-                        bbox_x1=visdrone_bbox[0],
-                        bbox_y1=visdrone_bbox[1],
-                        bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
-                        bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
-                        layer_role=layer_role,
-                        layer_name=layer_config[layer_role]['name'],
-                        cam_status='ok',  # RQ1: All quality levels are 'ok' (even flat/noisy/low_energy)
-                        fail_reason=None,  # RQ1: No fail_reason for quality issues (they're labels)
-                        cam_quality=cam_quality,  # RQ1: 'high' | 'flat' | 'noisy' | 'low_energy'
-                        cam_h=cam_shape[0] if cam_shape else None,
-                        cam_w=cam_shape[1] if cam_shape else None,
-                        entropy=float(metrics['entropy']),
-                        activation_spread=float(metrics['activation_spread']),
-                        center_shift=float(metrics['center_shift']),
-                        energy_in_bbox=float(metrics['energy_in_bbox']),
-                        activation_fragmentation=float(metrics.get('activation_fragmentation', 0.0)),
-                        bbox_center_activation_distance=float(metrics.get('bbox_center_activation_distance', 0.0)),
-                        letterbox_meta=letterbox_meta,
-                        # QC diagnostic stats (for consistency and debugging)
-                        cam_min=cam_min,
-                        cam_max=cam_max,
-                        cam_sum=cam_sum,
-                        cam_var=cam_var,
-                        cam_std=cam_std,  # 추가: std for QC
-                        cam_dtype=cam_dtype,
-                        finite_ratio=finite_ratio,
-                        preprocessed_shape=preprocessed_shape_tuple,
-                        failure_severity=failure_severity
-                    )
-                    
-                    # Add failure_event_id if available (for alignment analysis)
-                    if use_risk_events and 'failure_event_id' in event:
-                        record['failure_event_id'] = event['failure_event_id']
-                        record['failure_type'] = failure_type
-                    cam_records.append(record)
-                    if layer_role == 'primary':
-                        corruption_cam_stats[corruption]['success'] += 1
-                
-                # Clean up CAM for this layer
-                if cam is not None:
-                    del cam
+
+                    # Stage C: Quality Gate (RQ1: soft labels - all CAMs saved)
+                    cam_quality = layer_result.get('cam_quality', 'unknown')
+                    extraction_errors = ['no_activation', 'no_grad', 'shape_mismatch', 'memory_error', 'cam_extraction_failed', 'layer_not_configured']
+                    is_extraction_error = (cam_status == 'fail' and fail_reason in extraction_errors)
+
+                    if is_extraction_error:
+                        # Extract error information from layer_result
+                        exc_type = layer_result.get('exc_type')
+                        exc_msg = layer_result.get('exc_msg')
+                        traceback_last_lines = layer_result.get('traceback_last_lines')
+                        preprocessed_shape_tuple = None
+                        if preprocessed_shape and isinstance(preprocessed_shape, str):
+                            try:
+                                h, w = map(int, preprocessed_shape.split('x'))
+                                preprocessed_shape_tuple = (h, w)
+                            except Exception:
+                                pass
+                        elif preprocessed_shape:
+                            preprocessed_shape_tuple = preprocessed_shape
+                        record = create_cam_record(
+                            model=model_name,
+                            corruption=corruption,
+                            severity=severity,
+                            image_id=image_id,
+                            class_id=class_id,
+                            object_id=object_uid if 'object_uid' in locals() else None,
+                            cam_target_class_id=cam_target_class_id if 'cam_target_class_id' in locals() else class_id,
+                            cam_target_type=cam_target_type if 'cam_target_type' in locals() else "gt_class",
+                            bbox_x1=visdrone_bbox[0],
+                            bbox_y1=visdrone_bbox[1],
+                            bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
+                            bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
+                            layer_role=layer_role,
+                            layer_name=layer_config[layer_role]['name'],
+                            cam_status='fail',
+                            fail_reason=fail_reason,
+                            cam_quality=cam_quality if 'cam_quality' in locals() else 'extraction_failed',
+                            exc_type=exc_type,
+                            exc_msg=exc_msg,
+                            traceback_last_lines=traceback_last_lines,
+                            cam_min=cam_min,
+                            cam_max=cam_max,
+                            cam_sum=cam_sum,
+                            cam_var=cam_var,
+                            cam_std=cam_std,
+                            cam_dtype=cam_dtype,
+                            finite_ratio=finite_ratio,
+                            preprocessed_shape=preprocessed_shape_tuple,
+                            failure_severity=failure_severity,
+                            xai_method=xai_method
+                        )
+                        if use_risk_events and 'failure_event_id' in event:
+                            record['failure_event_id'] = event['failure_event_id']
+                            record['failure_type'] = failure_type
+                        cam_records.append(record)
+                        if layer_role == 'primary':
+                            corruption_cam_stats[corruption]['failed'] += 1
+                    else:
+                        # Not extraction error: store baseline, save heatmap, compute metrics
+                        if severity == 0:
+                            baseline_cams[xai_method][layer_role] = cam.copy() if cam is not None else None
+
+                        if layer_role == 'primary' and cam is not None:
+                            dasc_cfg = config.get('dasc', {})
+                            save_overlays = dasc_cfg.get('save_heatmap_overlays', False) or gradcam_config.get('save_samples', False)
+                            if save_overlays:
+                                bbox_xyxy_for_overlay = (
+                                    visdrone_bbox[0] * img_width / orig_w,
+                                    visdrone_bbox[1] * img_height / orig_h,
+                                    (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
+                                    (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
+                                )
+                                safe_uid = str(object_uid).replace('/', '_').replace('\\', '_')[:80]
+                                overlay_path = heatmap_base / model_name / corruption / f"L{severity}" / f"{image_id}_{safe_uid}.png"
+                                save_cam_overlay(cam, image, letterbox_meta, overlay_path, bbox_xyxy=bbox_xyxy_for_overlay)
+                            save_raw_cam = gradcam_config.get('save_raw_cam', False)
+                            if save_raw_cam:
+                                raw_cam_dir = Path(config['results'].get('raw_cam_dir', 'results/raw_cam'))
+                                raw_dir = raw_cam_dir / model_name / corruption / f"L{severity}"
+                                raw_dir.mkdir(parents=True, exist_ok=True)
+                                npy_path = raw_dir / f"{image_id}_{safe_uid}.npy"
+                                try:
+                                    np.save(npy_path, cam.astype(np.float32))
+                                except Exception:
+                                    pass
+                                full_overlay_path = raw_dir / f"{image_id}_{safe_uid}_full.png"
+                                save_cam_overlay(cam, image, letterbox_meta, full_overlay_path, bbox_xyxy=None)
+
+                        if cam is not None and baseline_cams[xai_method].get(layer_role) is not None:
+                            bbox_xyxy = (
+                                visdrone_bbox[0] * img_width / orig_w,
+                                visdrone_bbox[1] * img_height / orig_h,
+                                (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
+                                (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
+                            )
+                            if letterbox_meta is not None:
+                                letterbox_meta['original_width'] = img_width
+                                letterbox_meta['original_height'] = img_height
+                            metrics = compute_cam_metrics(
+                                cam,
+                                bbox_xyxy,
+                                cam_shape,
+                                letterbox_meta=letterbox_meta,
+                                baseline_cam=baseline_cams[xai_method][layer_role]
+                            )
+                            cam_min = layer_result.get('cam_min')
+                            cam_max = layer_result.get('cam_max')
+                            cam_sum = layer_result.get('cam_sum')
+                            cam_var = layer_result.get('cam_var')
+                            cam_std = layer_result.get('cam_std')
+                            cam_dtype = layer_result.get('cam_dtype')
+                            finite_ratio = layer_result.get('finite_ratio')
+                            preprocessed_shape = layer_result.get('preprocessed_shape')
+                            preprocessed_shape_tuple = None
+                            if preprocessed_shape and isinstance(preprocessed_shape, str):
+                                try:
+                                    h, w = map(int, preprocessed_shape.split('x'))
+                                    preprocessed_shape_tuple = (h, w)
+                                except Exception:
+                                    pass
+                            elif preprocessed_shape:
+                                preprocessed_shape_tuple = preprocessed_shape
+                            cam_sum_val = layer_result.get('cam_sum')
+                            spread_val = float(metrics.get('activation_spread', 0) or 0)
+                            cam_valid = (cam_sum_val is not None and float(cam_sum_val) >= 1e-8 and spread_val > 0)
+                            cam_quality = layer_result.get('cam_quality', 'high')
+                            record = create_cam_record(
+                                model=model_name,
+                                corruption=corruption,
+                                severity=severity,
+                                image_id=image_id,
+                                class_id=class_id,
+                                object_id=object_uid if 'object_uid' in locals() else None,
+                                cam_target_class_id=cam_target_class_id,
+                                cam_target_type=cam_target_type,
+                                bbox_x1=visdrone_bbox[0],
+                                bbox_y1=visdrone_bbox[1],
+                                bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
+                                bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
+                                layer_role=layer_role,
+                                layer_name=layer_config[layer_role]['name'],
+                                cam_status='ok',
+                                fail_reason=None,
+                                cam_quality=cam_quality,
+                                cam_valid=cam_valid,
+                                cam_h=cam_shape[0] if cam_shape else None,
+                                cam_w=cam_shape[1] if cam_shape else None,
+                                entropy=float(metrics['entropy']),
+                                activation_spread=float(metrics['activation_spread']),
+                                center_shift=float(metrics['center_shift']),
+                                energy_in_bbox=float(metrics['energy_in_bbox']),
+                                energy_in_bbox_1_1x=float(metrics.get('energy_in_bbox_1_1x', 0.0)) if metrics.get('energy_in_bbox_1_1x') is not None else None,
+                                energy_in_bbox_1_25x=float(metrics.get('energy_in_bbox_1_25x', 0.0)) if metrics.get('energy_in_bbox_1_25x') is not None else None,
+                                ring_energy_ratio=float(metrics.get('ring_energy_ratio')) if metrics.get('ring_energy_ratio') is not None else None,
+                                full_cam_sum=float(metrics['full_cam_sum']) if metrics.get('full_cam_sum') is not None else None,
+                                full_cam_entropy=float(metrics['full_cam_entropy']) if metrics.get('full_cam_entropy') is not None else None,
+                                activation_fragmentation=float(metrics.get('activation_fragmentation', 0.0)),
+                                bbox_center_activation_distance=float(metrics.get('bbox_center_activation_distance', 0.0)),
+                                peak_bbox_distance=float(metrics.get('peak_bbox_distance', 0.0)) if metrics.get('peak_bbox_distance') is not None else None,
+                                letterbox_meta=letterbox_meta,
+                                cam_min=cam_min,
+                                cam_max=cam_max,
+                                cam_sum=cam_sum,
+                                cam_var=cam_var,
+                                cam_std=cam_std,
+                                cam_dtype=cam_dtype,
+                                finite_ratio=finite_ratio,
+                                preprocessed_shape=preprocessed_shape_tuple,
+                                failure_severity=failure_severity,
+                                xai_method=xai_method
+                            )
+                            if use_risk_events and 'failure_event_id' in event:
+                                record['failure_event_id'] = event['failure_event_id']
+                                record['failure_type'] = failure_type
+                            cam_records.append(record)
+                            if layer_role == 'primary':
+                                corruption_cam_stats[corruption]['success'] += 1
+                        if cam is not None:
+                            del cam
             
             # CRITICAL: Aggressive cleanup after processing all layers
             del image
@@ -893,7 +892,8 @@ def main():
                 torch.cuda.empty_cache() if hasattr(torch.cuda, 'empty_cache') else None
         
         # CRITICAL: Clean up after each failure event (all severities processed)
-        baseline_cams.clear()
+        for _m in baseline_cams:
+            baseline_cams[_m].clear()
         # Aggressive cleanup after each event
         gc.collect()
         if torch.cuda.is_available():
@@ -908,9 +908,8 @@ def main():
                 gc.collect()  # Second pass for stubborn references
     
     # CRITICAL: Clean up model and gradcam after all events
-    for layer_role, gradcam_instance in gradcam_instances.items():
-        if gradcam_instance is not None:
-            del gradcam_instance
+    for _method in gradcam_instances:
+        gradcam_instances[_method].clear()
     gradcam_instances.clear()
     del torch_model
     del yolo

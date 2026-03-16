@@ -14,11 +14,16 @@ def compute_energy_in_bbox(
 ) -> float:
     """Compute energy (activation) inside GT bbox.
     
+    E_bbox = sum(CAM inside bbox) / sum(CAM)  [denominator = full CAM sum, not bbox sum]
+    
+    Design: CAM should be full-image; bbox is the measurement window. If CAM is bbox-crop-only,
+    E_bbox is always 1.0 and distance/attention-leakage metrics are distorted.
+    
     Args:
         cam: CAM heatmap (H, W)
         bbox: (x_center, y_center, width, height) in normalized coordinates
-        img_width: Image width
-        img_height: Image height
+        img_width: Image width (CAM width when CAM is crop)
+        img_height: Image height (CAM height when CAM is crop)
         
     Returns:
         Ratio of energy inside bbox to total energy
@@ -36,10 +41,71 @@ def compute_energy_in_bbox(
     x2 = max(0, min(x2, img_width - 1))
     y2 = max(0, min(y2, img_height - 1))
     
-    total_energy = np.sum(cam)
+    total_energy = np.sum(cam)  # Full CAM sum (must be denominator for ratio)
     if total_energy == 0:
         return 0.0
+    bbox_energy = np.sum(cam[y1:y2+1, x1:x2+1])
+    return bbox_energy / total_energy  # Not bbox_energy/bbox_energy
+
+
+def compute_ring_energy_ratio(
+    cam: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    img_width: int,
+    img_height: int,
+    outer_scale: float = 1.25,
+) -> float:
+    """Ring Energy Ratio: E_ring_ratio = energy_bbox / (energy_bbox + energy_ring).
     
+    ring = (outer_scale * bbox) \\ bbox (e.g. 1.25x expanded minus bbox).
+    >0.5 → object-centric; ≈0.5 → similar to context; <0.5 → context-centric.
+    Tiny-object friendly: compares bbox vs immediate surround instead of vs full image.
+    
+    Args:
+        cam: CAM heatmap (H, W), full image
+        bbox: (x_center, y_center, width, height) normalized
+        img_width, img_height: CAM dimensions
+        outer_scale: scale for outer region (default 1.25)
+    
+    Returns:
+        Ratio in [0, 1], or 0.5 when denominator is 0 (neutral).
+    """
+    total = float(np.sum(cam))
+    if total == 0:
+        return 0.5
+    energy_bbox = compute_energy_in_bbox(cam, bbox, img_width, img_height) * total
+    energy_outer = compute_energy_in_bbox_expanded(cam, bbox, img_width, img_height, scale=outer_scale) * total
+    energy_ring = energy_outer - energy_bbox  # ring = 1.25x \ bbox
+    denom = energy_bbox + energy_ring  # = energy_outer
+    if denom == 0:
+        return 0.5
+    return float(energy_bbox / denom)
+
+
+def compute_energy_in_bbox_expanded(
+    cam: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    img_width: int,
+    img_height: int,
+    scale: float = 1.1,
+) -> float:
+    """Compute energy inside bbox scaled by `scale` (center fixed, width/height scaled).
+    Used for ROI sensitivity: 1.1x and 1.25x expanded bbox.
+    """
+    x_center, y_center, width, height = bbox
+    w2 = min(0.5, width * scale / 2)
+    h2 = min(0.5, height * scale / 2)
+    x1 = int((x_center - w2) * img_width)
+    y1 = int((y_center - h2) * img_height)
+    x2 = int((x_center + w2) * img_width)
+    y2 = int((y_center + h2) * img_height)
+    x1 = max(0, min(x1, img_width - 1))
+    y1 = max(0, min(y1, img_height - 1))
+    x2 = max(0, min(x2, img_width - 1))
+    y2 = max(0, min(y2, img_height - 1))
+    total_energy = np.sum(cam)  # Full CAM sum
+    if total_energy == 0:
+        return 0.0
     bbox_energy = np.sum(cam[y1:y2+1, x1:x2+1])
     return bbox_energy / total_energy
 
@@ -182,7 +248,7 @@ def compute_bbox_center_activation_distance(
 ) -> float:
     """
     Distance between bbox center and activation center of mass (single CAM).
-    Tiny-object friendly: measures how much activation drifts from the GT bbox center.
+    Primary metric for gradual degradation: always continuous (no bimodal 0/1).
 
     Args:
         cam: CAM heatmap (H, W)
@@ -209,6 +275,33 @@ def compute_bbox_center_activation_distance(
     return float(dist / max_dist) if max_dist > 0 else 0.0
 
 
+def compute_peak_bbox_distance(
+    cam: np.ndarray,
+    bbox_xyxy_cam: Tuple[float, float, float, float],
+) -> float:
+    """
+    Distance between CAM peak (argmax) and bbox center. Continuous, stable for tiny objects.
+
+    Args:
+        cam: CAM heatmap (H, W)
+        bbox_xyxy_cam: (x1, y1, x2, y2) in CAM pixel coordinates
+
+    Returns:
+        Normalized distance (0 = peak on bbox center, 1 = diagonal)
+    """
+    if cam.size == 0 or cam.max() == 0:
+        return 0.0
+    peak_flat = np.argmax(cam)
+    peak_y = peak_flat // cam.shape[1]
+    peak_x = peak_flat % cam.shape[1]
+    x1, y1, x2, y2 = bbox_xyxy_cam
+    bbox_cy = (y1 + y2) / 2.0
+    bbox_cx = (x1 + x2) / 2.0
+    dist = np.sqrt((peak_y - bbox_cy) ** 2 + (peak_x - bbox_cx) ** 2)
+    max_dist = np.sqrt(cam.shape[0] ** 2 + cam.shape[1] ** 2)
+    return float(dist / max_dist) if max_dist > 0 else 0.0
+
+
 def compute_cam_metrics(
     cam: np.ndarray,
     bbox_xyxy: Tuple[float, float, float, float],
@@ -218,8 +311,11 @@ def compute_cam_metrics(
 ) -> Dict[str, float]:
     """Compute all CAM distribution metrics (layer-invariant).
     
+    Assumes full-image CAM; bbox is used only as a measurement window (energy in bbox,
+    distance from bbox center/peak, etc.). Do not use bbox-cropped CAM here.
+    
     Args:
-        cam: Current CAM heatmap (H, W)
+        cam: Current CAM heatmap (H, W) — full image
         bbox_xyxy: GT bbox (x1, y1, x2, y2) in original image pixels
         cam_shape: (cam_height, cam_width) CAM map dimensions
         letterbox_meta: Optional dict with letterbox transformation info
@@ -262,12 +358,20 @@ def compute_cam_metrics(
     
     # Energy in bbox
     metrics['energy_in_bbox'] = compute_energy_in_bbox(cam, bbox_norm, cam_w, cam_h)
+    # Expanded bbox (ROI sensitivity: 보완 전략 3.2)
+    metrics['energy_in_bbox_1_1x'] = compute_energy_in_bbox_expanded(cam, bbox_norm, cam_w, cam_h, scale=1.1)
+    metrics['energy_in_bbox_1_25x'] = compute_energy_in_bbox_expanded(cam, bbox_norm, cam_w, cam_h, scale=1.25)
+    # Ring Energy Ratio: bbox vs ring (1.25x \ bbox); >0.5 object-centric, <0.5 context-centric
+    metrics['ring_energy_ratio'] = compute_ring_energy_ratio(cam, bbox_norm, cam_w, cam_h, outer_scale=1.25)
+    # Full CAM sum (for 원인 분리: full vs ROI-only)
+    metrics['full_cam_sum'] = float(np.sum(cam))
     
     # Activation spread
     metrics['activation_spread'] = compute_activation_spread(cam)
     
-    # Entropy
+    # Entropy (and full_cam_entropy = same when CAM is ROI-masked)
     metrics['entropy'] = compute_cam_entropy(cam)
+    metrics['full_cam_entropy'] = metrics['entropy']
     
     # Center shift (if baseline provided)
     if baseline_cam is not None:
@@ -285,5 +389,9 @@ def compute_cam_metrics(
         metrics['bbox_center_activation_distance'] = compute_bbox_center_activation_distance(cam, bbox_cam_tuple)
     except Exception:
         metrics['bbox_center_activation_distance'] = 0.0
+    try:
+        metrics['peak_bbox_distance'] = compute_peak_bbox_distance(cam, bbox_cam_tuple)
+    except Exception:
+        metrics['peak_bbox_distance'] = 0.0
 
     return metrics
