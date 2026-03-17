@@ -178,10 +178,16 @@ gradcam:
     cam_var_epsilon: 1e-10  # CRITICAL: Reduced from 1e-8 to 1e-10 for debugging (allow near-flat CAMs to pass)
   top_k_percent: 10
   save_samples: true
+<<<<<<< HEAD
   save_raw_cam: false  # If true: save full CAM as .npy and full-image overlay _full.png (진짜 CAM 없음 vs ROI 구분)
   max_samples: null  # null = process all. Or use CLI: python scripts/05_gradcam_failure_analysis.py --max-events 10 (quick test)
   # Primary for gradual curves: bbox_dist, peak_dist, entropy, spread. ring_energy_ratio = bbox vs ring (tiny-object friendly).
   metrics: ["bbox_center_activation_distance", "entropy", "activation_spread", "center_shift", "activation_fragmentation", "energy_in_bbox", "energy_in_bbox_1_25x", "ring_energy_ratio"]
+=======
+  max_samples: null  # RQ1: null = process all risk events. Set to number to cap (e.g. 20 for debug).
+  # Lead/collapse and summary table use these 4 (bbox_dist, peak_dist, spread, E_ring_ratio)
+  metrics: ["bbox_center_activation_distance", "peak_bbox_distance", "activation_spread", "ring_energy_ratio"]
+>>>>>>> c772c63 (구버전 업데이트)
   # Dynamic refinement: analyze failure region in detail
   dynamic_refinement:
     enabled: true

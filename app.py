@@ -36,6 +36,12 @@ HEATMAP_DIR = get_heatmap_dir()
 RESULTS_DIR = ROOT / "results"
 
 
+def _print_results_path():
+    """Print once at startup so you know which folder's results are being shown."""
+    print(f"[app] Results dir (this folder's results): {RESULTS_DIR.resolve()}")
+    print(f"[app] Heatmap dir: {HEATMAP_DIR.resolve()}")
+
+
 def get_xai_methods_from_config():
     """Read gradcam.xai_methods from experiment.yaml so FastCAM etc. show even before folders exist."""
     config_path = ROOT / "configs" / "experiment.yaml"

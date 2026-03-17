@@ -152,6 +152,108 @@ def compute_activation_spread(
     return spread / max_distance
 
 
+def compute_bbox_center_activation_distance(
+    cam: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    cam_w: int,
+    cam_h: int,
+    threshold: float = 0.1
+) -> float:
+    """Distance from bbox center to activation center of mass (normalized).
+    bbox_dist: higher = CAM focus drifts from object.
+    """
+    if cam.max() == 0:
+        return 0.0
+    cam_norm = cam / cam.max()
+    activated = cam_norm >= threshold
+    if not np.any(activated):
+        return 0.0
+    y_coords, x_coords = np.where(activated)
+    act_cy, act_cx = np.mean(y_coords), np.mean(x_coords)
+    x_center, y_center, width, height = bbox
+    # bbox is normalized [0,1]; convert to CAM pixel center
+    bbox_cx = x_center * cam_w
+    bbox_cy = y_center * cam_h
+    dist = np.sqrt((act_cy - bbox_cy) ** 2 + (act_cx - bbox_cx) ** 2)
+    max_d = np.sqrt(cam_h ** 2 + cam_w ** 2)
+    return float(dist / max_d) if max_d > 0 else 0.0
+
+
+def compute_peak_bbox_distance(
+    cam: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    cam_w: int,
+    cam_h: int
+) -> float:
+    """Distance from CAM peak (argmax) to bbox center (normalized).
+    peak_dist: higher = peak activation is far from object.
+    """
+    flat_idx = np.argmax(cam)
+    peak_y = flat_idx // cam.shape[1]
+    peak_x = flat_idx % cam.shape[1]
+    x_center, y_center, width, height = bbox
+    bbox_cx = x_center * cam_w
+    bbox_cy = y_center * cam_h
+    dist = np.sqrt((peak_y - bbox_cy) ** 2 + (peak_x - bbox_cx) ** 2)
+    max_d = np.sqrt(cam_h ** 2 + cam_w ** 2)
+    return float(dist / max_d) if max_d > 0 else 0.0
+
+
+def compute_ring_energy_ratio(
+    cam: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    cam_w: int,
+    cam_h: int,
+    outer_scale: float = 1.25
+) -> float:
+    """Ratio of activation energy in ring (bbox to outer_scale*bbox) to total.
+    E_ring_ratio: higher = more activation outside object bbox (dispersion).
+    """
+    x_center, y_center, width, height = bbox
+    # pixel coords
+    cx = x_center * cam_w
+    cy = y_center * cam_h
+    w = max(1, width * cam_w)
+    h = max(1, height * cam_h)
+    x1 = int(cx - w / 2)
+    y1 = int(cy - h / 2)
+    x2 = int(cx + w / 2)
+    y2 = int(cy + h / 2)
+    x1 = max(0, min(x1, cam_w - 1))
+    y1 = max(0, min(y1, cam_h - 1))
+    x2 = max(0, min(x2, cam_w - 1))
+    y2 = max(0, min(y2, cam_h - 1))
+    # outer bbox (same center, outer_scale)
+    ow = max(1, w * outer_scale)
+    oh = max(1, h * outer_scale)
+    ox1 = max(0, int(cx - ow / 2))
+    oy1 = max(0, int(cy - oh / 2))
+    ox2 = min(cam_w, int(cx + ow / 2) + 1)
+    oy2 = min(cam_h, int(cy + oh / 2) + 1)
+    total_energy = float(np.sum(cam))
+    if total_energy == 0:
+        return 0.0
+    inner = np.sum(cam[y1:y2 + 1, x1:x2 + 1])
+    outer_region = cam[oy1:oy2, ox1:ox2].copy()
+    # mask out inner to get ring only
+    ly, lx = outer_region.shape[0], outer_region.shape[1]
+    iy1 = y1 - oy1
+    iy2 = y2 - oy1 + 1
+    ix1 = x1 - ox1
+    ix2 = x2 - ox1 + 1
+    if iy1 < 0:
+        iy1 = 0
+    if ix1 < 0:
+        ix1 = 0
+    if iy2 > ly:
+        iy2 = ly
+    if ix2 > lx:
+        ix2 = lx
+    outer_region[iy1:iy2, ix1:ix2] = 0
+    ring_energy = float(np.sum(outer_region))
+    return ring_energy / total_energy
+
+
 def compute_cam_entropy(
     cam: np.ndarray
 ) -> float:
@@ -369,7 +471,18 @@ def compute_cam_metrics(
     # Activation spread
     metrics['activation_spread'] = compute_activation_spread(cam)
     
+<<<<<<< HEAD
     # Entropy (and full_cam_entropy = same when CAM is ROI-masked)
+=======
+    # New lead/collapse metrics (unified with summary table)
+    metrics['bbox_center_activation_distance'] = compute_bbox_center_activation_distance(
+        cam, bbox_norm, cam_w, cam_h
+    )
+    metrics['peak_bbox_distance'] = compute_peak_bbox_distance(cam, bbox_norm, cam_w, cam_h)
+    metrics['ring_energy_ratio'] = compute_ring_energy_ratio(cam, bbox_norm, cam_w, cam_h)
+    
+    # Entropy
+>>>>>>> c772c63 (구버전 업데이트)
     metrics['entropy'] = compute_cam_entropy(cam)
     metrics['full_cam_entropy'] = metrics['entropy']
     

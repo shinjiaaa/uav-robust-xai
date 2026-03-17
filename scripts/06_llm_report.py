@@ -51,6 +51,20 @@ def load_metrics(config):
     else:
         metrics['tiny_curves'] = []
     
+    # DASC curves (IoU and Miss Rate curves)
+    dasc_curves_dir = results_root / "dasc_curves"
+    iou_curve_csv = dasc_curves_dir / "iou_curve.csv"
+    if iou_curve_csv.exists():
+        metrics['iou_curve'] = pd.read_csv(iou_curve_csv).to_dict('records')
+    else:
+        metrics['iou_curve'] = []
+    
+    miss_rate_curve_csv = dasc_curves_dir / "miss_rate_curve.csv"
+    if miss_rate_curve_csv.exists():
+        metrics['miss_rate_curve'] = pd.read_csv(miss_rate_curve_csv).to_dict('records')
+    else:
+        metrics['miss_rate_curve'] = []
+    
     # Failure events
     failure_events_csv = results_root / "failure_events.csv"
     if failure_events_csv.exists():
@@ -128,6 +142,8 @@ def main():
         print(f"  Dataset metrics: {len(metrics['dataset'])} records")
         print(f"  Detection records: {len(metrics['detection_records'])} records")
         print(f"  Tiny curves: {len(metrics['tiny_curves'])} records")
+        print(f"  IoU curve: {len(metrics['iou_curve'])} records")
+        print(f"  Miss rate curve: {len(metrics['miss_rate_curve'])} records")
         print(f"  Failure events: {len(metrics['failure_events'])} events")
         print(f"  Risk regions: {len(metrics['risk_regions'])} regions")
         print(f"  CAM records: {len(metrics.get('cam_records', []))} records")

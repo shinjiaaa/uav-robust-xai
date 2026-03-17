@@ -50,11 +50,12 @@ def create_cam_record(
     cam_w: Optional[int] = None,
     norm_method: str = "min_max",  # Normalization method
     
-    # Metrics
+    # Metrics (legacy + lead/collapse unified set)
     entropy: Optional[float] = None,
     activation_spread: Optional[float] = None,
     center_shift: Optional[float] = None,
     energy_in_bbox: Optional[float] = None,
+<<<<<<< HEAD
     energy_in_bbox_1_1x: Optional[float] = None,   # 보완: 1.1x expanded bbox (ROI 민감도)
     energy_in_bbox_1_25x: Optional[float] = None,  # 보완: 1.25x expanded bbox
     ring_energy_ratio: Optional[float] = None,    # bbox vs ring(1.25x\bbox); >0.5 object-centric, <0.5 context
@@ -64,6 +65,12 @@ def create_cam_record(
     bbox_center_activation_distance: Optional[float] = None,  # Primary: distance(CAM CoM, bbox center); continuous
     peak_bbox_distance: Optional[float] = None,  # distance(CAM peak, bbox center); continuous
 
+=======
+    bbox_center_activation_distance: Optional[float] = None,
+    peak_bbox_distance: Optional[float] = None,
+    ring_energy_ratio: Optional[float] = None,
+    
+>>>>>>> c772c63 (구버전 업데이트)
     # Performance (from detection)
     detected: Optional[int] = None,  # 0 or 1
     conf: Optional[float] = None,
@@ -136,6 +143,7 @@ def create_cam_record(
         'activation_spread': activation_spread,
         'center_shift': center_shift,
         'energy_in_bbox': energy_in_bbox,
+<<<<<<< HEAD
         'energy_in_bbox_1_1x': energy_in_bbox_1_1x,
         'energy_in_bbox_1_25x': energy_in_bbox_1_25x,
         'ring_energy_ratio': ring_energy_ratio,
@@ -145,6 +153,12 @@ def create_cam_record(
         'bbox_center_activation_distance': bbox_center_activation_distance,
         'peak_bbox_distance': peak_bbox_distance,
 
+=======
+        'bbox_center_activation_distance': bbox_center_activation_distance,
+        'peak_bbox_distance': peak_bbox_distance,
+        'ring_energy_ratio': ring_energy_ratio,
+        
+>>>>>>> c772c63 (구버전 업데이트)
         # Performance
         'detected': detected,
         'conf': conf,

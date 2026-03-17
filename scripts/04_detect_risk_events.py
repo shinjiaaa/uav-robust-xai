@@ -103,6 +103,12 @@ def make_risk_events(detection_df: pd.DataFrame, config: dict = None) -> pd.Data
         df["base_pred_score"] = None
         df["base_match_iou"] = None
     
+    # Ensure base columns exist (merge may not add them if pred_score/match_iou were missing in base)
+    if "base_pred_score" not in df.columns:
+        df["base_pred_score"] = None
+    if "base_match_iou" not in df.columns:
+        df["base_match_iou"] = None
+    
     # 3. Drop 규칙 (간단 버전: 비율/절대 혼합)
     base_score = df["base_pred_score"].fillna(0.0).clip(lower=1e-6)
     base_iou = df["base_match_iou"].fillna(0.0)

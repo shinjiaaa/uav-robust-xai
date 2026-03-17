@@ -1,20 +1,11 @@
 """
 LLM-based report generation.
-
-- Fixes:
-  1) load_metrics() now loads all CSVs that summarize_metrics() expects
-     (detection_records, failure_events, cam_metrics, risk_regions, instability, gradcam_error).
-  2) Fixed multiple indentation / block-structure bugs that would crash at runtime:
-     - performance_cam_alignment: CAM-metric loop was accidentally indented under dict literal
-     - lead_lag_analysis: missing per-corruption dict init + same indentation issue
-  3) Added defensive column handling and consistent key names.
 """
 
 import json
 from pathlib import Path
 from typing import Dict, Optional
 import pandas as pd
-# import numpy as np
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
@@ -239,6 +230,11 @@ def summarize_metrics(metrics: Dict) -> Dict:
         Summarized metrics dictionary
     """
     summarized: Dict = {}
+    
+    # Unified CAM metrics list
+    cam_metrics_list = ['bbox_center_activation_distance', 'peak_bbox_distance', 'activation_spread', 'ring_energy_ratio']
+    all_expected_corruptions = ['fog', 'lowlight', 'motion_blur']
+    all_severities = [0, 1, 2, 3, 4]
     
     # CRITICAL: Load detection_records once at the beginning for data consistency checks
     detection_records = metrics.get('detection_records', [])
@@ -686,9 +682,8 @@ def summarize_metrics(metrics: Dict) -> Dict:
 
     if has_cam_data and detection_records:
 
-        cam_metrics_list = ['energy_in_bbox', 'activation_spread', 'entropy', 'center_shift']
-        all_expected_corruptions = ['fog', 'lowlight', 'motion_blur']
-        all_severities = [0, 1, 2, 3, 4]
+        # Lead/collapse and summary table use the same 4 metrics (unified)
+        # cam_metrics_list, all_expected_corruptions, all_severities moved to top
 
         # ---- Table 4: CAM metrics by corruption x severity
         # CRITICAL: Only include corruptions that have actual detection records
@@ -769,12 +764,12 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 # No detection records for this corruption - mark all severities as "no data"
                 for sev in all_severities:
                     cam_metrics_by_corruption_severity.setdefault(corruption, {})[sev] = {
-                        'energy_in_bbox_mean': None,
+                        'bbox_center_activation_distance_mean': None,
+                        'peak_bbox_distance_mean': None,
                         'activation_spread_mean': None,
-                        'entropy_mean': None,
-                        'center_shift_mean': None,
+                        'ring_energy_ratio_mean': None,
                         'n_cam_frames': 0,
-                        'failure_severity': None,  # Add failure_severity
+                        'failure_severity': None,
                         'note': 'N/A (no detection records - data inconsistency)'
                     }
                 continue
@@ -852,16 +847,18 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         # Calculate CAM coverage ratio
                         cam_valid_ratio = float(n_cam_frames / n_expected_frames) if n_expected_frames is not None and n_expected_frames > 0 else None
                         
-                        # Compute metrics only from OK records
+                        # Compute metrics only from OK records (new 4: bbox_dist, peak_dist, spread, E_ring_ratio)
+                        def _mean_if(col):
+                            return float(metric_df[col].mean()) if col in metric_df.columns and len(metric_df) > 0 else None
                         cam_metrics_by_corruption_severity[corruption][sev] = {
-                            'energy_in_bbox_mean': float(metric_df['energy_in_bbox'].mean()) if 'energy_in_bbox' in metric_df.columns and len(metric_df) > 0 else None,
-                            'activation_spread_mean': float(metric_df['activation_spread'].mean()) if 'activation_spread' in metric_df.columns and len(metric_df) > 0 else None,
-                            'entropy_mean': float(metric_df['entropy'].mean()) if 'entropy' in metric_df.columns and len(metric_df) > 0 else None,
-                            'center_shift_mean': float(metric_df['center_shift'].mean()) if 'center_shift' in metric_df.columns and len(metric_df) > 0 else None,
+                            'bbox_center_activation_distance_mean': _mean_if('bbox_center_activation_distance'),
+                            'peak_bbox_distance_mean': _mean_if('peak_bbox_distance'),
+                            'activation_spread_mean': _mean_if('activation_spread'),
+                            'ring_energy_ratio_mean': _mean_if('ring_energy_ratio'),
                             'n_cam_frames': int(n_cam_frames),
                             'n_expected_frames': int(n_expected_frames) if n_expected_frames is not None else None,
-                            'cam_valid_ratio': cam_valid_ratio,  # CAM coverage: n_cam_frames / n_expected_frames
-                            'failure_severity': unified_failure_sev,  # Add failure_severity
+                            'cam_valid_ratio': cam_valid_ratio,
+                            'failure_severity': unified_failure_sev,
                             'cam_failure_rate': cam_failure_stats_by_severity.get(sev, {}).get('failure_rate'),
                             'note': f'Computed from {n_cam_frames} CAM frames (cam_status=ok only)' if n_cam_frames > 0 else 'N/A (no valid CAM frames, all failed)'
                         }
@@ -887,14 +884,14 @@ def summarize_metrics(metrics: Dict) -> Dict:
                             note = 'N/A (n_cam_frames=0, no CAM attempts)'
                         
                         cam_metrics_by_corruption_severity[corruption][sev] = {
-                            'energy_in_bbox_mean': None,
+                            'bbox_center_activation_distance_mean': None,
+                            'peak_bbox_distance_mean': None,
                             'activation_spread_mean': None,
-                            'entropy_mean': None,
-                            'center_shift_mean': None,
+                            'ring_energy_ratio_mean': None,
                             'n_cam_frames': 0,
                             'n_expected_frames': int(n_expected_frames) if n_expected_frames is not None else None,
                             'cam_valid_ratio': None,
-                            'failure_severity': unified_failure_sev,  # Add failure_severity even when n_cam_frames=0
+                            'failure_severity': unified_failure_sev,
                             'cam_failure_rate': failure_info.get('failure_rate') if failure_info else None,
                             'note': note
                         }
@@ -913,14 +910,14 @@ def summarize_metrics(metrics: Dict) -> Dict:
                             n_expected_frames = None
                         
                         cam_metrics_by_corruption_severity[corruption][sev] = {
-                            'energy_in_bbox_mean': None,
+                            'bbox_center_activation_distance_mean': None,
+                            'peak_bbox_distance_mean': None,
                             'activation_spread_mean': None,
-                            'entropy_mean': None,
-                            'center_shift_mean': None,
+                            'ring_energy_ratio_mean': None,
                             'n_cam_frames': 0,
                             'n_expected_frames': int(n_expected_frames) if n_expected_frames is not None else None,
                             'cam_valid_ratio': None,
-                            'failure_severity': unified_failure_sev,  # Add failure_severity even when CAM data not available
+                            'failure_severity': unified_failure_sev,
                             'cam_failure_rate': None,
                             'note': 'N/A (CAM data not available for this corruption, n_cam_frames=0)'
                         }
@@ -974,10 +971,10 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 else:
                     n_expected_frames = len(sev_det) if len(sev_det) > 0 else None
                 cam_metrics_by_corruption_severity[corruption][sev] = {
-                    'energy_in_bbox_mean': None,
+                    'bbox_center_activation_distance_mean': None,
+                    'peak_bbox_distance_mean': None,
                     'activation_spread_mean': None,
-                    'entropy_mean': None,
-                    'center_shift_mean': None,
+                    'ring_energy_ratio_mean': None,
                     'n_cam_frames': 0,
                     'n_expected_frames': int(n_expected_frames) if n_expected_frames is not None else None,
                     'cam_valid_ratio': None,
@@ -1369,14 +1366,26 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 risk_events_df = risk_events_df.drop_duplicates(subset=['corruption', 'object_uid', 'failure_type'], keep='first').copy()
                 print(f"[INFO] Deduplicated risk_events: {len(risk_events_df)} unique events (corruption, object_uid, failure_type)")
             
-            # CRITICAL: cam_change_sev = fixed detector (paper-friendly)
-            # (A) Z-score: z(sev) = (m(sev) - mean(m0)) / (std(m0) + 1e-8); cam_change_sev = min sev s.t. |z(sev)| >= 2
-            # (B) Optional: 2+ metrics with |z| >= 2 → cam_change (ensemble)
+            # CRITICAL: Align evaluation criteria with data — use same set for lead as in summary/cam_records
+            # If cam_records has "new 4" use them; else fall back to "old 4" (이전 커밋/되돌리기 후 구 기준 유지)
+            NEW_FOUR = ['bbox_center_activation_distance', 'peak_bbox_distance', 'activation_spread', 'ring_energy_ratio']
+            OLD_FOUR = ['energy_in_bbox', 'activation_spread', 'entropy', 'center_shift']
+            has_new = len(cam_records_df) > 0 and all(c in cam_records_df.columns for c in NEW_FOUR)
+            has_old = len(cam_records_df) > 0 and all(c in cam_records_df.columns for c in OLD_FOUR)
+            if has_new:
+                CAM_METRICS_FOR_ENSEMBLE = NEW_FOUR
+                METRIC_SET_LABEL = 'new4 (bbox_dist, peak_dist, spread, E_ring_ratio)'
+            elif has_old:
+                CAM_METRICS_FOR_ENSEMBLE = OLD_FOUR
+                METRIC_SET_LABEL = 'legacy4 (energy_in_bbox, activation_spread, entropy, center_shift)'
+            else:
+                CAM_METRICS_FOR_ENSEMBLE = ['activation_spread']  # at least one always present
+                METRIC_SET_LABEL = 'activation_spread only'
+            print(f"[INFO] Alignment cam_change_sev metric set: {METRIC_SET_LABEL}")
             REPRESENTATIVE_CAM_METRIC = 'activation_spread'
-            Z_SCORE_THRESHOLD = 2.0  # |z| >= 2 for significant CAM change
-            USE_CAM_ENSEMBLE = False  # If True: require >= MIN_METRICS_CHANGED metrics with |z| >= 2
-            MIN_METRICS_CHANGED = 2
-            CAM_METRICS_FOR_ENSEMBLE = ['energy_in_bbox', 'activation_spread', 'entropy', 'center_shift']
+            Z_SCORE_THRESHOLD = 2.0
+            USE_CAM_ENSEMBLE = len(CAM_METRICS_FOR_ENSEMBLE) >= 2
+            MIN_METRICS_CHANGED = min(2, len(CAM_METRICS_FOR_ENSEMBLE))
 
             alignment_analysis = {}
 
@@ -1412,21 +1421,19 @@ def summarize_metrics(metrics: Dict) -> Dict:
                             cam_change_sev = sev
                             metric_used = 'ensemble'
                             break
-                    else:
-                        if REPRESENTATIVE_CAM_METRIC not in baseline_cam.columns or REPRESENTATIVE_CAM_METRIC not in sev_cam.columns:
-                            continue
+                    # single-metric branch (or fallback when ensemble did not trigger)
+                    if cam_change_sev is None and REPRESENTATIVE_CAM_METRIC in baseline_cam.columns and REPRESENTATIVE_CAM_METRIC in sev_cam.columns:
                         m0 = baseline_cam[REPRESENTATIVE_CAM_METRIC].dropna()
                         ms = sev_cam[REPRESENTATIVE_CAM_METRIC].dropna()
-                        if len(m0) < 1 or len(ms) < 1:
-                            continue
-                        mean0, std0 = m0.mean(), m0.std()
-                        if pd.isna(std0) or std0 == 0:
-                            std0 = 1e-8
-                        z = (ms.mean() - mean0) / std0
-                        if abs(z) >= Z_SCORE_THRESHOLD:
-                            cam_change_sev = sev
-                            metric_used = REPRESENTATIVE_CAM_METRIC
-                            break
+                        if len(m0) >= 1 and len(ms) >= 1:
+                            mean0, std0 = m0.mean(), m0.std()
+                            if pd.isna(std0) or std0 == 0:
+                                std0 = 1e-8
+                            z = (ms.mean() - mean0) / std0
+                            if abs(z) >= Z_SCORE_THRESHOLD:
+                                cam_change_sev = sev
+                                metric_used = REPRESENTATIVE_CAM_METRIC
+                                break
                 return (cam_change_sev, metric_used)
 
             # CRITICAL: Process ALL events from risk_events_df (even if CAM data is missing)
@@ -1464,6 +1471,10 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         pass
 
                 if len(event_cam) > 0:
+                    # CRITICAL: Coerce severity to int (CSV may be string/float); use only CAM rows up to performance failure
+                    if 'severity' in event_cam.columns:
+                        event_cam = event_cam.copy()
+                        event_cam['severity'] = pd.to_numeric(event_cam['severity'], errors='coerce').fillna(-1).astype(int)
                     event_cam = event_cam[
                         (event_cam['corruption'] == corruption) &
                         (event_cam['severity'] <= start_severity)
@@ -1475,25 +1486,30 @@ def summarize_metrics(metrics: Dict) -> Dict:
                 if len(event_cam) > 0:
                     event_cam_primary = event_cam[event_cam.get('layer_role', 'primary') == 'primary'].copy()
                     if len(event_cam_primary) > 0:
-                        severity_order = sorted(event_cam_primary['severity'].unique())
+                        # CRITICAL: Use 'severity' (corruption level 0..4), NOT 'failure_severity'
+                        severity_order = sorted(int(s) for s in event_cam_primary['severity'].dropna().unique() if pd.notna(s))
                         cam_change_severity, cam_change_metric = _cam_change_sev_zscore(
                             event_cam_primary, severity_order, baseline_sev=0
                         )
+                        # Defensive: cam_change_severity cannot exceed start_severity (we only looked at severity <= start_severity)
+                        if cam_change_severity is not None and cam_change_severity > start_severity:
+                            print(f"[WARN] alignment: cam_change_severity ({cam_change_severity}) > start_severity ({start_severity}) for event {event_id[:50]}...; clamping to coincident")
+                            cam_change_severity = start_severity
                 
                 # CRITICAL: Determine alignment using unified formula
                 # lead_steps = perf_start_severity - cam_change_severity
                 # > 0 → lead, = 0 → coincident, < 0 → lag
                 # CRITICAL: If CAM is missing, mark as N/A (don't skip the event)
                 if cam_change_severity is not None:
-                    # CRITICAL: Unified lead_steps calculation
-                    lead_steps = start_severity - cam_change_severity
+                    # CRITICAL: Unified lead_steps calculation (both must be int, same scale 0..4)
+                    lead_steps = int(start_severity) - int(cam_change_severity)
                     
                     # CRITICAL: Alignment based on lead_steps (not separate conditions)
                     if lead_steps > 0:
                         alignment = 'lead'
                     elif lead_steps == 0:
                         alignment = 'coincident'
-                    else:  # lead_steps < 0
+                    else:  # lead_steps < 0 (should not happen after clamp; defensive)
                         alignment = 'lag'
                 else:
                     # CAM missing: mark as N/A (event still exists in X-detail)
@@ -1512,7 +1528,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
                     'failure_type': failure_type,
                     'performance_start_severity': start_severity,  # Performance Axis start
                     'cam_change_severity': cam_change_severity,  # Cognition Axis start (one per event)
-                    'cam_change_metric': cam_change_metric,  # Representative metric (activation_spread)
+                    'cam_change_metric': cam_change_metric,  # One of bbox_dist, peak_dist, spread, E_ring_ratio (or ensemble)
                     'alignment': alignment,  # lead / coincident / lag / None (N/A if CAM missing)
                     'lead_steps': lead_steps,  # Unified: perf_start_sev - cam_change_sev (None if CAM missing)
                 })
@@ -1570,7 +1586,7 @@ def summarize_metrics(metrics: Dict) -> Dict:
                         'failure_type': event_row.get('failure_type', ''),
                         'performance_start_severity': perf_start,
                         'cam_change_severity': cam_change,  # None if CAM missing
-                        'cam_change_metric': cam_change_metric if 'cam_change_metric' in locals() else event_row.get('cam_change_metric'),  # activation_spread or None
+                        'cam_change_metric': cam_change_metric if 'cam_change_metric' in locals() else event_row.get('cam_change_metric'),  # new 4 or ensemble
                         'alignment': alignment,  # ALWAYS recalculated alignment (None if CAM missing)
                         'lead_steps': lead_steps  # ALWAYS recalculated lead_steps (None if CAM missing)
                     })
@@ -1772,9 +1788,9 @@ def build_table7_markdown(summarized: Dict) -> str:
     if not cam:
         return ""
     lines = [
-        "<!-- Table 7: CAM Metrics from cam_records.csv -->",
-        "| Corruption   | Severity | n_cam_frames | n_expected_frames | cam_valid_ratio | Energy in BBox Mean | Activation Spread Mean | Entropy Mean | Center Shift Mean |",
-        "|--------------|----------|---------------|--------------------|------------------|---------------------|-----------------------|--------------|-------------------|",
+        "<!-- Table 7: CAM Metrics from cam_records.csv (same 4 as lead: bbox_dist, peak_dist, spread, E_ring_ratio) -->",
+        "| Corruption   | Severity | n_cam_frames | n_expected_frames | cam_valid_ratio | BBox Distance Mean | Peak Distance Mean | Activation Spread Mean | Ring Ratio Mean |",
+        "|--------------|----------|---------------|--------------------|------------------|---------------------|--------------------|-------------------------|-----------------|",
     ]
     corruptions = sorted(cam.keys())
     severities = [0, 1, 2, 3, 4]
@@ -1785,17 +1801,17 @@ def build_table7_markdown(summarized: Dict) -> str:
             n_exp = row.get('n_expected_frames')
             ratio = row.get('cam_valid_ratio')
             ratio_str = f"{float(ratio):.3f}" if ratio is not None and n_cam > 0 else ("N/A" if n_cam == 0 and ratio is None else (f"{float(ratio):.3f}" if ratio is not None else "N/A"))
-            ebb = row.get('energy_in_bbox_mean')
-            ebb_str = f"{float(ebb):.6f}" if ebb is not None else "N/A"
+            bbox_dist = row.get('bbox_center_activation_distance_mean')
+            bbox_str = f"{float(bbox_dist):.4f}" if bbox_dist is not None else "N/A"
+            peak_dist = row.get('peak_bbox_distance_mean')
+            peak_str = f"{float(peak_dist):.4f}" if peak_dist is not None else "N/A"
             asp = row.get('activation_spread_mean')
             asp_str = f"{float(asp):.3f}" if asp is not None else "N/A"
-            ent = row.get('entropy_mean')
-            ent_str = f"{float(ent):.3f}" if ent is not None else "N/A"
-            csh = row.get('center_shift_mean')
-            csh_str = f"{float(csh):.3f}" if csh is not None else "N/A"
+            ring = row.get('ring_energy_ratio_mean')
+            ring_str = f"{float(ring):.4f}" if ring is not None else "N/A"
             n_exp_str = str(int(n_exp)) if n_exp is not None else "N/A"
             corr_pad = str(corruption).ljust(12)
-            lines.append(f"| {corr_pad} | {sev}        | {n_cam}             | {n_exp_str}                  | {ratio_str}            | {ebb_str}            | {asp_str}                 | {ent_str}       | {csh_str}             |")
+            lines.append(f"| {corr_pad} | {sev}        | {n_cam}             | {n_exp_str}                  | {ratio_str}            | {bbox_str}            | {peak_str}             | {asp_str}                 | {ring_str}         |")
     return "\n".join(lines)
 
 
@@ -1845,39 +1861,14 @@ def generate_report_with_llm(config: Dict, metrics: Dict) -> str:
 
     prompt = f"""You are a research assistant writing an experiment report. Generate a comprehensive markdown report based on the provided metrics data.
 
-RESEARCH CONTEXT (CRITICAL - 이 연구의 핵심 구조):
-This research investigates whether **internal cognition (CAM) collapses before performance degradation** in object detection under image corruption.
+RESEARCH CONTEXT:
+This research investigates whether internal cognition (CAM) collapses before performance degradation in object detection under image corruption.
 
-The research has TWO AXES that must be aligned on the TIME AXIS (corruption severity):
+Two axes: Performance Axis (detection_records.csv, iou_curve.csv, miss_rate_curve.csv) and Cognition Axis (cam_records.csv).
 
-1. **Performance Axis (detection_records.csv)**:
-   - detection_records.csv = "Raw evidence log proving when the model starts to become at risk"
-   - This file contains frame-level detection results (matched, is_miss, pred_score, match_iou) for each tiny object across all corruption severities
-   - From this file, we compute:
-     * mAP / Precision / Recall curves (aggregated pred vs gt)
-     * Tiny miss-rate curve (mean(is_miss) by severity)
-     * Score drop curve (mean(delta_score) by severity)
-     * IoU drop curve (mean(delta_iou) by severity)
-     * Failure start point (first is_miss occurrence or sudden drop point) = RISK REGION START
-   - This is the GROUND TRUTH for "when performance degrades"
+Align on severity to prove CAM changes before performance collapse.
 
-2. **Cognition Axis (cam_records.csv)**:
-   - CAM (Grad-CAM) metrics show how the model's internal attention/distribution changes
-   - CAM metrics (energy_in_bbox, activation_spread, entropy, center_shift) are computed for the same objects/frames
-   - This shows "how the model's internal cognition changes"
-
-3. **Research Goal**:
-   - Align these TWO AXES on the TIME AXIS (corruption severity 0→4)
-   - Prove: "CAM changes occur BEFORE performance collapse"
-   - This requires detection_records.csv to define the performance degradation timeline FIRST
-   - Then CAM analysis can show if CAM changes precede or co-occur with performance drops
-   - CRITICAL (terminology): In this experiment, "performance degradation" is defined as **confidence degradation (score drop)**, not necessarily detection miss. IoU and miss rate may remain stable while confidence drops; we analyze the first severity where confidence falls below the threshold (score_drop). If Table 2 shows Miss Rate = 0.000, state: "IoU and miss were relatively stable; performance degradation is defined here as confidence degradation (score drop), not detection failure."
-
-CRITICAL: Without detection_records.csv:
-- Performance degradation timeline is unknown
-- Risk region start point cannot be determined
-- CAM analysis has no reference point
-- Cannot prove "CAM changes before performance collapse"
+CRITICAL: Without detection_records.csv, cannot prove alignment.
 - Report becomes mere interpretation/speculation, not evidence-based
 
 IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
@@ -1888,7 +1879,7 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
 5. CRITICAL: All tables must include count/sample size columns (n_objects_total, n_cam_frames, n_frames_valid, etc.).
 6. CRITICAL: DO NOT use words like "predict", "precursor", "lead", "foreshadow" - only report observed changes.
 7. CRITICAL: For CAM analysis, report ONLY observed values:
-   - "At failure severity K, center_shift = X (delta from severity K-1 = Y)"
+   - "At failure severity K, ring_ratio = X (delta from severity K-1 = Y)"
 8. CRITICAL: Performance values in Table 6 must EXACTLY match Table 2 (same corruption, same severity).
 9. CRITICAL: Report aggregation scope in notes (e.g., "avg_score/avg_iou from matched cases only").
 10. CRITICAL: For mAP, report valid subset statistics (n_frames_valid, valid_ratio) and mark as "N/A (insufficient valid frames)" if n_frames_valid < 10.
@@ -1944,34 +1935,21 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - IMPORTANT: Table 6 (if it exists) should be from dataset metrics, NOT from detection_records. 
       - Table 6 is separate from Table 2 and should only be created if dataset metrics exist
       - If detection_summary.has_data is False, you can still create Table 6 from dataset metrics, but DO NOT call it "Performance Metrics" or "Detection Summary"
-13. CRITICAL: Grad-CAM Analysis Scope (Methods/Limitations) - THE COGNITION AXIS:
-    - CAM computation is performed only for failure events that satisfy:
-      1) Detection records exist (detection_records.csv) - THE PERFORMANCE AXIS (defines when performance degrades)
-      2) Failure event detected (failure_events.csv) - identifies which objects/frames to analyze
-      3) Successful CAM generation (no shape/device errors)
-    - CAM analysis (THE COGNITION AXIS) must be aligned with detection_records.csv (THE PERFORMANCE AXIS)
-    - CAM metrics show internal cognition changes, which must be compared against performance degradation timeline
-    - The research question is: "Do CAM changes occur BEFORE performance collapse?"
-    - This requires BOTH axes: detection_records.csv (performance) AND cam_records.csv (cognition)
-    - If a corruption has failure_events but 0 CAM records, explicitly state:
-      "CAM generation failed for this corruption (see gradcam_errors.csv for details). Without CAM data, we cannot compare cognition axis with performance axis."
-    - Do NOT claim "no failure events" if failure_events exist but CAM records are 0
-14. CRITICAL: Score/IoU Drop Definition (Methods):
-    - Baseline: severity 0 for EACH corruption (corruption-specific baseline)
-    - Threshold: score_drop_threshold and iou_drop_threshold (common across corruptions)
-    - Detection: First severity where (baseline_score - current_score) >= threshold
-    - This ensures fair comparison across different corruption types
-15. CRITICAL: Failure Severity Range for CAM (Methods):
-    - CAM is computed for severity 0 (baseline) through failure_severity (inclusive)
+13. CRITICAL: Grad-CAM Analysis Scope:
+    - CAM for failure events with detection records.
+    - Align cognition axis with performance axis.
+    - If no CAM records but failure events exist: "CAM generation failed".
+14. Score/IoU Drop: Baseline severity 0, threshold-based detection.
+15. Failure Severity Range: CAM from severity 0 to failure_severity.
     - Each severity's CAM is computed INDEPENDENTLY (not cumulative)
     - CAM metrics compare each severity's CAM to baseline (severity 0)
     - This tracks CAM distribution changes as corruption severity increases up to failure point
 16. CRITICAL: CAM Metrics Table (Table 7) MUST include:
-    - Format: | Corruption | Severity | n_cam_frames | n_expected_frames | cam_valid_ratio | failure_severity_median | Energy in BBox Mean | Activation Spread Mean | Entropy Mean | Center Shift Mean |
+    - Format: | Corruption | Severity | n_cam_frames | n_expected_frames | cam_valid_ratio | failure_severity_median | BBox Distance Mean | Peak Distance Mean | Activation Spread Mean | Ring Ratio Mean |
     - n_expected_frames: Expected frames from detection_records.csv (for this corruption×severity)
     - cam_valid_ratio: CAM coverage ratio (n_cam_frames / n_expected_frames) - CRITICAL for reviewer to assess representativeness
     - If cam_valid_ratio is very low (e.g., < 0.1), explicitly note the limited sample size
-    - failure_severity_median: Median failure severity from risk_events.csv (event-based distribution)
+    - failure_severity_median: Median of performance-axis failure severity (from risk_events start_severity / first_miss_severity), NOT from CAM onset
     - If failure_severity_distribution exists, show median (Q25, Q75) instead of single value
     - Example: "failure_severity_median: 2 (IQR: 1-3)" shows distribution, not fixed value
     - DO NOT show failure_severity as single fixed value if distribution data exists
@@ -1985,7 +1963,7 @@ IMPORTANT RULES (CRITICAL - 논문 안전 수치만):
     - Alignment analysis is computed from risk_events.csv (Performance Axis) and cam_records.csv (Cognition Axis)
     - For each risk event, compare:
       * performance_start_severity: When performance degradation starts (from risk_events.csv)
-      * cam_change_severity: First severity where |z(sev)|>=2 (z = (m(sev)-mean0)/(std0+1e-8) on activation_spread)
+      * cam_change_severity: First severity where ≥2 of the 4 metrics (bbox_dist, peak_dist, spread, E_ring_ratio) have |z(sev)|>=2 vs severity-0 baseline
     - Alignment types:
       * lead: CAM changes BEFORE performance degradation (cam_change_severity < performance_start_severity)
       * coincident: CAM changes AT THE SAME TIME as performance degradation (==)
@@ -2005,30 +1983,20 @@ Experiment Configuration:
 - Tiny object threshold: {config['tiny_objects']['area_threshold']} pixels²
 - CRITICAL (pilot / sample size): If n_objects_unique or n_frames_valid is small (e.g. < 50), add one line: "These results are from a small pilot run for pipeline validation; full-scale analysis (≈461 objects, ≥30 events per corruption) is in progress."
 - CRITICAL (score trend): Do NOT state that score decreases monotonically. Use "overall decreasing trend" or "score tends to decrease with severity"; if score increases slightly at some severity (e.g. sev1), note it as local variation.
-- CRITICAL (Methods): In Methods, state exactly: "cam_change_sev is defined as the first severity where the z-score of activation_spread (vs severity-0 baseline) exceeds the threshold (|z|≥2)."
+- CRITICAL (Methods): In Methods, state exactly: "cam_change_sev is defined as the first severity where at least 2 of the 4 CAM metrics (bbox_dist, peak_dist, spread, E_ring_ratio) have z-score vs severity-0 baseline exceeding |z|≥2."
 
 Metrics Data (Summarized, JSON format - compact):
 {json.dumps(summarized_metrics, indent=None, separators=(',', ':'))}
 
 REPORT STRUCTURE:
-1. Start with a brief explanation of the TWO-AXIS research structure:
-   - Performance Axis (detection_records.csv): Frame-level detection results showing WHEN performance degrades
-     * Contains: miss-rate curve, score curve, IoU curve by severity
-     * Defines: Risk region start point (first miss/score_drop/iou_drop occurrence)
-   - Cognition Axis (cam_records.csv): CAM metrics showing HOW internal cognition changes
-     * Contains: energy_in_bbox, activation_spread, entropy, center_shift by severity
-     * Shows: Internal attention/distribution changes as corruption increases
-   - Research goal: Align these axes on time (severity) to prove "CAM changes before performance collapse"
-   - Alignment analysis: Join risk_events.csv (Performance Axis) with cam_records.csv (Cognition Axis)
-     * Compare: performance_start_severity vs cam_change_severity
-     * Result: lead (CAM first) / coincident (same time) / lag (CAM after)
+1. Brief explanation of TWO-AXIS structure: Performance Axis (detection_records.csv) and Cognition Axis (cam_records.csv). Align to prove CAM changes before performance collapse.
 
-2. Then generate tables showing:
-   - Table 2: Performance metrics from detection_records.csv (THE PERFORMANCE AXIS)
-     * Shows: miss-rate, avg_score, avg_iou by corruption×severity
+2. Tables:
+   - Table 2: Performance metrics from detection_records.csv
+   - Table 7: CAM metrics from cam_records.csv
      * From: detection_records.csv aggregation
    - Table 7: CAM metrics from cam_records.csv (THE COGNITION AXIS)
-     * Shows: energy_in_bbox, activation_spread, entropy, center_shift by corruption×severity
+     * Shows: BBox Distance Mean, Peak Distance Mean, Activation Spread Mean, Ring Ratio Mean by corruption×severity
      * From: cam_records.csv (cam_status='ok' only)
    - Table X-summary (NEW): Alignment Analysis Summary (Performance vs Cognition)
      * CRITICAL: Use EXACT values from alignment_analysis.summary[corruption].table_x_summary_row for each corruption. DO NOT recompute. Event unit = (corruption, object_uid, failure_type).
@@ -2037,7 +2005,7 @@ REPORT STRUCTURE:
      * If Total Events > Events with CAM, note: "Some events missing CAM data (N/A in detail table)". Breakdown from by_failure_type if available.
    - Table X-detail (NEW - REQUIRED): Alignment Analysis Detail (Reviewer Evidence Table)
      * CRITICAL: List EXACTLY alignment_analysis.summary[corruption].detail_events for each corruption (one row per event). Keys: failure_event_id, object_uid, failure_type, performance_start_severity, cam_change_severity, cam_change_metric, alignment, lead_steps. Map to columns: event_id, corruption, object_uid, failure_type, perf_start_sev, cam_change_sev, cam_metric, alignment, lead_steps.
-     * Detail row count per corruption MUST equal that corruption's total_events; rows with alignment='lead' MUST equal lead_count. cam_change_sev definition (Methods): "cam_change_sev is the first severity where |z(sev)|>=2 on activation_spread vs severity-0 baseline."
+     * Detail row count per corruption MUST equal that corruption's total_events; rows with alignment='lead' MUST equal lead_count. cam_change_sev definition (Methods): "cam_change_sev is the first severity where ≥2 of the 4 metrics (bbox_dist, peak_dist, spread, E_ring_ratio) have |z|≥2 vs severity-0 baseline."
      * Data source: alignment_analysis.summary[corruption].detail_events. If empty, note: "No detail events available."
      * This table can be in appendix if too long for main text, but MUST be included somewhere
 

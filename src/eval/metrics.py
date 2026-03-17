@@ -16,16 +16,6 @@ except ImportError:
 
 
 def compute_iou(box1: Tuple[float, float, float, float], box2: Tuple[float, float, float, float]) -> float:
-    """Compute IoU between two boxes in (x_center, y_center, width, height) format (normalized).
-    
-    Args:
-        box1: First box (x_center, y_center, width, height)
-        box2: Second box (x_center, y_center, width, height)
-        
-    Returns:
-        IoU value
-    """
-    # Convert to (x1, y1, x2, y2)
     x1_1 = box1[0] - box1[2] / 2
     y1_1 = box1[1] - box1[3] / 2
     x2_1 = box1[0] + box1[2] / 2
@@ -66,20 +56,7 @@ def evaluate_model_dataset_wide(
     iou_thres: float = 0.45,
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 ) -> Dict[str, float]:
-    """Evaluate model on dataset and return metrics.
-    
-    Args:
-        model_path: Path to model checkpoint or model name
-        model_type: 'yolo' or 'rtdetr'
-        dataset_yaml: Path to dataset YAML file
-        conf_thres: Confidence threshold
-        iou_thres: IoU threshold for NMS
-        device: Device to run on
-        
-    Returns:
-        Dictionary with metrics: map50, map5095, precision, recall
-    """
-    # Load model
+
     if model_type == 'yolo':
         model = YOLO(model_path)
     elif model_type == 'rtdetr':
