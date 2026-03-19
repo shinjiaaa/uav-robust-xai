@@ -253,25 +253,20 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     
-    # Save report
+    # Save report (LLM 긴 버전은 report_llm.md — report.md는 exp_A 요약용으로 유지)
     print("\n3. Saving report...")
     report_path = Path(config['results']['report_md'])
-    save_report(report, report_path)
+    llm_report_path = report_path.parent / "report_llm.md"
+    save_report(report, llm_report_path)
     
     print("\n[OK] Report generation complete!")
-    print(f"\nReport saved to: {report_path}")
+    print(f"\nLLM report saved to: {llm_report_path}")
+    print(f"(Short delta-threshold summary stays in {report_path} - run: python scripts/exp_A_threshold_trend_validation.py)")
 
-    # 추가: 핵심 메시지 압축 요약 리포트 생성
-    generate_concise_summary_report(config)
-
-    # report.md를 report_concise.md 내용으로 대체 (요청 반영)
-    concise_path = Path('results') / 'report_concise.md'
-    if concise_path.exists() and report_path.exists():
-        concise_text = concise_path.read_text(encoding='utf-8')
-        report_path.write_text(concise_text, encoding='utf-8')
-        print(f"[OK] Overwrote {report_path} with content from {concise_path}")
-    else:
-        print(f"[WARN] Could not overwrite {report_path}: {concise_path} or {report_path} missing")
+    # Optional: legacy concise (exp_A CSV 기반, lead=0% 고정 문구). report.md는 덮어쓰지 않음.
+    # delta 임계값 요약·통합 표는: python scripts/exp_A_threshold_trend_validation.py
+    if __import__("os").environ.get("UAV_GENERATE_CONCISE_LEGACY", "").lower() in ("1", "true", "yes"):
+        generate_concise_summary_report(config)
 
 
 if __name__ == "__main__":
