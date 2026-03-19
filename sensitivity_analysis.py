@@ -89,57 +89,48 @@ def calculate_alignment_sensitivity(metrics, settings):
         CAM_METRICS_FOR_ENSEMBLE = ['activation_spread']
 
     REPRESENTATIVE_CAM_METRIC = 'activation_spread'
-    Z_SCORE_THRESHOLD = settings['z_threshold']
+    DELTA_THRESHOLD = settings.get('delta_threshold', 0.2)  # default 0.2
     USE_CAM_ENSEMBLE = len(CAM_METRICS_FOR_ENSEMBLE) >= 2
     MIN_METRICS_CHANGED = settings['min_metrics_changed']
 
     alignment_analysis = {}
 
-    def _cam_change_sev_zscore(event_cam_primary, severity_order, baseline_sev=0):
-        """Return (cam_change_sev, metric_used) using z-score."""
+    def _cam_change_sev_delta(event_cam_primary, severity_order, baseline_sev=0):
+        """Return (cam_change_sev, metric_used, change_type) using delta threshold."""
         baseline_cam = event_cam_primary[event_cam_primary['severity'] == baseline_sev]
         if len(baseline_cam) < 1:
-            return None, None
+            return None, None, None
         cam_change_sev = None
         metric_used = None
+        change_type = None
         for sev in severity_order:
             if sev == baseline_sev:
                 continue
             sev_cam = event_cam_primary[event_cam_primary['severity'] == sev]
             if len(sev_cam) == 0:
                 continue
-            if USE_CAM_ENSEMBLE:
-                n_changed = 0
-                for m in CAM_METRICS_FOR_ENSEMBLE:
-                    if m not in baseline_cam.columns or m not in sev_cam.columns:
-                        continue
-                    m0 = baseline_cam[m].dropna()
-                    ms = sev_cam[m].dropna()
-                    if len(m0) < 1 or len(ms) < 1:
-                        continue
-                    mean0, std0 = m0.mean(), m0.std()
-                    if pd.isna(std0) or std0 == 0:
-                        std0 = 1e-8
-                    z = (ms.mean() - mean0) / std0
-                    if abs(z) >= Z_SCORE_THRESHOLD:
+            n_changed = 0
+            collapse_detected = False
+            for m in CAM_METRICS_FOR_ENSEMBLE:
+                if m not in baseline_cam.columns or m not in sev_cam.columns:
+                    continue
+                b_val = baseline_cam[m].dropna().mean()
+                s_val = sev_cam[m].dropna().mean()
+                if pd.notna(b_val) and pd.notna(s_val):
+                    if s_val == 0 or abs(s_val) < 1e-3:
+                        collapse_detected = True
+                    delta = abs(s_val - b_val) / max(abs(b_val), 1e-6)
+                    if delta >= DELTA_THRESHOLD:  # threshold
                         n_changed += 1
-                if n_changed >= MIN_METRICS_CHANGED:
-                    cam_change_sev = sev
-                    metric_used = 'ensemble'
-                    break
-            if cam_change_sev is None and REPRESENTATIVE_CAM_METRIC in baseline_cam.columns and REPRESENTATIVE_CAM_METRIC in sev_cam.columns:
-                m0 = baseline_cam[REPRESENTATIVE_CAM_METRIC].dropna()
-                ms = sev_cam[REPRESENTATIVE_CAM_METRIC].dropna()
-                if len(m0) >= 1 and len(ms) >= 1:
-                    mean0, std0 = m0.mean(), m0.std()
-                    if pd.isna(std0) or std0 == 0:
-                        std0 = 1e-8
-                    z = (ms.mean() - mean0) / std0
-                    if abs(z) >= Z_SCORE_THRESHOLD:
-                        cam_change_sev = sev
-                        metric_used = REPRESENTATIVE_CAM_METRIC
-                        break
-        return (cam_change_sev, metric_used)
+            if n_changed >= MIN_METRICS_CHANGED:
+                cam_change_sev = sev
+                metric_used = 'ensemble'
+                if collapse_detected:
+                    change_type = 'collapse'
+                else:
+                    change_type = 'gradual'
+                break
+        return (cam_change_sev, metric_used, change_type)
 
     # Process events
     for _, risk_event in risk_events_df.iterrows():
@@ -208,7 +199,7 @@ def calculate_alignment_sensitivity(metrics, settings):
             event_cam_primary = event_cam[event_cam.get('layer_role', 'primary') == 'primary'].copy()
             if len(event_cam_primary) > 0:
                 severity_order = sorted(int(s) for s in event_cam_primary['severity'].dropna().unique() if pd.notna(s))
-                cam_change_severity, cam_change_metric = _cam_change_sev_zscore(
+                cam_change_severity, cam_change_metric, change_type = _cam_change_sev_delta(
                     event_cam_primary, severity_order, baseline_sev=0
                 )
                 if cam_change_severity is not None and cam_change_severity > start_severity:
@@ -238,6 +229,7 @@ def calculate_alignment_sensitivity(metrics, settings):
             'performance_start_severity': start_severity,
             'cam_change_severity': cam_change_severity,
             'cam_change_metric': cam_change_metric,
+            'change_type': change_type,
             'alignment': alignment,
             'lead_steps': lead_steps,
         })
@@ -396,76 +388,44 @@ def get_severity_1_examples(sev1_analysis, limit=10):
     return pd.DataFrame(examples)
 
 
-def analyze_severity_1_concentration(alignment_analysis, cam_records_df, risk_events_df):
-    """Analyze why cam_change_severity is concentrated at 1."""
-    # Get all events with cam_change_severity == 1
-    sev1_events = []
-    for corruption, events in alignment_analysis.items():
-        for event in events:
-            if event.get('cam_change_severity') == 1.0:
-                sev1_events.append(event)
-    
-    # Sample 10
-    sample_events = sev1_events[:10] if len(sev1_events) > 10 else sev1_events
-    
-    results = []
-    
+def analyze_std_distribution(cam_records_df):
+    """Analyze std distribution for baseline metrics."""
     CAM_METRICS = ['bbox_center_activation_distance', 'peak_bbox_distance', 'activation_spread', 'ring_energy_ratio']
     
-    for event in sample_events:
-        uid = event['object_uid']
-        corruption = event['corruption']
-        failure_type = event['failure_type']
-        perf_start = event['performance_start_severity']
-        cam_change_sev = event['cam_change_severity']
-        
-        # Get CAM data for this object
-        cam_data = cam_records_df[cam_records_df['object_id'] == uid].copy()
-        if cam_data.empty:
-            continue
-        
-        baseline = cam_data[cam_data['severity'] == 0]
-        sev1 = cam_data[cam_data['severity'] == 1]
-        
-        if baseline.empty or sev1.empty:
-            continue
-        
-        changed_metrics = []
-        for metric in CAM_METRICS:
-            if metric in baseline.columns and metric in sev1.columns:
-                b_val = baseline[metric].dropna().mean()
-                s_val = sev1[metric].dropna().mean()
-                
-                if pd.notna(b_val) and pd.notna(s_val) and b_val != 0:
-                    delta_percent = ((s_val - b_val) / abs(b_val)) * 100
-                    std_b = baseline[metric].dropna().std()
-                    z_score = (s_val - b_val) / std_b if pd.notna(std_b) and std_b > 0 else 0
-                    if abs(z_score) >= 1.5:  # z=1.5 threshold
-                        changed_metrics.append({
-                            'metric': metric,
-                            'baseline_value': round(b_val, 4),
-                            'severity1_value': round(s_val, 4),
-                            'delta_percent': round(delta_percent, 2),
-                            'z_score': round(z_score, 2)
-                        })
-        
-        if changed_metrics:
-            # Take the first changed metric for simplicity
-            cm = changed_metrics[0]
-            results.append({
-                'object_uid': uid,
-                'corruption': corruption,
-                'failure_type': failure_type,
-                'perf_start_severity': perf_start,
-                'cam_change_severity': cam_change_sev,
-                'changed_metric': cm['metric'],
-                'baseline_value': cm['baseline_value'],
-                'severity1_value': cm['severity1_value'],
-                'delta_percent': cm['delta_percent'],
-                'z_score': cm['z_score']
-            })
+    results = []
+    for metric in CAM_METRICS:
+        if metric in cam_records_df.columns:
+            baseline_data = cam_records_df[cam_records_df['severity'] == 0][metric].dropna()
+            if len(baseline_data) > 0:
+                std_val = baseline_data.std()
+                count = len(baseline_data)
+                results.append({
+                    'metric': metric,
+                    'std': round(std_val, 6) if pd.notna(std_val) else 'NaN',
+                    'count': count
+                })
     
-    return results
+    return pd.DataFrame(results)
+
+
+def analyze_low_std_cases(cam_records_df, threshold=1e-6):
+    """Count cases where std < threshold."""
+    CAM_METRICS = ['bbox_center_activation_distance', 'peak_bbox_distance', 'activation_spread', 'ring_energy_ratio']
+    
+    results = []
+    for metric in CAM_METRICS:
+        if metric in cam_records_df.columns:
+            baseline_data = cam_records_df[cam_records_df['severity'] == 0][metric].dropna()
+            if len(baseline_data) > 0:
+                std_val = baseline_data.std()
+                low_std_count = 1 if pd.notna(std_val) and std_val < threshold else 0
+                results.append({
+                    'metric': metric,
+                    'std': round(std_val, 6) if pd.notna(std_val) else 'NaN',
+                    'count': low_std_count
+                })
+    
+    return pd.DataFrame(results)
 
 
 def robustness_check(metrics, settings_list):
@@ -473,7 +433,7 @@ def robustness_check(metrics, settings_list):
     results = {}
     
     for settings in settings_list:
-        key = f"z={settings['z_threshold']}, min={settings['min_metrics_changed']}"
+        key = f"delta=0.2, min={settings['min_metrics_changed']}"
         alignment_analysis = calculate_alignment_sensitivity(metrics, settings)
         
         total_lead = sum(len([e for e in events if e['alignment'] == 'lead']) for events in alignment_analysis.values())
@@ -497,82 +457,88 @@ def main():
     risk_events_df = pd.DataFrame(metrics['risk_events'])
     cam_records_df = pd.DataFrame(metrics['cam_records'])
 
+    # CAM metrics 설정
+    NEW_FOUR = ['bbox_center_activation_distance', 'peak_bbox_distance', 'activation_spread', 'ring_energy_ratio']
+    OLD_FOUR = ['energy_in_bbox', 'activation_spread', 'entropy', 'center_shift']
+    has_new = len(cam_records_df) > 0 and all(c in cam_records_df.columns for c in NEW_FOUR)
+    has_old = len(cam_records_df) > 0 and all(c in cam_records_df.columns for c in OLD_FOUR)
+    if has_new:
+        CAM_METRICS_FOR_ENSEMBLE = NEW_FOUR
+    elif has_old:
+        CAM_METRICS_FOR_ENSEMBLE = OLD_FOUR
+    else:
+        CAM_METRICS_FOR_ENSEMBLE = ['activation_spread']
+
     # 1. Join 실패 원인 분석
     join_analysis, matched, unmatched, total = analyze_join_failures(risk_events_df, cam_records_df)
     print("1) Join 실패 원인 표")
     print(join_analysis.to_string(index=False))
     print()
 
-    # 2. CAM change severity=1 집중 원인 분석
-    settings = {'z_threshold': 1.5, 'min_metrics_changed': 1, 'separate_unavailable': True, 'perf_start_mode': 'separate'}
+    # Delta 분석
+    print("Delta 계산 코드:")
+    print("delta = abs(value - baseline) / max(abs(baseline), 1e-6)")
+    print("change if delta >= threshold and min_metrics_changed satisfied")
+    print()
+
+    # Alignment 계산 (threshold 0.2)
+    settings = {'min_metrics_changed': 1, 'separate_unavailable': True, 'perf_start_mode': 'separate', 'delta_threshold': 0.2}
     alignment_analysis = calculate_alignment_sensitivity(metrics, settings)
-    sev1_analysis = analyze_severity_1_concentration(alignment_analysis, cam_records_df, risk_events_df)
-    print("2) Severity 1 과집중 분석 (샘플 10개)")
-    sev1_df = pd.DataFrame(sev1_analysis)
-    print(sev1_df.to_string(index=False))
+
+    # Change type별 alignment
+    all_events = [e for events in alignment_analysis.values() for e in events]
+    collapse_events = [e for e in all_events if e.get('change_type') == 'collapse']
+    gradual_events = [e for e in all_events if e.get('change_type') == 'gradual']
+
+    def calc_stats(events):
+        lead = len([e for e in events if e['alignment'] == 'lead'])
+        coincident = len([e for e in events if e['alignment'] == 'coincident'])
+        lag = len([e for e in events if e['alignment'] == 'lag'])
+        unavailable = len([e for e in events if e['alignment'] == 'unavailable'])
+        total = lead + coincident + lag + unavailable
+        return {
+            'lead': lead / total * 100 if total > 0 else 0,
+            'coincident': coincident / total * 100 if total > 0 else 0,
+            'lag': lag / total * 100 if total > 0 else 0,
+            'unavailable': unavailable / total * 100 if total > 0 else 0,
+            'count': total
+        }
+
+    collapse_stats = calc_stats(collapse_events)
+    gradual_stats = calc_stats(gradual_events)
+
+    print("Change type별 alignment")
+    print("change_type | lead% | coincident% | lag% | count")
+    print("-" * 50)
+    print(f"collapse    | {collapse_stats['lead']:.1f}  | {collapse_stats['coincident']:.1f}       | {collapse_stats['lag']:.1f}  | {collapse_stats['count']}")
+    print(f"gradual     | {gradual_stats['lead']:.1f}  | {gradual_stats['coincident']:.1f}       | {gradual_stats['lag']:.1f}  | {gradual_stats['count']}")
     print()
 
-    # 3. Robustness check
-    robustness_settings = [
-        {'z_threshold': 1.5, 'min_metrics_changed': 1, 'separate_unavailable': True, 'perf_start_mode': 'separate'},
-        {'z_threshold': 1.5, 'min_metrics_changed': 2, 'separate_unavailable': True, 'perf_start_mode': 'separate'},
-        {'z_threshold': 2.0, 'min_metrics_changed': 1, 'separate_unavailable': True, 'perf_start_mode': 'separate'},
-        {'z_threshold': 2.0, 'min_metrics_changed': 2, 'separate_unavailable': True, 'perf_start_mode': 'separate'}
-    ]
-    robustness_results = robustness_check(metrics, robustness_settings)
-    print("3) Robustness comparison table")
-    for key, vals in robustness_results.items():
-        print(f"{key}: lead={vals['lead']:.1f}%, coincident={vals['coincident']:.1f}%, lag={vals['lag']:.1f}%, unavailable={vals['unavailable']:.1f}%")
+    # Metric별 collapse 발생
+    print("Metric별 collapse 발생")
+    collapse_metric_counts = {}
+    for e in collapse_events:
+        object_uid = e.get('object_uid', '')
+        corruption = e.get('corruption', '')
+        cam_change_sev = e.get('cam_change_severity')
+        if cam_change_sev is not None:
+            event_cams = cam_records_df[
+                (cam_records_df['object_id'] == object_uid) &
+                (cam_records_df['corruption'] == corruption) &
+                (cam_records_df['severity'] == cam_change_sev)
+            ]
+            for m in CAM_METRICS_FOR_ENSEMBLE:
+                if m in event_cams.columns:
+                    val = event_cams[m].dropna().mean()
+                    if pd.notna(val) and (val == 0 or abs(val) < 1e-3):
+                        if m not in collapse_metric_counts:
+                            collapse_metric_counts[m] = 0
+                        collapse_metric_counts[m] += 1
+    total_collapse = sum(collapse_metric_counts.values())
+    for m, count in collapse_metric_counts.items():
+        pct = count / total_collapse * 100 if total_collapse > 0 else 0
+        print(f"{m}: {count} ({pct:.1f}%)")
     print()
-
-    # 4. 집계 단위 확인
-    aggregation_check = check_aggregation_unit(alignment_analysis, risk_events_df)
-    print("4) Alignment 집계 단위 확인")
-    print(aggregation_check.to_string(index=False))
-    print()
-
-    # 5. 객체 단위 재집계
-    methods = ['earliest', 'majority', 'median']
-    reaggregation_results = {}
-    for method in methods:
-        reagg = reaggregate_by_event_unit(alignment_analysis, cam_records_df, risk_events_df, method)
-        stats = calculate_alignment_stats(reagg)
-        reaggregation_results[method] = stats
-    
-    print("5) 객체 단위 재집계 결과")
-    for method, stats in reaggregation_results.items():
-        print(f"{method}: lead={stats['lead']:.1f}%, coincident={stats['coincident']:.1f}%, lag={stats['lag']:.1f}%, unavailable={stats['unavailable']:.1f}%")
-    print()
-
-    # 6. Severity 1 대표 사례
-    sev1_examples = get_severity_1_examples(sev1_analysis, 10)
-    print("6) Severity 1 대표 사례 10개")
-    print(sev1_examples.to_string(index=False))
-    print()
-    
-    # 각 샘플 설명
-    print("각 샘플 설명:")
-    for i, row in sev1_examples.iterrows():
-        metric = row['changed_metric']
-        delta = row['delta_percent']
-        z = row['z_score']
-        if 'spread' in metric:
-            desc = f"spread {'증가' if delta > 0 else '감소'} ({delta:.1f}%, z={z:.2f})"
-        elif 'distance' in metric:
-            desc = f"distance {'증가' if delta > 0 else '감소'} ({delta:.1f}%, z={z:.2f})"
-        elif 'ratio' in metric:
-            desc = f"ring ratio {'증가' if delta > 0 else '감소'} ({delta:.1f}%, z={z:.2f})"
-        else:
-            desc = f"{metric} 변화 ({delta:.1f}%, z={z:.2f})"
-        print(f"샘플 {i+1}: {desc}")
-    print()
-
-    # 7. 최종 권장 집계 방식
-    recommended = "event 단위 (earliest cam_change_severity)"
-    reason = "row 단위는 중복으로 인한 부풀림이 없으며, event 단위로 신뢰성 높음. earliest 방식이 가장 해석하기 쉬움."
-    print("7) 최종 권장 집계 방식과 이유")
-    print(f"권장 방식: {recommended}")
-    print(f"이유: {reason}")
 
 
 if __name__ == "__main__":
