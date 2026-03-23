@@ -470,19 +470,7 @@ def compute_cam_metrics(
     
     # Activation spread
     metrics['activation_spread'] = compute_activation_spread(cam)
-    
-<<<<<<< HEAD
-    # Entropy (and full_cam_entropy = same when CAM is ROI-masked)
-=======
-    # New lead/collapse metrics (unified with summary table)
-    metrics['bbox_center_activation_distance'] = compute_bbox_center_activation_distance(
-        cam, bbox_norm, cam_w, cam_h
-    )
-    metrics['peak_bbox_distance'] = compute_peak_bbox_distance(cam, bbox_norm, cam_w, cam_h)
-    metrics['ring_energy_ratio'] = compute_ring_energy_ratio(cam, bbox_norm, cam_w, cam_h)
-    
-    # Entropy
->>>>>>> c772c63 (구버전 업데이트)
+
     metrics['entropy'] = compute_cam_entropy(cam)
     metrics['full_cam_entropy'] = metrics['entropy']
     

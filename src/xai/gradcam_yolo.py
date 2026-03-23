@@ -41,9 +41,18 @@ class YOLOGradCAM:
             if grad_output is not None and len(grad_output) > 0 and grad_output[0] is not None:
                 self.gradients = grad_output[0]
 
-        self.target_layer.register_forward_hook(fwd_hook)
+        self._hook_fwd = self.target_layer.register_forward_hook(fwd_hook)
         # Use register_full_backward_hook (removes FutureWarning and more stable)
-        self.target_layer.register_full_backward_hook(bwd_hook)
+        self._hook_bwd = self.target_layer.register_full_backward_hook(bwd_hook)
+
+    def close(self):
+        """Remove hooks so another explainer can be attached to the same layer."""
+        if getattr(self, "_hook_fwd", None) is not None:
+            self._hook_fwd.remove()
+            self._hook_fwd = None
+        if getattr(self, "_hook_bwd", None) is not None:
+            self._hook_bwd.remove()
+            self._hook_bwd = None
 
     def _compute_cam(self, activations: torch.Tensor, gradients: torch.Tensor) -> torch.Tensor:
         """Grad-CAM: global average pooling of gradients as weights. (1,C,h,w) -> (1,1,h,w)."""
@@ -286,3 +295,21 @@ class YOLOGradCAMPP(YOLOGradCAM):
         w_k = (alpha * relu_grad).sum(dim=(2, 3))  # (1, C)
         cam = (w_k.unsqueeze(2).unsqueeze(3) * activations).sum(dim=1, keepdim=True)
         return F.relu(cam)
+
+
+class YOLOLayerCAM(YOLOGradCAM):
+    """
+    Layer-CAM style: per-channel ReLU(activation * gradient), then sum over channels.
+    Same forward/backward path as Grad-CAM; only CAM weighting differs.
+    """
+
+    def _compute_cam(self, activations: torch.Tensor, gradients: torch.Tensor) -> torch.Tensor:
+        """LayerCAM: sum_c ReLU(A_c * G_c). (1,C,h,w) -> (1,1,h,w)."""
+        parts = []
+        c = activations.shape[1]
+        for i in range(c):
+            a = activations[:, i : i + 1, :, :]
+            g = gradients[:, i : i + 1, :, :]
+            parts.append(F.relu(a * g))
+        stacked = torch.cat(parts, dim=1)
+        return stacked.sum(dim=1, keepdim=True)

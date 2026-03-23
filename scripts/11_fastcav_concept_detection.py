@@ -39,8 +39,8 @@ FastCAV: 계산할 개념(Concept) 점수와 concept change severity 정의
 
 변화 기준:
 - delta = |score_sev - score_baseline| / max(|score_baseline|, 1e-6)
-- delta >= 0.2이면 change로 판정
-- concept change severity = min sev s.t. delta >= 0.2
+- delta >= CHANGE_THRESHOLD (default 0.15) 이면 change로 판정
+- concept change severity = min sev s.t. delta >= CHANGE_THRESHOLD
 - concept change type = 'gradual' (delta < 1.0) or 'collapse' (delta >= 1.0)
 """
 
@@ -50,6 +50,9 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Grad-CAM과 동일 임계값으로 비교 (report.md 산출 시 0.15 사용)
+CHANGE_THRESHOLD = 0.15
 
 def load_cam_records():
     """Load and filter CAM records."""
@@ -218,7 +221,7 @@ def main():
                 
                 delta = abs(sev_score - baseline_score) / max(abs(baseline_score), 1e-6)
                 
-                if delta >= 0.2:  # Change threshold (same as Grad-CAM)
+                if delta >= CHANGE_THRESHOLD:  # Same as exp_A Grad-CAM gradual threshold
                     concept_change_sev = sev
                     concept_change_type = 'collapse' if delta >= 1.0 else 'gradual'
                     break  # First change severity
@@ -239,7 +242,7 @@ def main():
     
     # 3. Summary statistics
     print("\n" + "=" * 70)
-    print("Summary: Concept Change Detection (threshold delta=0.2)")
+    print(f"Summary: Concept Change Detection (threshold delta={CHANGE_THRESHOLD})")
     print("=" * 70)
     
     for concept in concepts:

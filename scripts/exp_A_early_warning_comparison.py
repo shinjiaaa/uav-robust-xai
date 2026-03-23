@@ -28,6 +28,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# FastCAV(11)와 동일 임계값으로 비교 (report.md 산출 시 0.15 사용)
+GRADUAL_CHANGE_THRESHOLD = 0.15
+
 def load_data():
     """Load Grad-CAM and FastCAV results."""
     results_dir = Path('results')
@@ -84,7 +87,7 @@ def extract_gradcam_changes(cam_df):
         if 0 not in sev_range or len(sev_range) < 2:
             continue
         
-        # Detect collapse (activation_spread < 1e-3) and gradual (delta >= 0.2)
+        # Detect collapse (activation_spread < 1e-3) and gradual (delta >= GRADUAL_CHANGE_THRESHOLD)
         baseline_spread = group[group['severity'] == 0]['activation_spread'].dropna().mean()
         
         if pd.isna(baseline_spread):
@@ -105,10 +108,10 @@ def extract_gradcam_changes(cam_df):
             if collapse_change_sev is None and float(sev_spread) < 1e-3:
                 collapse_change_sev = sev
             
-            # Gradual detection (delta >= 0.2)
+            # Gradual detection (delta >= GRADUAL_CHANGE_THRESHOLD)
             if gradual_change_sev is None and baseline_spread != 0:
                 delta = abs(sev_spread - baseline_spread) / max(abs(baseline_spread), 1e-6)
-                if delta >= 0.2:
+                if delta >= GRADUAL_CHANGE_THRESHOLD:
                     gradual_change_sev = sev
         
         # Report earliest change

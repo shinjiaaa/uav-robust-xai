@@ -1,15 +1,21 @@
 """Threshold / Trend Change Detection Validation (Grad-CAM event-level).
 
-- Threshold sweep (0.05 / 0.10 / 0.20): delta-based CAM change.
-- Writes results/lead_stats.json (delta_threshold=0.1) and results/report.md.
-- report.md: original concise layout (Key conclusions, Core comparison, Severity table,
-  Observations, Recommendation); Lead % / Avg Lead Steps use delta=0.1 per corruption.
+- Core table + lead_stats: 4-metric mean delta >= 0.15 (DEFAULT_CAM_METRIC_DELTA).
+- Writes results/lead_stats.json and results/report.md.
+- Embeds real-time block from results/runtime_summary.json (see scripts/runtime_xai_benchmark.py).
+- XAI별 선행성: cam_records의 `xai_method`가 있으면 Method comparison에 Grad-CAM / Grad-CAM++ / LayerCAM 행 분리,
+  `results/lead_stats_by_xai_method.json` 생성 (05 재실행 필요).
 """
 
 import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
+# 4지표 평균 delta 기준 (Core 표, lead_stats, Key conclusions 본문)
+DEFAULT_CAM_METRIC_DELTA = 0.15
+# 리포트에만 나열하는 sweep (0.15는 주력 임계값으로 별도 계산)
+THRESHOLDS_SWEEP = [0.05, 0.10, 0.20]
 
 
 def compute_event_cam_scores(event_cam):
@@ -87,6 +93,142 @@ def compute_alignment(perf_start, cam_change_sev):
     return 'lag', lead_steps
 
 
+def xai_method_display_name(key: str) -> str:
+    k = str(key).lower()
+    return {
+        'gradcam': 'Grad-CAM',
+        'fastcam': 'Grad-CAM++',
+        'gradcampp': 'Grad-CAM++',
+        'layercam': 'LayerCAM',
+    }.get(k, str(key))
+
+
+def iter_xai_method_labels(cam_df: pd.DataFrame) -> list:
+    """cam_records에 있는 XAI 키 목록(선행성 비교용). 레거시(null 열 없음)는 gradcam 단일."""
+    if 'xai_method' not in cam_df.columns:
+        return ['gradcam']
+    s = cam_df['xai_method']
+    if s.isna().all():
+        return ['gradcam']
+    labels = []
+    non_null = sorted(s.dropna().astype(str).unique().tolist())
+    if s.isna().any() or 'gradcam' in non_null:
+        labels.append('gradcam')
+    for m in non_null:
+        if m == 'gradcam':
+            continue
+        labels.append(m)
+    return labels if labels else ['gradcam']
+
+
+def filter_cam_primary_xai(cam_df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """primary 행만, label에 해당하는 xai_method(레거시 null은 gradcam 버킷)."""
+    df = cam_df.copy()
+    if 'layer_role' in df.columns:
+        df = df[df['layer_role'] == 'primary']
+    if 'xai_method' not in df.columns:
+        return df
+    ser = df['xai_method']
+    if ser.isna().all():
+        return df
+    if label == 'gradcam':
+        return df[ser.isna() | (ser.astype(str) == 'gradcam')]
+    return df[ser.astype(str) == label]
+
+
+def summarize_alignment_list(results):
+    total = len(results)
+    if total == 0:
+        return None
+    lead_items = [x for x in results if x['alignment'] == 'lead']
+    coincident_items = [x for x in results if x['alignment'] == 'coincident']
+    lag_items = [x for x in results if x['alignment'] == 'lag']
+    unavailable = [x for x in results if x['alignment'] == 'unavailable']
+    lead_ratio = (len(lead_items) / total) * 100
+    lead_steps_list = [x['lead_steps'] for x in lead_items if x['lead_steps'] is not None]
+    mean_lead_step = float(np.mean(lead_steps_list)) if lead_steps_list else np.nan
+    return {
+        'n_lead': len(lead_items),
+        'n_coincident': len(coincident_items),
+        'n_lag': len(lag_items),
+        'n_unavailable': len(unavailable),
+        'n_total': total,
+        'Lead Ratio (%)': lead_ratio,
+        'Mean Lead Step': mean_lead_step,
+    }
+
+
+def compute_alignment_stats_for_cam_subset(failure_events_with_start, cam_subset, all_thresholds):
+    """failure_events는 performance_start_severity 열이 있어야 함."""
+    methods_tpl = [('threshold', t) for t in all_thresholds] + [('trend', None)]
+    stats = {m: [] for m in methods_tpl}
+
+    for _, event in failure_events_with_start.iterrows():
+        start = event.get('performance_start_severity')
+        if pd.isna(start):
+            continue
+        start = int(start)
+
+        corruption = event.get('corruption')
+        image_id = event.get('image_id')
+        class_id = event.get('class_id')
+
+        event_cam = cam_subset[
+            (cam_subset['corruption'] == corruption)
+            & (cam_subset['image_id'] == image_id)
+            & (cam_subset['class_id'] == class_id)
+        ]
+
+        def _rec(align, steps):
+            return {'corruption': corruption, 'alignment': align, 'lead_steps': steps}
+
+        if event_cam.empty:
+            for m in methods_tpl:
+                stats[m].append(_rec('unavailable', None))
+            continue
+
+        event_cam = event_cam[event_cam['severity'] <= start].copy()
+        if event_cam.empty:
+            for m in methods_tpl:
+                stats[m].append(_rec('unavailable', None))
+            continue
+
+        event_cam = event_cam.copy()
+        event_cam['severity'] = pd.to_numeric(event_cam['severity'], errors='coerce').fillna(-1).astype(int)
+        score_by_sev = compute_event_cam_scores(event_cam)
+
+        for m in methods_tpl:
+            if m[0] == 'threshold':
+                cam_change_sev = baseline_threshold_change(score_by_sev, m[1])
+            else:
+                cam_change_sev = trend_based_change(score_by_sev)
+            alignment, lead_steps = compute_alignment(start, cam_change_sev)
+            stats[m].append(_rec(alignment, lead_steps))
+
+    return stats, methods_tpl
+
+
+def build_summary_rows_from_stats(stats, methods_tpl):
+    rows = []
+    for method in methods_tpl:
+        s = summarize_alignment_list(stats[method])
+        if s is None:
+            continue
+        rows.append({
+            'method': method,
+            'Change Type': 'threshold' if method[0] == 'threshold' else 'trend',
+            'Threshold': method[1],
+            'Lead Ratio (%)': s['Lead Ratio (%)'],
+            'Mean Lead Step': s['Mean Lead Step'],
+            'n_lead': s['n_lead'],
+            'n_coincident': s['n_coincident'],
+            'n_lag': s['n_lag'],
+            'n_unavailable': s['n_unavailable'],
+            'n_total': s['n_total'],
+        })
+    return rows
+
+
 def load_data():
     root = Path('results')
     failure_events = pd.read_csv(root / 'failure_events.csv')
@@ -153,25 +295,31 @@ def compute_severity_progression_summary(
 
 def build_gradcam_fastcav_report_section(results_root: Path) -> list:
     """
-    exp_A_early_warning_comparison.py 산출물(exp_A_alignment_comparison.csv) 기반
-    Grad-CAM vs FastCAV 조기경보 정렬 요약을 Markdown 줄 목록으로 반환.
+    exp_A_early_warning_comparison.py 산출물 기반 보조 비교(정의가 본문과 다름).
+    본문 Lead와 혼동되지 않도록 Appendix 제목·면책 문구 사용.
     """
     align_path = results_root / 'exp_A_alignment_comparison.csv'
     if not align_path.exists() or align_path.stat().st_size == 0:
         return [
             '',
-            '## Grad-CAM vs FastCAV (early warning)',
-            '*이 섹션 데이터 없음. 생성: `python scripts/11_fastcav_concept_detection.py` 후 '
+            '## Appendix: Grad-CAM vs FastCAV (exp_A, alternate metric)',
+            '*이 부록 데이터 없음. 생성: `python scripts/11_fastcav_concept_detection.py` 후 '
             '`python scripts/exp_A_early_warning_comparison.py`*',
+            '',
+            '*아래 표의 Lead는 **본 문서 상단 Method comparison과 동일한 정의가 아님** '
+            '(spread·개념점수 vs 4지표 평균 delta).*',
         ]
 
     adf = pd.read_csv(align_path)
-    lines = ['', '## Grad-CAM vs FastCAV (early warning)']
+    lines = ['', '## Appendix: Grad-CAM vs FastCAV (exp_A, alternate metric)']
     lines.append(
-        '*동일 `failure_events`의 performance 시작 severity 대비 CAM/개념 변화 시점 정렬(lead/coincident/lag). '
-        '**Grad-CAM (exp_A)**: `activation_spread` 붕괴 또는 baseline 대비 spread 변화 ≥0.2 (`exp_A_early_warning_comparison.py`). '
-        '**FastCAV (본 레포 proxy)**: `cam_records` 지표로 만든 개념 점수, 변화 ≥0.2 (`11_fastcav_concept_detection.py`). '
-        '위 둘은 Core 표의 **4지표 평균 delta=0.10** lead 정의와 다름.*'
+        '**주의: 이 부록의 Lead/Coincident/Lag는 상단 *Method comparison* 과 비교 불가.** '
+        '동일 `failure_events`·동일 performance 시작 severity에 대해, '
+        '**Grad-CAM (exp_A)**: spread 붕괴 또는 spread 상대 변화 ≥0.15 (`exp_A_early_warning_comparison.py`). '
+        '**FastCAV proxy**: 개념 점수 변화 ≥0.15 (`11_fastcav_concept_detection.py`). '
+        '본문의 통일 정의는 **4지표 평균 상대 delta ≥ {:.2f}** 임.'.format(
+            DEFAULT_CAM_METRIC_DELTA
+        )
     )
     lines.append('')
     lines.append('### Overall alignment (N={})'.format(len(adf)))
@@ -224,6 +372,102 @@ def build_gradcam_fastcav_report_section(results_root: Path) -> list:
     return lines
 
 
+def build_runtime_performance_section(results_root: Path) -> list:
+    """
+    results/runtime_summary.json (또는 구버전 runtime_benchmark.csv) 기반
+    논문/보고용 최소 실시간 지표 4종: FPS, 평균 지연, 마감 충족률, 검출기 대비 추가 비용.
+    """
+    json_path = results_root / 'runtime_summary.json'
+    csv_path = results_root / 'runtime_benchmark.csv'
+    lines = ['', '## Real-time performance (runtime)']
+
+    data = None
+    deadline_ms = 33.0
+    n_iter = None
+    if json_path.exists() and json_path.stat().st_size > 0:
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            deadline_ms = float(data.get('deadline_ms', 33.0))
+            n_iter = data.get('n_timed_iterations')
+            methods = data.get('methods', [])
+        except Exception:
+            data = None
+            methods = []
+    else:
+        methods = []
+
+    if not methods and csv_path.exists() and csv_path.stat().st_size > 0:
+        try:
+            cdf = pd.read_csv(csv_path)
+            methods = cdf.to_dict('records')
+            if 'within_deadline_pct' not in cdf.columns:
+                for m in methods:
+                    m['within_deadline_pct'] = float('nan')
+            deadline_ms = 33.0
+            n_iter = None
+        except Exception:
+            methods = []
+
+    if not methods:
+        lines.append(
+            '*실시간 지표 없음. `python scripts/runtime_xai_benchmark.py` 실행 후 `results/runtime_summary.json`·'
+            '`runtime_benchmark.csv`가 생성되면 본 섹션이 채워집니다.*'
+        )
+        lines.append('')
+        lines.append(
+            '*권장 최소 지표: (1) 평균 FPS (2) 평균 지연(ms) — 파이프라인 종료 시각 '
+            '(3) 마감 충족률 — 예: {:.0f} ms 이내 비율 (4) 설명 추가 비용 — 검출기-only 대비 지연·오버헤드 %.*'.format(
+                deadline_ms
+            )
+        )
+        return lines
+
+    lines.append(
+        (
+            '*단일 이미지·단일 bbox·batch=1, `runtime_xai_benchmark.py`와 동일 설정. '
+            '**Mean latency** = 해당 파이프라인 1회 wall time (입력 로드는 타이밍 제외). '
+            '**Within {:.0f} ms** = 반복 중 지연이 마감 이하인 비율(실시간 운용 가능성 참고). '
+            '**Overhead** = 검출기-only 평균 지연 대비 상대 증가율(%).*'
+        ).format(deadline_ms)
+    )
+    if data and data.get('latency_note'):
+        lines.append('*{}*'.format(str(data['latency_note']).strip()))
+    if n_iter is not None:
+        lines.append('*Timed iterations (after warmup): {}.*'.format(n_iter))
+    lines.append('')
+    lines.append(
+        '| Method | Mean latency (ms) | FPS | Within {:.0f} ms (%) | Overhead vs detector (%) |'.format(deadline_ms)
+    )
+    lines.append('|--------|-------------------|-----|--------------------|---------------------------|')
+
+    for row in methods:
+        name = str(row.get('method', ''))
+        mlat = row.get('mean_time_ms', float('nan'))
+        fps = row.get('fps', float('nan'))
+        wd = row.get('within_deadline_pct', float('nan'))
+        oh = row.get('overhead_percent', float('nan'))
+        mlat_s = '{:.2f}'.format(float(mlat)) if pd.notna(mlat) else 'N/A'
+        fps_s = '{:.2f}'.format(float(fps)) if pd.notna(fps) else 'N/A'
+        wd_s = '{:.1f}'.format(float(wd)) if pd.notna(wd) else 'N/A'
+        oh_s = '{:.1f}'.format(float(oh)) if pd.notna(oh) else 'N/A'
+        lines.append('| {} | {} | {} | {} | {} |'.format(name, mlat_s, fps_s, wd_s, oh_s))
+
+    has_deadline_col = any(
+        pd.notna(row.get('within_deadline_pct')) for row in methods
+    )
+    lines.append('')
+    if not has_deadline_col:
+        lines.append(
+            '*`within_deadline_pct`가 없는 구버전 `runtime_benchmark.csv`입니다. '
+            '`python scripts/runtime_xai_benchmark.py`를 다시 실행하면 마감 충족률·`runtime_summary.json`이 생성됩니다.*'
+        )
+    lines.append(
+        '*갱신: `python scripts/runtime_xai_benchmark.py` (마감 변경: `--deadline-ms 16.67` 등).*'
+    )
+    return lines
+
+
 def main():
     failure_events, cam_records = load_data()
 
@@ -243,97 +487,60 @@ def main():
     failure_events = failure_events.copy()
     failure_events['performance_start_severity'] = failure_events.apply(get_start_sev, axis=1)
 
-    # Threshold sweep: 0.05, 0.10, 0.20 (delta-based) + trend
-    THRESHOLDS = [0.05, 0.10, 0.20]
-    DEFAULT_THRESHOLD = 0.10  # used for lead_stats.json and report
-    methods = [('threshold', t) for t in THRESHOLDS] + [('trend', None)]
-    stats = {m: [] for m in methods}  # list of dict: corruption, alignment, lead_steps
+    # Compute sweep thresholds + primary DEFAULT_CAM_METRIC_DELTA (0.15)
+    DEFAULT_THRESHOLD = DEFAULT_CAM_METRIC_DELTA
+    all_thresholds = sorted(set(THRESHOLDS_SWEEP + [DEFAULT_THRESHOLD]))
+    methods_tpl = [('threshold', t) for t in all_thresholds] + [('trend', None)]
 
-    for _, event in failure_events.iterrows():
-        start = event.get('performance_start_severity')
-        if pd.isna(start):
-            continue
-        start = int(start)
+    xai_labels = iter_xai_method_labels(cam_records)
+    stats_by_xai = {}
+    rows_by_xai = {}
+    for xai_label in xai_labels:
+        cam_sub = filter_cam_primary_xai(cam_records, xai_label)
+        st, _mt = compute_alignment_stats_for_cam_subset(failure_events, cam_sub, all_thresholds)
+        stats_by_xai[xai_label] = st
+        rows_by_xai[xai_label] = build_summary_rows_from_stats(st, methods_tpl)
 
-        corruption = event.get('corruption')
-        image_id = event.get('image_id')
-        class_id = event.get('class_id')
-
-        event_cam = cam_records[
-            (cam_records['corruption'] == corruption) &
-            (cam_records['image_id'] == image_id) &
-            (cam_records['class_id'] == class_id) &
-            (cam_records['layer_role'] == 'primary')
-        ]
-
-        def _rec(align, steps):
-            return {'corruption': corruption, 'alignment': align, 'lead_steps': steps}
-
-        if event_cam.empty:
-            for method in methods:
-                stats[method].append(_rec('unavailable', None))
-            continue
-
-        event_cam = event_cam[event_cam['severity'] <= start].copy()
-        if event_cam.empty:
-            for method in methods:
-                stats[method].append(_rec('unavailable', None))
-            continue
-
-        event_cam['severity'] = pd.to_numeric(event_cam['severity'], errors='coerce').fillna(-1).astype(int)
-        score_by_sev = compute_event_cam_scores(event_cam)
-
-        for method in methods:
-            if method[0] == 'threshold':
-                cam_change_sev = baseline_threshold_change(score_by_sev, method[1])
-            else:
-                cam_change_sev = trend_based_change(score_by_sev)
-            alignment, lead_steps = compute_alignment(start, cam_change_sev)
-            stats[method].append(_rec(alignment, lead_steps))
-
-    def _summarize_method(results):
-        total = len(results)
-        if total == 0:
-            return None
-        lead_items = [x for x in results if x['alignment'] == 'lead']
-        coincident_items = [x for x in results if x['alignment'] == 'coincident']
-        lag_items = [x for x in results if x['alignment'] == 'lag']
-        unavailable = [x for x in results if x['alignment'] == 'unavailable']
-        lead_ratio = (len(lead_items) / total) * 100
-        lead_steps_list = [x['lead_steps'] for x in lead_items if x['lead_steps'] is not None]
-        mean_lead_step = float(np.mean(lead_steps_list)) if lead_steps_list else np.nan
-        return {
-            'n_lead': len(lead_items),
-            'n_coincident': len(coincident_items),
-            'n_lag': len(lag_items),
-            'n_unavailable': len(unavailable),
-            'n_total': total,
-            'Lead Ratio (%)': lead_ratio,
-            'Mean Lead Step': mean_lead_step,
-        }
+    # lead_stats.json·Core 표: gradcam 버킷 우선(레거시 호환), 없으면 첫 XAI 라벨
+    lead_src_label = 'gradcam' if 'gradcam' in stats_by_xai else xai_labels[0]
+    stats = stats_by_xai[lead_src_label]
+    rows = rows_by_xai[lead_src_label]
 
     def _summarize_per_corruption(results, corruption: str):
         sub = [x for x in results if x.get('corruption') == corruption]
-        return _summarize_method(sub)
+        return summarize_alignment_list(sub)
 
-    # Summary rows for each method
-    rows = []
-    for method in methods:
-        s = _summarize_method(stats[method])
-        if s is None:
-            continue
-        rows.append({
-            'method': method,
-            'Change Type': 'threshold' if method[0] == 'threshold' else 'trend',
-            'Threshold': method[1],
-            'Lead Ratio (%)': s['Lead Ratio (%)'],
-            'Mean Lead Step': s['Mean Lead Step'],
-            'n_lead': s['n_lead'],
-            'n_coincident': s['n_coincident'],
-            'n_lag': s['n_lag'],
-            'n_unavailable': s['n_unavailable'],
-            'n_total': s['n_total'],
-        })
+    # ---- lead_stats_by_xai_method.json (XAI별 선행성 동일 정의)
+    multi_bundle = {
+        'delta_threshold': float(DEFAULT_THRESHOLD),
+        'lead_reference_bucket': lead_src_label,
+        'methods': {},
+    }
+    for lbl in xai_labels:
+        rws = rows_by_xai[lbl]
+        pr = next((r for r in rws if r['method'] == ('threshold', DEFAULT_THRESHOLD)), None)
+        tr = next((r for r in rws if r['Change Type'] == 'trend'), None)
+        multi_bundle['methods'][lbl] = {
+            'display_name': xai_method_display_name(lbl),
+            'primary_delta': {
+                'Lead Ratio (%)': None if pr is None else float(pr['Lead Ratio (%)']),
+                'Mean Lead Step': None
+                if pr is None or (isinstance(pr['Mean Lead Step'], float) and np.isnan(pr['Mean Lead Step']))
+                else float(pr['Mean Lead Step']),
+                'n_unavailable': None if pr is None else int(pr['n_unavailable']),
+                'n_total': None if pr is None else int(pr['n_total']),
+            },
+            'trend': {
+                'Lead Ratio (%)': None if tr is None else float(tr['Lead Ratio (%)']),
+                'Mean Lead Step': None
+                if tr is None or (isinstance(tr['Mean Lead Step'], float) and np.isnan(tr['Mean Lead Step']))
+                else float(tr['Mean Lead Step']),
+            },
+        }
+    multi_path = Path('results') / 'lead_stats_by_xai_method.json'
+    with open(multi_path, 'w', encoding='utf-8') as f:
+        json.dump(multi_bundle, f, indent=2, ensure_ascii=False)
+    print(f"[OK] Wrote {multi_path}")
 
     # ---- lead_stats.json (threshold = DEFAULT_THRESHOLD)
     default_row = next((r for r in rows if r['method'] == ('threshold', DEFAULT_THRESHOLD)), None)
@@ -395,6 +602,10 @@ def main():
     summary_df = None
     if det_df is not None and len(det_df) > 0:
         cam_for_summary = cam_df if cam_df is not None else pd.DataFrame()
+        if len(cam_for_summary) > 0 and 'xai_method' in cam_for_summary.columns:
+            _sxm = cam_for_summary['xai_method']
+            if not _sxm.isna().all():
+                cam_for_summary = filter_cam_primary_xai(cam_for_summary, lead_src_label)
         summary_df = compute_severity_progression_summary(det_df, cam_for_summary, results_root)
 
     # Sev4 performance / CAM availability per corruption (dynamic if CSVs exist)
@@ -413,9 +624,8 @@ def main():
                 score_drop = float(d4['is_miss'].mean())
         cam_ratio = 0.0
         if cam_df is not None and len(cam_df) > 0 and 'severity' in cam_df.columns:
-            c4 = cam_df[(cam_df['corruption'] == c) & (cam_df['severity'] == 4)]
-            if 'layer_role' in c4.columns:
-                c4 = c4[c4['layer_role'] == 'primary']
+            cam_f = filter_cam_primary_xai(cam_df, lead_src_label)
+            c4 = cam_f[(cam_f['corruption'] == c) & (cam_f['severity'] == 4)]
             if 'cam_status' in c4.columns:
                 c4 = c4[c4['cam_status'] == 'ok']
             cam_ratio = (
@@ -425,46 +635,131 @@ def main():
             )
         sev4_perf_cam[c] = (cam_ratio, score_drop)
 
-    th_05 = next((r for r in rows if r['method'] == ('threshold', 0.05)), None)
-    th_10 = next((r for r in rows if r['method'] == ('threshold', 0.10)), None)
-    th_20 = next((r for r in rows if r['method'] == ('threshold', 0.20)), None)
     trend_row = next((r for r in rows if r['Change Type'] == 'trend'), None)
-    th10_key = ('threshold', DEFAULT_THRESHOLD)
-    th10_stats = stats[th10_key]
+    primary_key = ('threshold', DEFAULT_THRESHOLD)
+    primary_stats = stats[primary_key]
+    primary_row = next((r for r in rows if r['method'] == primary_key), None)
+    multi_xai_compare = len(xai_labels) > 1
+
+    def _fmt_mean_lead_step(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return 'N/A'
+        return f'{float(v):.2f}'
 
     report_lines = []
     report_lines.append('# Concise Summary Report: CAM vs Performance')
     report_lines.append('')
     report_lines.append('This summary focuses on the core findings for fast decision-making.')
     report_lines.append('')
+    report_lines.append('## Method comparison (single metric)')
+    report_lines.append(
+        '*Unified definition for every row: aggregate CAM score at each severity = mean of '
+        '(bbox_center_activation_distance, peak_bbox_distance, activation_spread, ring_energy_ratio); '
+        '**CAM change severity** = smallest severity > 0 with relative |Δ| vs severity 0 ≥ threshold (primary rows) '
+        'or trend rule (trend rows). Aligned with `performance_start_severity` from `failure_events`. '
+        'Multiple rows = different **heatmap methods** from `cam_records.xai_method` (re-run `05_gradcam_failure_analysis.py` '
+        'with `gradcam.xai_methods` in `configs/experiment.yaml`).*'
+    )
+    report_lines.append('')
+    if multi_xai_compare:
+        report_lines.append(
+            '| XAI method | Rule | Lead % | Avg lead steps | Unavailable % | N |'
+        )
+        report_lines.append(
+            '|------------|------|--------|----------------|---------------|---|'
+        )
+        _wrote_multi = False
+        for lbl in xai_labels:
+            rws = rows_by_xai[lbl]
+            dn = xai_method_display_name(lbl)
+            pr = next((r for r in rws if r['method'] == primary_key), None)
+            tr = next((r for r in rws if r['Change Type'] == 'trend'), None)
+            if pr:
+                _wrote_multi = True
+                un_p = 100.0 * pr['n_unavailable'] / pr['n_total'] if pr['n_total'] else 0.0
+                report_lines.append(
+                    '| {} | **Primary: 4-metric mean delta >= {:.2f}** | {:.1f}% | {} | {:.1f}% | {} |'.format(
+                        dn,
+                        DEFAULT_THRESHOLD,
+                        pr['Lead Ratio (%)'],
+                        _fmt_mean_lead_step(pr['Mean Lead Step']),
+                        un_p,
+                        pr['n_total'],
+                    )
+                )
+            if tr:
+                _wrote_multi = True
+                un_p = 100.0 * tr['n_unavailable'] / tr['n_total'] if tr['n_total'] else 0.0
+                report_lines.append(
+                    '| {} | Trend-based (same 4-metric scores) | {:.1f}% | {} | {:.1f}% | {} |'.format(
+                        dn,
+                        tr['Lead Ratio (%)'],
+                        _fmt_mean_lead_step(tr['Mean Lead Step']),
+                        un_p,
+                        tr['n_total'],
+                    )
+                )
+        if not _wrote_multi:
+            report_lines.append('| N/A | N/A | N/A | N/A | N/A | 0 |')
+    else:
+        report_lines.append('| Rule | Lead % | Avg lead steps | Unavailable % | N |')
+        report_lines.append('|------|--------|----------------|---------------|---|')
+        if primary_row:
+            pr = primary_row
+            un_p = 100.0 * pr['n_unavailable'] / pr['n_total'] if pr['n_total'] else 0.0
+            report_lines.append(
+                '| **Primary: 4-metric mean delta >= {:.2f}** | {:.1f}% | {} | {:.1f}% | {} |'.format(
+                    DEFAULT_THRESHOLD,
+                    pr['Lead Ratio (%)'],
+                    _fmt_mean_lead_step(pr['Mean Lead Step']),
+                    un_p,
+                    pr['n_total'],
+                )
+            )
+        if trend_row:
+            tr = trend_row
+            un_p = 100.0 * tr['n_unavailable'] / tr['n_total'] if tr['n_total'] else 0.0
+            report_lines.append(
+                '| Trend-based change (same 4-metric scores) | {:.1f}% | {} | {:.1f}% | {} |'.format(
+                    tr['Lead Ratio (%)'],
+                    _fmt_mean_lead_step(tr['Mean Lead Step']),
+                    un_p,
+                    tr['n_total'],
+                )
+            )
+        if not primary_row and not trend_row:
+            report_lines.append('| N/A | N/A | N/A | N/A | 0 |')
+    report_lines.append('')
+    report_lines.append(
+        '*Grad-CAM vs FastCAV under **different** signal definitions → Appendix at end of this report.*'
+    )
+    report_lines.append('')
     report_lines.append('## Key conclusions')
     report_lines.append(
-        '- **CAM 변화 정의 (본 리포트)**: severity-0 대비 4지표(bbox_dist, peak_dist, spread, ring_ratio) 평균 스코어의 '
-        '**상대 변화(delta) >= {:.2f}** 인 최소 severity를 CAM 변화 시점으로 둠.'.format(DEFAULT_THRESHOLD)
-    )
-    if th_05 and th_10 and th_20:
-        report_lines.append(
-            '- Threshold sweep (delta): lead 비율 {:.1f}% / {:.1f}% / {:.1f}% (0.05 / 0.10 / 0.20); '
-            'Mean lead step {:.2f} / {:.2f} / {:.2f}.'.format(
-                th_05['Lead Ratio (%)'], th_10['Lead Ratio (%)'], th_20['Lead Ratio (%)'],
-                th_05['Mean Lead Step'] if not np.isnan(th_05['Mean Lead Step']) else 0,
-                th_10['Mean Lead Step'] if not np.isnan(th_10['Mean Lead Step']) else 0,
-                th_20['Mean Lead Step'] if not np.isnan(th_20['Mean Lead Step']) else 0,
-            )
+        '- **CAM 변화 정의 (본 리포트 전역)**: severity-0 대비 4지표(bbox_dist, peak_dist, spread, ring_ratio) 평균 스코어의 '
+        '**상대 변화(delta) >= {:.2f}** 인 최소 severity를 CAM 변화 시점으로 둠. `lead_stats.json`·Core 표는 **{}** 버킷 기준; '
+        'XAI별 수치는 `lead_stats_by_xai_method.json` 및 상단 표.'.format(
+            DEFAULT_THRESHOLD,
+            xai_method_display_name(lead_src_label),
         )
-    n_tot = th_10['n_total'] if th_10 else 0
-    n_wcam = (th_10['n_lead'] + th_10['n_coincident'] + th_10['n_lag']) if th_10 else 0
-    if th_10 and n_tot > 0:
+    )
+    n_tot = primary_row['n_total'] if primary_row else 0
+    n_wcam = (
+        (primary_row['n_lead'] + primary_row['n_coincident'] + primary_row['n_lag'])
+        if primary_row
+        else 0
+    )
+    if primary_row and n_tot > 0:
         report_lines.append(
             '- **delta={:.2f} 전체 이벤트 기준**: lead {:.1f}% (전체 N={}), '
             'CAM 가능 이벤트 내 lead {:.1f}% (N={}), coincident {:.1f}%, lag {:.1f}%.'.format(
                 DEFAULT_THRESHOLD,
-                100.0 * th_10['n_lead'] / n_tot,
+                100.0 * primary_row['n_lead'] / n_tot,
                 n_tot,
-                100.0 * th_10['n_lead'] / n_wcam if n_wcam else 0.0,
+                100.0 * primary_row['n_lead'] / n_wcam if n_wcam else 0.0,
                 n_wcam,
-                100.0 * th_10['n_coincident'] / n_wcam if n_wcam else 0.0,
-                100.0 * th_10['n_lag'] / n_wcam if n_wcam else 0.0,
+                100.0 * primary_row['n_coincident'] / n_wcam if n_wcam else 0.0,
+                100.0 * primary_row['n_lag'] / n_wcam if n_wcam else 0.0,
             )
         )
     if trend_row is not None:
@@ -477,45 +772,28 @@ def main():
     report_lines.append('- 성능 붕괴 현상: severity 3~4에서 score_drop 및 miss_rate 급증.')
     report_lines.append('- CAM 가용성 감소: severity 4에서 cam_valid_ratio가 크게 감소.')
     report_lines.append(
-        '- 참고: z-score(|z|>=2) 기반 정렬은 별도 파이프라인이며, 본 표의 Lead는 **delta 임계값 {:.2f}** 산출값임.'.format(
-            DEFAULT_THRESHOLD
-        )
+        '- 기타 파이프라인: z-score(|z|>=2) 등은 **별도 정의**이며, 본 문서의 Lead/표는 **4지표 평균 delta**만 사용.'
     )
-    exp_a_summary_path = results_root / 'exp_A_summary_table.csv'
-    if exp_a_summary_path.exists() and exp_a_summary_path.stat().st_size > 0:
-        try:
-            es = pd.read_csv(exp_a_summary_path)
-            gl = es[(es['method'] == 'GRADCAM') & (es['alignment'] == 'lead')]['percentage']
-            fl = es[(es['method'] == 'FASTCAV') & (es['alignment'] == 'lead')]['percentage']
-            gu = es[(es['method'] == 'GRADCAM') & (es['alignment'] == 'unavailable')]['percentage']
-            fu = es[(es['method'] == 'FASTCAV') & (es['alignment'] == 'unavailable')]['percentage']
-            if len(gl) > 0 and len(fl) > 0:
-                report_lines.append(
-                    '- **Grad-CAM vs FastCAV (exp_A 조기경보)**: 동일 failure 이벤트 기준 lead 비율 '
-                    'Grad-CAM {:.1f}% vs FastCAV {:.1f}% (unavailable {:.1f}% vs {:.1f}%). '
-                    '정의는 spread/개념점수·delta=0.2 — Core 표의 4지표 delta={:.2f} 와 별개. 하단 표 참조.'.format(
-                        float(gl.iloc[0]), float(fl.iloc[0]),
-                        float(gu.iloc[0]) if len(gu) > 0 else 0.0,
-                        float(fu.iloc[0]) if len(fu) > 0 else 0.0,
-                        DEFAULT_THRESHOLD,
-                    )
-                )
-        except Exception:
-            pass
+    report_lines.append(
+        '- exp_A Grad-CAM vs FastCAV는 **다른 신호**(spread·개념점수)이므로 상단 표와 숫자를 직접 비교하지 말 것 → 부록.'
+    )
+    report_lines.extend(build_runtime_performance_section(results_root))
     report_lines.append('')
     report_lines.append('## Core comparison table')
     report_lines.append(
-        '*Cam Valid Ratio (sev4): 분자 = cam_records 행 수(`layer_role=primary`, `cam_status=ok`); '
-        '분모 = corruption당 고유 image 슬롯 수 {} (tiny 코호트; sev4에서도 동일 분모). '
-        'Score Drop Rate (sev4): **matched==1** detection 행만 대상으로 `mean(is_score_drop)` — '
-        '미스 행은 스코어 드롭 플래그가 정의되지 않아 제외.*'.format(EXPECTED_UNIQUE_IMAGES_PER_CORRUPTION)
+        '*Cam Valid Ratio (sev4)·Lead: **{}** (`xai_method` 버킷, primary·ok). '
+        '분자 = 해당 버킷 cam_records 행 수; 분모 = corruption당 고유 image 슬롯 수 {}. '
+        'Score Drop Rate (sev4): **matched==1** detection 행만 `mean(is_score_drop)`.*'.format(
+            xai_method_display_name(lead_src_label),
+            EXPECTED_UNIQUE_IMAGES_PER_CORRUPTION,
+        )
     )
     report_lines.append(
         '| Corruption | Lead % | Avg Lead Steps | Cam Valid Ratio (sev4) | Score Drop Rate (sev4) |'
     )
     report_lines.append('|------------|--------|----------------|------------------------|------------------------|')
     for c in corruptions:
-        pc = _summarize_per_corruption(th10_stats, c)
+        pc = _summarize_per_corruption(primary_stats, c)
         cam_v, sd = sev4_perf_cam.get(c, (0.0, 0.0))
         if pc is None or pc['n_total'] == 0:
             report_lines.append('| {} | N/A | N/A | {:.3f} | {:.3f} |'.format(c, cam_v, sd))
@@ -575,8 +853,15 @@ def main():
         '- 실무: Grad-CAM baseline 유지 + cam_status != ok 건수를 위험 지표에 포함.'
     )
     report_lines.append(
-        '- FastCAV 비교 갱신: `python scripts/11_fastcav_concept_detection.py` → '
+        '- 부록(exp_A) 갱신: `python scripts/11_fastcav_concept_detection.py` → '
         '`python scripts/exp_A_early_warning_comparison.py` → 본 `report.md` 재생성.'
+    )
+    report_lines.append(
+        '- 실시간 성능 표 갱신: `python scripts/runtime_xai_benchmark.py` → `python scripts/exp_A_threshold_trend_validation.py`.'
+    )
+    report_lines.append(
+        '- Grad-CAM++ / LayerCAM **선행성**: `configs/experiment.yaml`의 `gradcam.xai_methods`에 '
+        '`fastcam`(또는 `gradcampp`), `layercam` 포함 후 `python scripts/05_gradcam_failure_analysis.py` → 본 스크립트.'
     )
 
     report_path = results_root / 'report.md'

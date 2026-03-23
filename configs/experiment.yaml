@@ -154,8 +154,8 @@ collapse_detection:
 # cam_mode: full (all 0..4) | risk_window (onset-1..onset+1) | stratified (sample). Currently risk_events define window.
 gradcam:
   enabled: true
-  # XAI 방법 비교: gradcam만 쓰면 기존과 동일, fastcam 추가 시 Grad-CAM++(FastCAM)도 실행·저장
-  xai_methods: ["gradcam", "fastcam"]  # ["gradcam"] only | ["gradcam", "fastcam"] for 비교 분석
+  # XAI 방법 비교: gradcam | fastcam 또는 gradcampp(Grad-CAM++) | layercam — cam_records.xai_method·선행성 표에 반영
+  xai_methods: ["gradcam", "fastcam", "layercam"]
   # CAM 생성: 전체 이미지(full-image) 권장. bbox는 지표 계산용(측정 창)으로만 사용.
   # use_bbox_roi: true → bbox crop에만 CAM 씌우면 attention 이동/leakage를 못 봄, E_bbox≈1·distance 왜곡.
   use_bbox_roi: false

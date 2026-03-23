@@ -18,7 +18,7 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # 40MP limit (adjust if needed)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.xai.gradcam_yolo import YOLOGradCAM, YOLOGradCAMPP
+from src.xai.gradcam_yolo import YOLOGradCAM, YOLOGradCAMPP, YOLOLayerCAM
 from src.xai.cam_metrics import compute_cam_metrics
 from src.xai.cam_qc import get_qc_status
 from src.xai.cam_extraction import extract_cam_multi_layer
@@ -261,8 +261,13 @@ def main():
     
     # Stage B: Initialize Grad-CAM (and FastCAM/Grad-CAM++) for multiple methods and layers
     device_str = str(device) if 'device' in locals() else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    xai_methods = gradcam_config.get('xai_methods', ['gradcam'])  # ['gradcam', 'fastcam'] for 비교 분석
-    cam_class = {'gradcam': YOLOGradCAM, 'fastcam': YOLOGradCAMPP}
+    xai_methods = gradcam_config.get('xai_methods', ['gradcam'])  # e.g. gradcam, fastcam(gradcampp), layercam
+    cam_class = {
+        'gradcam': YOLOGradCAM,
+        'fastcam': YOLOGradCAMPP,   # legacy name = Grad-CAM++
+        'gradcampp': YOLOGradCAMPP,
+        'layercam': YOLOLayerCAM,
+    }
     gradcam_instances = {}  # xai_method -> { layer_role -> instance }
     for xai_method in xai_methods:
         gradcam_instances[xai_method] = {}
@@ -337,18 +342,20 @@ def main():
                 print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id} (object_uid={object_uid})")
                 # B4: Record missing_tiny_obj so it appears in fail reason counts (one per severity)
                 for sev in range(cam_sev_from, cam_sev_to + 1):
-                    rec_skip = create_cam_record(
-                        model=model_name, corruption=corruption, severity=sev,
-                        image_id=image_id, class_id=class_id, object_id=object_uid,
-                        bbox_x1=None, bbox_y1=None, bbox_x2=None, bbox_y2=None,
-                        layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
-                        cam_status='skipped', fail_reason='missing_tiny_obj', exc_type=None, exc_msg=None,
-                        failure_severity=start_severity
-                    )
-                    if use_risk_events and 'failure_event_id' in event:
-                        rec_skip['failure_event_id'] = event['failure_event_id']
-                        rec_skip['failure_type'] = failure_type
-                    cam_records.append(rec_skip)
+                    for xm in xai_methods:
+                        rec_skip = create_cam_record(
+                            model=model_name, corruption=corruption, severity=sev,
+                            image_id=image_id, class_id=class_id, object_id=object_uid,
+                            bbox_x1=None, bbox_y1=None, bbox_x2=None, bbox_y2=None,
+                            layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                            cam_status='skipped', fail_reason='missing_tiny_obj', exc_type=None, exc_msg=None,
+                            failure_severity=start_severity,
+                            xai_method=xm,
+                        )
+                        if use_risk_events and 'failure_event_id' in event:
+                            rec_skip['failure_event_id'] = event['failure_event_id']
+                            rec_skip['failure_type'] = failure_type
+                        cam_records.append(rec_skip)
                 continue
             
             frame_rel_path = tiny_obj['frame_path']
@@ -382,18 +389,20 @@ def main():
                 print(f"[DBG] missing tiny_obj for {corruption} {image_id} class={class_id}")
                 # B4: Record missing_tiny_obj for fail reason counts
                 for sev in range(0, failure_severity + 1):
-                    rec_skip = create_cam_record(
-                        model=model_name, corruption=corruption, severity=sev,
-                        image_id=image_id, class_id=class_id, object_id=object_uid,
-                        bbox_x1=None, bbox_y1=None, bbox_x2=None, bbox_y2=None,
-                        layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
-                        cam_status='skipped', fail_reason='missing_tiny_obj', exc_type=None, exc_msg=None,
-                        failure_severity=failure_severity
-                    )
-                    if use_risk_events and 'failure_event_id' in event:
-                        rec_skip['failure_event_id'] = event['failure_event_id']
-                        rec_skip['failure_type'] = failure_type
-                    cam_records.append(rec_skip)
+                    for xm in xai_methods:
+                        rec_skip = create_cam_record(
+                            model=model_name, corruption=corruption, severity=sev,
+                            image_id=image_id, class_id=class_id, object_id=object_uid,
+                            bbox_x1=None, bbox_y1=None, bbox_x2=None, bbox_y2=None,
+                            layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                            cam_status='skipped', fail_reason='missing_tiny_obj', exc_type=None, exc_msg=None,
+                            failure_severity=failure_severity,
+                            xai_method=xm,
+                        )
+                        if use_risk_events and 'failure_event_id' in event:
+                            rec_skip['failure_event_id'] = event['failure_event_id']
+                            rec_skip['failure_type'] = failure_type
+                        cam_records.append(rec_skip)
                 continue
             
             frame_rel_path = tiny_obj['frame_path']
@@ -437,36 +446,40 @@ def main():
                                 seed=config['seed']
                             )
                         except Exception as e:
-                            rec_skip = create_cam_record(
-                                model=model_name, corruption=corruption, severity=severity,
-                                image_id=image_id, class_id=class_id, object_id=object_uid,
-                                bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
-                                bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
-                                layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
-                                cam_status='skipped', fail_reason='image_missing', exc_type=None, exc_msg=None,
-                                failure_severity=failure_severity
-                            )
-                            if use_risk_events and 'failure_event_id' in event:
-                                rec_skip['failure_event_id'] = event['failure_event_id']
-                                rec_skip['failure_type'] = failure_type
-                            cam_records.append(rec_skip)
+                            for xm in xai_methods:
+                                rec_skip = create_cam_record(
+                                    model=model_name, corruption=corruption, severity=severity,
+                                    image_id=image_id, class_id=class_id, object_id=object_uid,
+                                    bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                                    bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                                    layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                                    cam_status='skipped', fail_reason='image_missing', exc_type=None, exc_msg=None,
+                                    failure_severity=failure_severity,
+                                    xai_method=xm,
+                                )
+                                if use_risk_events and 'failure_event_id' in event:
+                                    rec_skip['failure_event_id'] = event['failure_event_id']
+                                    rec_skip['failure_type'] = failure_type
+                                cam_records.append(rec_skip)
                             continue
                     # else: orig missing, fall through to skip
                 if not image_path.exists():
                     # B-2: Log skipped attempt
-                    rec_skip = create_cam_record(
-                        model=model_name, corruption=corruption, severity=severity,
-                        image_id=image_id, class_id=class_id, object_id=object_uid,
-                        bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
-                        bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
-                        layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
-                        cam_status='skipped', fail_reason='image_missing', exc_type=None, exc_msg=None,
-                        failure_severity=failure_severity
-                    )
-                    if use_risk_events and 'failure_event_id' in event:
-                        rec_skip['failure_event_id'] = event['failure_event_id']
-                        rec_skip['failure_type'] = failure_type
-                    cam_records.append(rec_skip)
+                    for xm in xai_methods:
+                        rec_skip = create_cam_record(
+                            model=model_name, corruption=corruption, severity=severity,
+                            image_id=image_id, class_id=class_id, object_id=object_uid,
+                            bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                            bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                            layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                            cam_status='skipped', fail_reason='image_missing', exc_type=None, exc_msg=None,
+                            failure_severity=failure_severity,
+                            xai_method=xm,
+                        )
+                        if use_risk_events and 'failure_event_id' in event:
+                            rec_skip['failure_event_id'] = event['failure_event_id']
+                            rec_skip['failure_type'] = failure_type
+                        cam_records.append(rec_skip)
                     continue
             
             # Load image with memory-efficient approach
@@ -495,20 +508,22 @@ def main():
                             'exc_type': 'ImageTooLarge',
                             'exc_msg': f'Image size {w}x{h} exceeds {MAX_PIXELS//1_000_000}MP limit'
                         })
-                        rec_skip = create_cam_record(
-                            model=model_name, corruption=corruption, severity=severity,
-                            image_id=image_id, class_id=class_id, object_id=object_uid,
-                            bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
-                            bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
-                            layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
-                            cam_status='skipped', fail_reason='image_too_large',
-                            exc_type='ImageTooLarge', exc_msg=f'Image size {w}x{h} exceeds {MAX_PIXELS//1_000_000}MP limit',
-                            failure_severity=failure_severity
-                        )
-                        if use_risk_events and 'failure_event_id' in event:
-                            rec_skip['failure_event_id'] = event['failure_event_id']
-                            rec_skip['failure_type'] = failure_type
-                        cam_records.append(rec_skip)
+                        for xm in xai_methods:
+                            rec_skip = create_cam_record(
+                                model=model_name, corruption=corruption, severity=severity,
+                                image_id=image_id, class_id=class_id, object_id=object_uid,
+                                bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                                bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                                layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                                cam_status='skipped', fail_reason='image_too_large',
+                                exc_type='ImageTooLarge', exc_msg=f'Image size {w}x{h} exceeds {MAX_PIXELS//1_000_000}MP limit',
+                                failure_severity=failure_severity,
+                                xai_method=xm,
+                            )
+                            if use_risk_events and 'failure_event_id' in event:
+                                rec_skip['failure_event_id'] = event['failure_event_id']
+                                rec_skip['failure_type'] = failure_type
+                            cam_records.append(rec_skip)
                         continue
                     
                     # CRITICAL: Very aggressive resizing for memory-constrained systems
@@ -548,19 +563,21 @@ def main():
                     'exc_type': type(e).__name__,
                     'exc_msg': str(e)[:200]
                 })
-                rec_fail = create_cam_record(
-                    model=model_name, corruption=corruption, severity=severity,
-                    image_id=image_id, class_id=class_id, object_id=object_uid,
-                    bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
-                    bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
-                    layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
-                    cam_status='fail', fail_reason='oom', exc_type=type(e).__name__, exc_msg=str(e)[:200],
-                    failure_severity=failure_severity
-                )
-                if use_risk_events and 'failure_event_id' in event:
-                    rec_fail['failure_event_id'] = event['failure_event_id']
-                    rec_fail['failure_type'] = failure_type
-                cam_records.append(rec_fail)
+                for xm in xai_methods:
+                    rec_fail = create_cam_record(
+                        model=model_name, corruption=corruption, severity=severity,
+                        image_id=image_id, class_id=class_id, object_id=object_uid,
+                        bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                        bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                        layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                        cam_status='fail', fail_reason='oom', exc_type=type(e).__name__, exc_msg=str(e)[:200],
+                        failure_severity=failure_severity,
+                        xai_method=xm,
+                    )
+                    if use_risk_events and 'failure_event_id' in event:
+                        rec_fail['failure_event_id'] = event['failure_event_id']
+                        rec_fail['failure_type'] = failure_type
+                    cam_records.append(rec_fail)
                 gc.collect()
                 continue
             except (OSError, IOError, ValueError) as e:
@@ -579,19 +596,21 @@ def main():
                     'exc_type': type(e).__name__,
                     'exc_msg': str(e)[:200]
                 })
-                rec_fail = create_cam_record(
-                    model=model_name, corruption=corruption, severity=severity,
-                    image_id=image_id, class_id=class_id, object_id=object_uid,
-                    bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
-                    bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
-                    layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
-                    cam_status='fail', fail_reason='image_load_failed', exc_type=type(e).__name__, exc_msg=str(e)[:200],
-                    failure_severity=failure_severity
-                )
-                if use_risk_events and 'failure_event_id' in event:
-                    rec_fail['failure_event_id'] = event['failure_event_id']
-                    rec_fail['failure_type'] = failure_type
-                cam_records.append(rec_fail)
+                for xm in xai_methods:
+                    rec_fail = create_cam_record(
+                        model=model_name, corruption=corruption, severity=severity,
+                        image_id=image_id, class_id=class_id, object_id=object_uid,
+                        bbox_x1=tiny_obj['bbox'][0], bbox_y1=tiny_obj['bbox'][1],
+                        bbox_x2=tiny_obj['bbox'][0] + tiny_obj['bbox'][2], bbox_y2=tiny_obj['bbox'][1] + tiny_obj['bbox'][3],
+                        layer_role='primary', layer_name=layer_config.get('primary', {}).get('name', 'unknown'),
+                        cam_status='fail', fail_reason='image_load_failed', exc_type=type(e).__name__, exc_msg=str(e)[:200],
+                        failure_severity=failure_severity,
+                        xai_method=xm,
+                    )
+                    if use_risk_events and 'failure_event_id' in event:
+                        rec_fail['failure_event_id'] = event['failure_event_id']
+                        rec_fail['failure_type'] = failure_type
+                    cam_records.append(rec_fail)
                 gc.collect()
                 continue
             
@@ -706,10 +725,114 @@ def main():
                             pass
                     elif preprocessed_shape:
                         preprocessed_shape_tuple = preprocessed_shape
-                    
+
+                    bbox_xyxy_orig = (
+                        float(visdrone_bbox[0]),
+                        float(visdrone_bbox[1]),
+                        float(visdrone_bbox[0] + visdrone_bbox[2]),
+                        float(visdrone_bbox[1] + visdrone_bbox[3]),
+                    )
+
+                    # Extraction/QC failure: no metrics
+                    if cam is None or cam_shape is None or str(cam_status).lower() == 'fail':
+                        rec_fail = create_cam_record(
+                            model=model_name,
+                            corruption=corruption,
+                            severity=severity,
+                            image_id=image_id,
+                            class_id=class_id,
+                            object_id=object_uid if 'object_uid' in locals() else None,
+                            cam_target_class_id=cam_target_class_id,
+                            cam_target_type=cam_target_type,
+                            bbox_x1=visdrone_bbox[0],
+                            bbox_y1=visdrone_bbox[1],
+                            bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
+                            bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
+                            layer_role=layer_role,
+                            layer_name=layer_config[layer_role]['name'],
+                            cam_status='fail',
+                            fail_reason=fail_reason or 'cam_none',
+                            cam_quality=layer_result.get('cam_quality'),
+                            exc_type=layer_result.get('exc_type'),
+                            exc_msg=layer_result.get('exc_msg'),
+                            cam_min=cam_min,
+                            cam_max=cam_max,
+                            cam_sum=cam_sum,
+                            cam_var=cam_var,
+                            cam_std=cam_std,
+                            cam_dtype=cam_dtype,
+                            finite_ratio=finite_ratio,
+                            preprocessed_shape=preprocessed_shape_tuple,
+                            failure_severity=failure_severity,
+                            xai_method=xai_method,
+                        )
+                        if use_risk_events and 'failure_event_id' in event:
+                            rec_fail['failure_event_id'] = event['failure_event_id']
+                            rec_fail['failure_type'] = failure_type
+                        cam_records.append(rec_fail)
+                        continue
+
+                    meta_for_metrics = letterbox_meta
+                    if meta_for_metrics is not None:
+                        meta_for_metrics = dict(meta_for_metrics)
+                        meta_for_metrics.setdefault('original_width', orig_w)
+                        meta_for_metrics.setdefault('original_height', orig_h)
+                    else:
+                        meta_for_metrics = {'original_width': orig_w, 'original_height': orig_h}
+
+                    baseline_np = None
+                    if severity != 0:
+                        baseline_np = baseline_cams.get(xai_method, {}).get(layer_role)
+
+                    try:
+                        metrics = compute_cam_metrics(
+                            cam,
+                            bbox_xyxy_orig,
+                            (int(cam_shape[0]), int(cam_shape[1])),
+                            meta_for_metrics,
+                            baseline_cam=baseline_np.copy() if baseline_np is not None else None,
+                        )
+                    except Exception as me:
+                        rec_fail = create_cam_record(
+                            model=model_name,
+                            corruption=corruption,
+                            severity=severity,
+                            image_id=image_id,
+                            class_id=class_id,
+                            object_id=object_uid if 'object_uid' in locals() else None,
+                            cam_target_class_id=cam_target_class_id,
+                            cam_target_type=cam_target_type,
+                            bbox_x1=visdrone_bbox[0],
+                            bbox_y1=visdrone_bbox[1],
+                            bbox_x2=visdrone_bbox[0] + visdrone_bbox[2],
+                            bbox_y2=visdrone_bbox[1] + visdrone_bbox[3],
+                            layer_role=layer_role,
+                            layer_name=layer_config[layer_role]['name'],
+                            cam_status='fail',
+                            fail_reason='metrics_error',
+                            exc_type=type(me).__name__,
+                            exc_msg=str(me)[:200],
+                            cam_min=cam_min,
+                            cam_max=cam_max,
+                            cam_sum=cam_sum,
+                            cam_var=cam_var,
+                            cam_std=cam_std,
+                            cam_dtype=cam_dtype,
+                            finite_ratio=finite_ratio,
+                            preprocessed_shape=preprocessed_shape_tuple,
+                            failure_severity=failure_severity,
+                            xai_method=xai_method,
+                        )
+                        if use_risk_events and 'failure_event_id' in event:
+                            rec_fail['failure_event_id'] = event['failure_event_id']
+                            rec_fail['failure_type'] = failure_type
+                        cam_records.append(rec_fail)
+                        continue
+
+                    if severity == 0:
+                        baseline_cams.setdefault(xai_method, {})[layer_role] = np.array(cam, copy=True)
+
                     # Create record with new schema (RQ1: all CAMs saved with quality labels)
-                    # CRITICAL: Include object_uid and failure_event_id for alignment analysis
-                    # RQ1: Include CAM target information and quality label
                     cam_quality = layer_result.get('cam_quality', 'high')  # RQ1: quality label
                     record = create_cam_record(
                         model=model_name,
@@ -748,7 +871,8 @@ def main():
                         cam_dtype=cam_dtype,
                         finite_ratio=finite_ratio,
                         preprocessed_shape=preprocessed_shape_tuple,
-                        failure_severity=failure_severity
+                        failure_severity=failure_severity,
+                        xai_method=xai_method,
                     )
                     
                     # Add failure_event_id if available (for alignment analysis)
