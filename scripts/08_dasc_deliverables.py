@@ -326,20 +326,34 @@ def main():
     heatmap_dir = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples'))
     heatmap_samples = []
     if heatmap_dir.exists():
-        for c in corruptions:
-            for s in severities:
-                p = heatmap_dir / "yolo_generic" / c / f"L{s}"
-                if p.exists():
-                    for f in sorted(p.glob("*.png"))[:2]:
-                        try:
-                            rel = str(f.relative_to(Path.cwd()))
-                        except ValueError:
-                            rel = str(f)
-                        heatmap_samples.append({
-                            'corruption': c,
-                            'severity': int(s),
-                            'path': rel.replace('\\', '/')
-                        })
+        # New layout: heatmap_samples/<xai_method>/yolo_generic/... (per CAM type)
+        # Legacy: heatmap_samples/yolo_generic/...
+        subdirs = [d for d in heatmap_dir.iterdir() if d.is_dir()]
+        has_per_method = any((d / "yolo_generic").exists() for d in subdirs)
+        scan_roots = []
+        if has_per_method:
+            for d in sorted(subdirs):
+                if (d / "yolo_generic").exists():
+                    scan_roots.append((d.name, d))
+        else:
+            scan_roots = [("default", heatmap_dir)]
+
+        for xai_label, root in scan_roots:
+            for c in corruptions:
+                for s in severities:
+                    p = root / "yolo_generic" / c / f"L{s}"
+                    if p.exists():
+                        for f in sorted(p.glob("*.png"))[:2]:
+                            try:
+                                rel = str(f.relative_to(Path.cwd()))
+                            except ValueError:
+                                rel = str(f)
+                            heatmap_samples.append({
+                                'xai_method': xai_label,
+                                'corruption': c,
+                                'severity': int(s),
+                                'path': rel.replace('\\', '/')
+                            })
 
     # DASC summary JSON for HTML prototype
     summary = {

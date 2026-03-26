@@ -10,7 +10,7 @@ Measures (per method):
 Pipeline:
   - Detector only: letterbox preprocess (384) + YOLO forward, no backward.
   - XAI methods: full generate_cam (forward + backward + CAM map) on same layer as 05 script.
-  - FastCAV: Grad-CAM generate_cam + compute_cam_metrics (05-style) + concept scores (11-style).
+  - FastCAV: concept-score post-process only (no CAM generation).
 
 Output:
   - results/runtime_benchmark.csv
@@ -44,7 +44,6 @@ from ultralytics import YOLO
 from src.utils.io import load_yaml
 from src.utils.seed import set_seed
 from src.xai.gradcam_yolo import YOLOGradCAM, YOLOGradCAMPP, YOLOLayerCAM
-from src.xai.cam_metrics import compute_cam_metrics
 from src.data.bbox_conversion import visdrone_to_yolo_bbox
 
 
@@ -113,10 +112,12 @@ def _load_fastcav_normalizers(root: Path) -> Optional[Dict]:
     need = ["bbox_center_activation_distance", "activation_spread", "ring_energy_ratio"]
     if not all(c in cam_df.columns for c in need):
         return None
+    metric_rows = cam_df[need].dropna().to_dict("records")
     return {
         "bbox_distance": _normalize_metric_series(cam_df["bbox_center_activation_distance"].dropna()),
         "spread": _normalize_metric_series(cam_df["activation_spread"].dropna()),
         "ring_ratio": _normalize_metric_series(cam_df["ring_energy_ratio"].dropna()),
+        "metric_rows": metric_rows,
     }
 
 
@@ -168,33 +169,16 @@ def measure_xai_generate_cam(
 
 
 def measure_fastcav_pipeline(
-    explainer: YOLOGradCAM,
-    img_rgb: np.ndarray,
-    yolo_bbox: Tuple[float, float, float, float],
-    class_id: int,
-    bbox_xyxy: Tuple[float, float, float, float],
-    img_wh: Tuple[int, int],
+    metric_row: Dict,
     normalizers: Dict,
     *,
     sync_fn: Callable[[], None],
 ) -> float:
-    """Grad-CAM + cam_metrics + FastCAV concept scores (single-sample)."""
+    """FastCAV concept-score post-process only (single-sample)."""
     sync_fn()
     t0 = time.perf_counter()
-    cam_np, letterbox_meta = explainer.generate_cam(img_rgb, yolo_bbox, int(class_id))
-    sync_fn()  # ensure GPU CAM work finished before CPU metrics (accurate wall time)
-    ih, iw = img_wh
-    meta = dict(letterbox_meta)
-    meta["original_width"] = iw
-    meta["original_height"] = ih
-    metrics = compute_cam_metrics(
-        cam_np,
-        bbox_xyxy,
-        (cam_np.shape[0], cam_np.shape[1]),
-        meta,
-        baseline_cam=None,
-    )
-    _concept_scores_from_metrics(metrics, normalizers)
+    row = dict(metric_row)
+    _concept_scores_from_metrics(row, normalizers)
     sync_fn()
     return time.perf_counter() - t0
 
@@ -332,6 +316,13 @@ def main():
             "bbox_distance": lambda x: 0.5,
             "spread": lambda x: 0.5,
             "ring_ratio": lambda x: 0.5,
+            "metric_rows": [
+                {
+                    "bbox_center_activation_distance": 0.0,
+                    "activation_spread": 0.0,
+                    "ring_energy_ratio": 0.5,
+                }
+            ],
         }
 
     rows_out: List[Dict] = []
@@ -393,20 +384,24 @@ def main():
         explainer.close()
         del explainer
 
-    # --- FastCAV (Grad-CAM + metrics + concepts) ---
+    # --- FastCAV (concept-score post-process only; CAM generation excluded) ---
     idx_cycle["i"] = 0
-    explainer_fc = _make_explainer(YOLOGradCAM, torch_model, layer_name, device_str)
+    metric_rows = fastcav_norm.get("metric_rows", [])
+    if not metric_rows:
+        metric_rows = [
+            {
+                "bbox_center_activation_distance": 0.0,
+                "activation_spread": 0.0,
+                "ring_energy_ratio": 0.5,
+            }
+        ]
+    fastcav_idx = {"i": 0}
 
     def run_fastcav():
-        img, yb, cid, bbox_xyxy = next_sample()
-        h, w = img.shape[0], img.shape[1]
+        j = fastcav_idx["i"] % len(metric_rows)
+        fastcav_idx["i"] += 1
         return measure_fastcav_pipeline(
-            explainer_fc,
-            img,
-            yb,
-            cid,
-            bbox_xyxy,
-            (w, h),
+            metric_rows[j],
             fastcav_norm,
             sync_fn=_cuda_sync,
         )
@@ -426,7 +421,6 @@ def main():
             "within_deadline_pct": m_within,
         }
     )
-    explainer_fc.close()
 
     out_dir = root / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -441,7 +435,8 @@ def main():
         "warmup_iterations": int(args.warmup),
         "latency_note": (
             "End-to-end wall time per iteration for the listed pipeline (batch=1, one bbox): "
-            "detector = letterbox+forward only; XAI = full generate_cam (and FastCAV adds metrics+concepts). "
+            "detector = letterbox+forward only; Grad-CAM/Grad-CAM++/LayerCAM = full generate_cam; "
+            "FastCAV = concept-score post-process only (CAM generation excluded). "
             "Interpret as time until explanation signal is available for that path."
         ),
         "methods": rows_out,

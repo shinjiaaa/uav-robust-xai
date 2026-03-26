@@ -888,7 +888,15 @@ def main():
                         if save_overlays and cam is not None and letterbox_meta is not None:
                             heatmap_dir = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples'))
                             safe_uid = str(object_uid).replace('/', '_').replace('\\', '_')[:80]
-                            overlay_path = heatmap_dir / model_name / corruption / f"L{severity}" / f"{image_id}_{safe_uid}.png"
+                            # Per XAI method so gradcam / fastcam(layercam++) / layercam do not overwrite each other
+                            overlay_path = (
+                                heatmap_dir
+                                / str(xai_method)
+                                / model_name
+                                / corruption
+                                / f"L{severity}"
+                                / f"{image_id}_{safe_uid}.png"
+                            )
                             save_cam_overlay(cam, image, letterbox_meta, overlay_path)
                 
                 # Clean up CAM for this layer

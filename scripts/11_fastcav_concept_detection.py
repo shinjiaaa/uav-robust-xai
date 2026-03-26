@@ -46,13 +46,17 @@ FastCAV: 계산할 개념(Concept) 점수와 concept change severity 정의
 
 import sys
 from pathlib import Path
+import argparse
 import pandas as pd
 import numpy as np
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Grad-CAM과 동일 임계값으로 비교 (report.md 산출 시 0.15 사용)
 CHANGE_THRESHOLD = 0.15
+DEFAULT_VIS_CONF_THRESHOLD = 0.30
+DEFAULT_TINY_AREA_RATIO_THRESHOLD = 0.01
 
 def load_cam_records():
     """Load and filter CAM records."""
@@ -74,6 +78,105 @@ def load_cam_records():
     if 'severity' in df.columns:
         df['severity'] = pd.to_numeric(df['severity'], errors='coerce').fillna(-1).astype(int)
     
+    return df
+
+
+def _safe_rel_path(root: Path, rel: str) -> Path:
+    p = root / str(rel)
+    if p.exists():
+        return p
+    alt = root / "datasets" / str(rel)
+    return alt
+
+
+def _bbox_area_ratio(row, root: Path, area_cache: dict, tiny_ratio_thr: float) -> tuple:
+    """Return (bbox_area_ratio, tiny_rule_hit). Falls back to is_tiny when image area unknown."""
+    gt_area = row.get('gt_area', np.nan)
+    if pd.isna(gt_area):
+        x1, y1 = row.get('gt_x1', np.nan), row.get('gt_y1', np.nan)
+        x2, y2 = row.get('gt_x2', np.nan), row.get('gt_y2', np.nan)
+        if pd.notna(x1) and pd.notna(y1) and pd.notna(x2) and pd.notna(y2):
+            gt_area = max(0.0, float(x2) - float(x1)) * max(0.0, float(y2) - float(y1))
+        else:
+            gt_area = np.nan
+
+    img_rel = row.get('corrupted_image_path') if pd.notna(row.get('corrupted_image_path')) else row.get('image_path')
+    image_area = np.nan
+    if pd.notna(img_rel):
+        key = str(img_rel)
+        if key in area_cache:
+            image_area = area_cache[key]
+        else:
+            p = _safe_rel_path(root, key)
+            if p.exists():
+                try:
+                    with Image.open(p) as im:
+                        w, h = im.size
+                    image_area = float(max(1, w * h))
+                except Exception:
+                    image_area = np.nan
+            area_cache[key] = image_area
+
+    if pd.notna(gt_area) and pd.notna(image_area) and image_area > 0:
+        ratio = float(gt_area) / float(image_area)
+        return ratio, bool(ratio <= tiny_ratio_thr)
+
+    is_tiny = row.get('is_tiny', np.nan)
+    if pd.notna(is_tiny):
+        return np.nan, bool(int(is_tiny) == 1)
+    return np.nan, False
+
+
+def load_detection_records(tiny_ratio_thr: float, vis_conf_thr: float):
+    """Load detection_records and derive tiny-object recognition concepts."""
+    root = Path('.')
+    p = root / 'results' / 'detection_records.csv'
+    if not p.exists() or p.stat().st_size == 0:
+        return None
+    df = pd.read_csv(p)
+    needed = ['corruption', 'severity', 'image_id', 'object_uid', 'matched']
+    if not all(c in df.columns for c in needed):
+        return None
+
+    df = df.copy()
+    df['severity'] = pd.to_numeric(df['severity'], errors='coerce').fillna(-1).astype(int)
+    df['pred_score'] = pd.to_numeric(df.get('pred_score', np.nan), errors='coerce')
+    df['matched'] = pd.to_numeric(df['matched'], errors='coerce').fillna(0).astype(int)
+    area_cache = {}
+
+    ratios = []
+    tiny_hits = []
+    for _, row in df.iterrows():
+        ratio, hit = _bbox_area_ratio(row, root, area_cache, tiny_ratio_thr)
+        ratios.append(ratio)
+        tiny_hits.append(hit)
+    df['bbox_area_ratio'] = ratios
+    df['is_tiny_by_ratio'] = tiny_hits
+    df = df[df['is_tiny_by_ratio'] == True].copy()
+
+    # tiny_object_presence: 1 for tiny-object samples in this filtered table.
+    df['concept_tiny_object_presence'] = 1.0
+
+    # tiny_object_visibility: matched + confidence-aware recognition signal.
+    # Conservative default: if miss then 0; if matched then normalized by confidence threshold.
+    conf = df['pred_score'].fillna(0.0)
+    vis = np.where(
+        df['matched'] == 1,
+        np.clip((conf - vis_conf_thr) / max(1e-6, 1.0 - vis_conf_thr), 0.0, 1.0),
+        0.0,
+    )
+    df['concept_tiny_object_visibility'] = vis.astype(float)
+
+    # tiny_object_separability (first pass proxy):
+    # separability is high when matched and IoU is high with decent confidence.
+    iou = pd.to_numeric(df.get('match_iou', np.nan), errors='coerce').fillna(0.0)
+    sep = np.where(
+        df['matched'] == 1,
+        np.clip(0.5 * conf + 0.5 * iou, 0.0, 1.0),
+        0.0,
+    )
+    df['concept_tiny_object_separability'] = sep.astype(float)
+    df['miss_flag'] = (df['matched'] == 0).astype(int)
     return df
 
 def normalize_metric(series, clip_zero=False):
@@ -149,6 +252,12 @@ def compute_concept_score(row, concept_name, normalizers):
     return np.nan
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--change-threshold", type=float, default=CHANGE_THRESHOLD)
+    parser.add_argument("--visibility-conf-threshold", type=float, default=DEFAULT_VIS_CONF_THRESHOLD)
+    parser.add_argument("--tiny-area-ratio-threshold", type=float, default=DEFAULT_TINY_AREA_RATIO_THRESHOLD)
+    args = parser.parse_args()
+
     print("=" * 70)
     print("FastCAV Concept Detection & Change Analysis")
     print("=" * 70)
@@ -168,7 +277,7 @@ def main():
         'ring_ratio': normalize_metric(cam_df['ring_energy_ratio'].dropna()),
     }
     
-    # 1. Compute concept scores for all records
+    # 1) 기존 환경 개념 점수 (cam_records 기반) - backward compatibility 유지
     concepts = ['Focused', 'Diffused', 'Background', 'Collapse']
     
     for concept in concepts:
@@ -188,7 +297,7 @@ def main():
     cam_df[cols_to_save].to_csv(concept_scores_path, index=False)
     print(f"\nSaved concept scores: {concept_scores_path}")
     
-    # 2. Compute concept change severity per object-event
+    # 2) 기존 환경 개념 변화 시점 (object-event)
     # Group by (corruption, object_id) to track severity progression
     group_cols = ['corruption', 'object_id']
     
@@ -221,7 +330,7 @@ def main():
                 
                 delta = abs(sev_score - baseline_score) / max(abs(baseline_score), 1e-6)
                 
-                if delta >= CHANGE_THRESHOLD:  # Same as exp_A Grad-CAM gradual threshold
+                if delta >= float(args.change_threshold):  # configurable threshold
                     concept_change_sev = sev
                     concept_change_type = 'collapse' if delta >= 1.0 else 'gradual'
                     break  # First change severity
@@ -240,9 +349,9 @@ def main():
     changes_df.to_csv(changes_path, index=False)
     print(f"Saved concept changes: {changes_path}")
     
-    # 3. Summary statistics
+    # 3) 기존 요약
     print("\n" + "=" * 70)
-    print(f"Summary: Concept Change Detection (threshold delta={CHANGE_THRESHOLD})")
+    print(f"Summary: Concept Change Detection (threshold delta={float(args.change_threshold):.3f})")
     print("=" * 70)
     
     for concept in concepts:
@@ -265,8 +374,171 @@ def main():
             avg_change_sev = change_data['concept_change_severity'].mean()
             print(f"  Mean change severity: {avg_change_sev:.2f}")
     
+    # 4) Tiny-object recognition-level concept pipeline (new)
+    det_df = load_detection_records(
+        tiny_ratio_thr=float(args.tiny_area_ratio_threshold),
+        vis_conf_thr=float(args.visibility_conf_threshold),
+    )
+    if det_df is None or len(det_df) == 0:
+        print("\n[WARN] detection_records.csv 기반 tiny-object concept 데이터가 없어 신규 파이프라인은 건너뜀.")
+    else:
+        tiny_cols = [
+            'corruption', 'severity', 'image_id', 'object_uid',
+            'concept_tiny_object_presence', 'concept_tiny_object_visibility', 'concept_tiny_object_separability',
+            'matched', 'pred_score', 'miss_flag', 'bbox_area_ratio'
+        ]
+        tiny_scores_path = results_dir / 'fastcav_tiny_concept_scores.csv'
+        det_df[tiny_cols].to_csv(tiny_scores_path, index=False)
+        print(f"Saved tiny-object concept scores: {tiny_scores_path}")
+
+        # severity summary by corruption
+        gb = det_df.groupby(['corruption', 'severity'], dropna=False)
+        tiny_summary = gb.agg(
+            n_samples=('object_uid', 'count'),
+            mean_tiny_object_presence=('concept_tiny_object_presence', 'mean'),
+            mean_tiny_object_visibility=('concept_tiny_object_visibility', 'mean'),
+            mean_tiny_object_separability=('concept_tiny_object_separability', 'mean'),
+            mean_confidence=('pred_score', 'mean'),
+            miss_rate=('miss_flag', 'mean'),
+        ).reset_index()
+        tiny_summary_path = results_dir / 'fastcav_tiny_severity_summary.csv'
+        tiny_summary.to_csv(tiny_summary_path, index=False)
+        print(f"Saved tiny severity summary: {tiny_summary_path}")
+
+        # change onset by object for required primary concept: tiny_object_visibility
+        changes = []
+        for (corr, obj), g in det_df.groupby(['corruption', 'object_uid'], dropna=False):
+            g = g.sort_values('severity')
+            if 0 not in set(g['severity'].tolist()):
+                continue
+            b = g[g['severity'] == 0]['concept_tiny_object_visibility'].dropna().mean()
+            if pd.isna(b):
+                continue
+            onset = None
+            onset_type = None
+            for sev in sorted(set(g['severity'].tolist())):
+                if int(sev) == 0:
+                    continue
+                sv = g[g['severity'] == sev]['concept_tiny_object_visibility'].dropna().mean()
+                if pd.isna(sv):
+                    continue
+                delta = abs(float(sv) - float(b)) / max(abs(float(b)), 1e-6)
+                if delta >= float(args.change_threshold):
+                    onset = int(sev)
+                    onset_type = 'collapse' if delta >= 1.0 else 'gradual'
+                    break
+            changes.append({
+                'corruption': corr,
+                'object_id': obj,
+                'image_id': g.iloc[0].get('image_id'),
+                'class_id': g.iloc[0].get('gt_class_id') if 'gt_class_id' in g.columns else g.iloc[0].get('class_id'),
+                'concept': 'tiny_object_visibility',
+                'baseline_score': float(b),
+                'concept_change_severity': onset,
+                'concept_change_type': onset_type,
+                'change_threshold': float(args.change_threshold),
+            })
+        tiny_changes_df = pd.DataFrame(changes)
+        tiny_changes_path = results_dir / 'fastcav_tiny_concept_changes.csv'
+        tiny_changes_df.to_csv(tiny_changes_path, index=False)
+        print(f"Saved tiny concept changes: {tiny_changes_path}")
+
+        # Bridge analysis: concept vs detection conf/miss correlation by corruption
+        bridge_rows = []
+        for corr, g in det_df.groupby('corruption', dropna=False):
+            vis = pd.to_numeric(g['concept_tiny_object_visibility'], errors='coerce')
+            conf = pd.to_numeric(g['pred_score'], errors='coerce')
+            miss = pd.to_numeric(g['miss_flag'], errors='coerce')
+            c1 = vis.corr(conf) if vis.notna().sum() > 1 and conf.notna().sum() > 1 else np.nan
+            c2 = vis.corr(miss) if vis.notna().sum() > 1 and miss.notna().sum() > 1 else np.nan
+            bridge_rows.append({
+                'corruption': corr,
+                'corr_visibility_confidence': c1,
+                'corr_visibility_miss_flag': c2,
+                'n_samples': int(len(g)),
+            })
+        bridge_df = pd.DataFrame(bridge_rows)
+        bridge_path = results_dir / 'fastcav_tiny_bridge_analysis.csv'
+        bridge_df.to_csv(bridge_path, index=False)
+        print(f"Saved tiny bridge analysis: {bridge_path}")
+
+        # Early-warning alignment: tiny visibility onset vs performance start severity
+        fpath = results_dir / 'failure_events.csv'
+        if fpath.exists() and fpath.stat().st_size > 0:
+            fe = pd.read_csv(fpath)
+            fe = fe.copy()
+            if 'object_uid' not in fe.columns and 'image_id' in fe.columns and 'class_id' in fe.columns:
+                fe['object_uid'] = fe['image_id'].astype(str) + '_obj_' + fe['class_id'].astype(str)
+
+            def _start_sev(r):
+                for col in ['start_severity', 'first_miss_severity', 'score_drop_severity', 'iou_drop_severity', 'failure_severity']:
+                    v = r.get(col)
+                    if pd.notna(v):
+                        return int(v)
+                return None
+
+            rows = []
+            for _, r in fe.iterrows():
+                corr = r.get('corruption')
+                oid = r.get('object_uid')
+                img_id = r.get('image_id')
+                cls_id = r.get('class_id')
+                start = _start_sev(r)
+                if start is None:
+                    continue
+                sub = tiny_changes_df[(tiny_changes_df['corruption'] == corr) & (tiny_changes_df['object_id'] == oid)]
+                if len(sub) == 0 and pd.notna(img_id) and pd.notna(cls_id):
+                    sub = tiny_changes_df[
+                        (tiny_changes_df['corruption'] == corr)
+                        & (tiny_changes_df['image_id'].astype(str) == str(img_id))
+                        & (pd.to_numeric(tiny_changes_df['class_id'], errors='coerce') == float(cls_id))
+                    ]
+                if len(sub) == 0 or pd.isna(sub.iloc[0]['concept_change_severity']):
+                    rows.append({'corruption': corr, 'object_id': oid, 'performance_start_severity': start,
+                                 'concept_change_severity': np.nan, 'alignment': 'unavailable', 'lead_steps': np.nan})
+                    continue
+                ch = int(sub.iloc[0]['concept_change_severity'])
+                lead = int(start) - ch
+                align = 'lead' if lead > 0 else ('coincident' if lead == 0 else 'lag')
+                rows.append({'corruption': corr, 'object_id': oid, 'performance_start_severity': start,
+                             'concept_change_severity': ch, 'alignment': align, 'lead_steps': lead})
+            ew_df = pd.DataFrame(rows)
+            ew_path = results_dir / 'fastcav_tiny_early_warning_summary.csv'
+            ew_df.to_csv(ew_path, index=False)
+            print(f"Saved tiny early-warning rows: {ew_path}")
+
+            # corruption-wise summary
+            summary_rows = []
+            for corr, g in ew_df.groupby('corruption', dropna=False):
+                total = len(g)
+                if total == 0:
+                    continue
+                lead_pct = 100.0 * float((g['alignment'] == 'lead').sum()) / total
+                coinc_pct = 100.0 * float((g['alignment'] == 'coincident').sum()) / total
+                lag_pct = 100.0 * float((g['alignment'] == 'lag').sum()) / total
+                unavail_pct = 100.0 * float((g['alignment'] == 'unavailable').sum()) / total
+                ls = pd.to_numeric(g.loc[g['alignment'] == 'lead', 'lead_steps'], errors='coerce').dropna()
+                mean_lead = float(ls.mean()) if len(ls) else np.nan
+                # mean onset over available rows
+                av = pd.to_numeric(g['concept_change_severity'], errors='coerce').dropna()
+                mean_onset = float(av.mean()) if len(av) else np.nan
+                summary_rows.append({
+                    'corruption': corr,
+                    'mean_visibility_onset_severity': mean_onset,
+                    'lead_pct': lead_pct,
+                    'coincident_pct': coinc_pct,
+                    'lag_pct': lag_pct,
+                    'unavailable_pct': unavail_pct,
+                    'mean_lead_steps': mean_lead,
+                    'n_total': int(total),
+                })
+            ew_corr_df = pd.DataFrame(summary_rows)
+            ew_corr_path = results_dir / 'fastcav_tiny_corruption_summary.csv'
+            ew_corr_df.to_csv(ew_corr_path, index=False)
+            print(f"Saved tiny early-warning corruption summary: {ew_corr_path}")
+
     print("\n" + "=" * 70)
-    print("Next: Run exp_A_early_warning_comparison.py to compare Grad-CAM vs FastCAV")
+    print("Next: Run exp_A_early_warning_comparison.py and exp_A_threshold_trend_validation.py")
     print("=" * 70)
 
 if __name__ == "__main__":

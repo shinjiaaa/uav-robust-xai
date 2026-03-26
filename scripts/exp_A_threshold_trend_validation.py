@@ -293,6 +293,52 @@ def compute_severity_progression_summary(
     return out
 
 
+def compute_severity_progression_by_corruption(
+    det_df: pd.DataFrame,
+    results_root: Path,
+) -> pd.DataFrame:
+    """
+    corruption x severity별 성능 변화 지표를 재계산해 CSV로 저장.
+
+    - avg_score: 해당 (corruption, severity)의 mean(pred_score or score)
+    - score_drop_rate: matched==1 행만 mean(is_score_drop)
+    - score_drop_rate_all_records: 전체 행 mean(is_score_drop) (감사용)
+    """
+    score_col = 'pred_score' if 'pred_score' in det_df.columns else 'score'
+    rows_out = []
+    corruptions = sorted(str(c) for c in det_df['corruption'].dropna().unique())
+    sevs = sorted(int(s) for s in det_df['severity'].dropna().unique())
+
+    for corruption in corruptions:
+        cdf = det_df[det_df['corruption'] == corruption]
+        for sev in sevs:
+            sub = cdf[cdf['severity'] == sev]
+            matched_sub = sub[sub['matched'] == 1] if 'matched' in sub.columns else sub.iloc[0:0]
+            avg_score = float(sub[score_col].mean()) if score_col in sub.columns and len(sub) else float('nan')
+            sdr_matched = (
+                float(matched_sub['is_score_drop'].mean())
+                if len(matched_sub) > 0 and 'is_score_drop' in matched_sub.columns
+                else 0.0
+            )
+            sdr_all = (
+                float(sub['is_score_drop'].mean()) if 'is_score_drop' in sub.columns and len(sub) else 0.0
+            )
+            rows_out.append({
+                'corruption': corruption,
+                'severity': sev,
+                'avg_score': avg_score,
+                'score_drop_rate': sdr_matched,
+                'score_drop_rate_all_records': sdr_all,
+                'n_records': int(len(sub)),
+            })
+
+    out = pd.DataFrame(rows_out)
+    out_path = results_root / 'severity_progression_by_corruption.csv'
+    out.to_csv(out_path, index=False)
+    print(f"[OK] Wrote {out_path} (corruption x severity avg_score / score_drop_rate)")
+    return out
+
+
 def build_gradcam_fastcav_report_section(results_root: Path) -> list:
     """
     exp_A_early_warning_comparison.py 산출물 기반 보조 비교(정의가 본문과 다름).
@@ -468,6 +514,90 @@ def build_runtime_performance_section(results_root: Path) -> list:
     return lines
 
 
+def build_tiny_object_concept_section(results_root: Path) -> list:
+    """tiny-object recognition-level concept outputs from 11_fastcav_concept_detection.py."""
+    lines = ['', '## Tiny-object concept pipeline (recognition-level)']
+    lines.append(
+        '*Cause-level concepts (fog/lowlight/motion_blur) and recognition-level concepts are 분리 해석합니다. '
+        '아래 표는 **tiny_object_visibility** 중심으로, corruption 증가에 따라 모델 내부 tiny-object evidence가 '
+        '언제 붕괴되는지(성능 시작 severity 대비 lead/coincident/lag)만 비교합니다.*'
+    )
+
+    tiny_sum = results_root / 'fastcav_tiny_severity_summary.csv'
+    tiny_ew = results_root / 'fastcav_tiny_early_warning_summary.csv'
+    tiny_corr = results_root / 'fastcav_tiny_corruption_summary.csv'
+    tiny_bridge = results_root / 'fastcav_tiny_bridge_analysis.csv'
+    if not tiny_sum.exists() or tiny_sum.stat().st_size == 0:
+        lines.append(
+            '*tiny-object concept 결과 없음. `python scripts/11_fastcav_concept_detection.py` 실행 후 본 리포트를 재생성하세요.*'
+        )
+        return lines
+
+    try:
+        sdf = pd.read_csv(tiny_sum)
+    except Exception:
+        lines.append('*tiny-object severity summary 로드 실패.*')
+        return lines
+
+    lines.append('')
+    lines.append('### Mean tiny_object_visibility by corruption × severity')
+    lines.append('| Corruption | Severity | Mean tiny_object_visibility | Mean confidence | Miss rate |')
+    lines.append('|------------|----------|-----------------------------|-----------------|-----------|')
+    for _, r in sdf.sort_values(['corruption', 'severity']).iterrows():
+        lines.append(
+            '| {} | {} | {:.3f} | {:.3f} | {:.3f} |'.format(
+                str(r.get('corruption')),
+                int(r.get('severity')),
+                float(r.get('mean_tiny_object_visibility', np.nan)),
+                float(r.get('mean_confidence', np.nan)),
+                float(r.get('miss_rate', np.nan)),
+            )
+        )
+
+    if tiny_corr.exists() and tiny_corr.stat().st_size > 0:
+        cdf = pd.read_csv(tiny_corr)
+        lines.append('')
+        lines.append('### Early warning timing (tiny_object_visibility onset vs performance start)')
+        lines.append('| Corruption | Mean onset severity | Lead % | Coincident % | Lag % | Unavailable % | Mean lead steps |')
+        lines.append('|------------|----------------------|--------|--------------|-------|---------------|-----------------|')
+        for _, r in cdf.sort_values('corruption').iterrows():
+            onset = r.get('mean_visibility_onset_severity', np.nan)
+            onset_s = '{:.2f}'.format(float(onset)) if pd.notna(onset) else 'N/A'
+            mls = r.get('mean_lead_steps', np.nan)
+            mls_s = '{:.2f}'.format(float(mls)) if pd.notna(mls) else 'N/A'
+            lines.append(
+                '| {} | {} | {:.1f}% | {:.1f}% | {:.1f}% | {:.1f}% | {} |'.format(
+                    str(r.get('corruption')),
+                    onset_s,
+                    float(r.get('lead_pct', 0.0)),
+                    float(r.get('coincident_pct', 0.0)),
+                    float(r.get('lag_pct', 0.0)),
+                    float(r.get('unavailable_pct', 0.0)),
+                    mls_s,
+                )
+            )
+
+    if tiny_bridge.exists() and tiny_bridge.stat().st_size > 0:
+        bdf = pd.read_csv(tiny_bridge)
+        lines.append('')
+        lines.append('### Bridge analysis: visibility vs detection')
+        lines.append('| Corruption | Corr(visibility, confidence) | Corr(visibility, miss_flag) | N |')
+        lines.append('|------------|-------------------------------|-----------------------------|---|')
+        for _, r in bdf.sort_values('corruption').iterrows():
+            c1 = r.get('corr_visibility_confidence', np.nan)
+            c2 = r.get('corr_visibility_miss_flag', np.nan)
+            c1s = '{:.3f}'.format(float(c1)) if pd.notna(c1) else 'N/A'
+            c2s = '{:.3f}'.format(float(c2)) if pd.notna(c2) else 'N/A'
+            lines.append('| {} | {} | {} | {} |'.format(str(r.get('corruption')), c1s, c2s, int(r.get('n_samples', 0))))
+
+    lines.append('')
+    lines.append(
+        '*출력 파일: `fastcav_tiny_concept_scores.csv`, `fastcav_tiny_severity_summary.csv`, '
+        '`fastcav_tiny_early_warning_summary.csv`, `fastcav_tiny_corruption_summary.csv`, `fastcav_tiny_bridge_analysis.csv`.*'
+    )
+    return lines
+
+
 def main():
     failure_events, cam_records = load_data()
 
@@ -600,6 +730,7 @@ def main():
     det_df = pd.read_csv(det_path) if det_path.exists() and det_path.stat().st_size > 0 else None
     cam_df = pd.read_csv(cam_path) if cam_path.exists() and cam_path.stat().st_size > 0 else None
     summary_df = None
+    summary_by_corr_df = None
     if det_df is not None and len(det_df) > 0:
         cam_for_summary = cam_df if cam_df is not None else pd.DataFrame()
         if len(cam_for_summary) > 0 and 'xai_method' in cam_for_summary.columns:
@@ -607,10 +738,11 @@ def main():
             if not _sxm.isna().all():
                 cam_for_summary = filter_cam_primary_xai(cam_for_summary, lead_src_label)
         summary_df = compute_severity_progression_summary(det_df, cam_for_summary, results_root)
+        summary_by_corr_df = compute_severity_progression_by_corruption(det_df, results_root)
 
     # Sev4 performance / CAM availability per corruption (dynamic if CSVs exist)
     corruptions = ['fog', 'lowlight', 'motion_blur']
-    sev4_perf_cam = {}
+    sev4_perf_cam_by_xai = {lbl: {} for lbl in xai_labels}
     for c in corruptions:
         score_drop = 0.0
         if det_df is not None and len(det_df) > 0:
@@ -622,18 +754,19 @@ def main():
                 score_drop = float(d4['is_score_drop'].mean())
             elif len(d4) > 0 and 'is_miss' in d4.columns:
                 score_drop = float(d4['is_miss'].mean())
-        cam_ratio = 0.0
-        if cam_df is not None and len(cam_df) > 0 and 'severity' in cam_df.columns:
-            cam_f = filter_cam_primary_xai(cam_df, lead_src_label)
-            c4 = cam_f[(cam_f['corruption'] == c) & (cam_f['severity'] == 4)]
-            if 'cam_status' in c4.columns:
-                c4 = c4[c4['cam_status'] == 'ok']
-            cam_ratio = (
-                float(len(c4)) / EXPECTED_UNIQUE_IMAGES_PER_CORRUPTION
-                if EXPECTED_UNIQUE_IMAGES_PER_CORRUPTION > 0
-                else 0.0
-            )
-        sev4_perf_cam[c] = (cam_ratio, score_drop)
+        for lbl in xai_labels:
+            cam_ratio = 0.0
+            if cam_df is not None and len(cam_df) > 0 and 'severity' in cam_df.columns:
+                cam_f = filter_cam_primary_xai(cam_df, lbl)
+                c4 = cam_f[(cam_f['corruption'] == c) & (cam_f['severity'] == 4)]
+                if 'cam_status' in c4.columns:
+                    c4 = c4[c4['cam_status'] == 'ok']
+                cam_ratio = (
+                    float(len(c4)) / EXPECTED_UNIQUE_IMAGES_PER_CORRUPTION
+                    if EXPECTED_UNIQUE_IMAGES_PER_CORRUPTION > 0
+                    else 0.0
+                )
+            sev4_perf_cam_by_xai[lbl][c] = (cam_ratio, score_drop)
 
     trend_row = next((r for r in rows if r['Change Type'] == 'trend'), None)
     primary_key = ('threshold', DEFAULT_THRESHOLD)
@@ -781,27 +914,46 @@ def main():
     report_lines.append('')
     report_lines.append('## Core comparison table')
     report_lines.append(
-        '*Cam Valid Ratio (sev4)·Lead: **{}** (`xai_method` 버킷, primary·ok). '
-        '분자 = 해당 버킷 cam_records 행 수; 분모 = corruption당 고유 image 슬롯 수 {}. '
-        'Score Drop Rate (sev4): **matched==1** detection 행만 `mean(is_score_drop)`.*'.format(
-            xai_method_display_name(lead_src_label),
-            EXPECTED_UNIQUE_IMAGES_PER_CORRUPTION,
+        '*Corruption별 Lead/CAM 가용성은 `xai_method`별로 분리 집계합니다. '
+        'Cam Valid Ratio (sev4) 분자 = 해당 버킷(primary·ok) cam_records 행 수; '
+        '분모 = corruption당 고유 image 슬롯 수 {}. '
+        'Score Drop Rate (sev4) = **matched==1** detection 행 `mean(is_score_drop)` (모델 성능 기준이라 XAI 방법과 무관).*'.format(
+            EXPECTED_UNIQUE_IMAGES_PER_CORRUPTION
         )
     )
-    report_lines.append(
-        '| Corruption | Lead % | Avg Lead Steps | Cam Valid Ratio (sev4) | Score Drop Rate (sev4) |'
-    )
-    report_lines.append('|------------|--------|----------------|------------------------|------------------------|')
-    for c in corruptions:
-        pc = _summarize_per_corruption(primary_stats, c)
-        cam_v, sd = sev4_perf_cam.get(c, (0.0, 0.0))
-        if pc is None or pc['n_total'] == 0:
-            report_lines.append('| {} | N/A | N/A | {:.3f} | {:.3f} |'.format(c, cam_v, sd))
-            continue
-        lp = pc['Lead Ratio (%)']
-        ms = pc['Mean Lead Step']
-        ms_str = f'{ms:.2f}' if ms is not None and not np.isnan(ms) else 'N/A'
-        report_lines.append('| {} | {:.1f}% | {} | {:.3f} | {:.3f} |'.format(c, lp, ms_str, cam_v, sd))
+    if multi_xai_compare:
+        report_lines.append(
+            '| XAI method | Corruption | Lead % | Avg Lead Steps | Cam Valid Ratio (sev4) | Score Drop Rate (sev4) |'
+        )
+        report_lines.append('|------------|------------|--------|----------------|------------------------|------------------------|')
+        for lbl in xai_labels:
+            x_stats = stats_by_xai[lbl][primary_key]
+            dn = xai_method_display_name(lbl)
+            for c in corruptions:
+                pc = _summarize_per_corruption(x_stats, c)
+                cam_v, sd = sev4_perf_cam_by_xai.get(lbl, {}).get(c, (0.0, 0.0))
+                if pc is None or pc['n_total'] == 0:
+                    report_lines.append('| {} | {} | N/A | N/A | {:.3f} | {:.3f} |'.format(dn, c, cam_v, sd))
+                    continue
+                lp = pc['Lead Ratio (%)']
+                ms = pc['Mean Lead Step']
+                ms_str = f'{ms:.2f}' if ms is not None and not np.isnan(ms) else 'N/A'
+                report_lines.append('| {} | {} | {:.1f}% | {} | {:.3f} | {:.3f} |'.format(dn, c, lp, ms_str, cam_v, sd))
+    else:
+        report_lines.append(
+            '| Corruption | Lead % | Avg Lead Steps | Cam Valid Ratio (sev4) | Score Drop Rate (sev4) |'
+        )
+        report_lines.append('|------------|--------|----------------|------------------------|------------------------|')
+        for c in corruptions:
+            pc = _summarize_per_corruption(primary_stats, c)
+            cam_v, sd = sev4_perf_cam_by_xai.get(lead_src_label, {}).get(c, (0.0, 0.0))
+            if pc is None or pc['n_total'] == 0:
+                report_lines.append('| {} | N/A | N/A | {:.3f} | {:.3f} |'.format(c, cam_v, sd))
+                continue
+            lp = pc['Lead Ratio (%)']
+            ms = pc['Mean Lead Step']
+            ms_str = f'{ms:.2f}' if ms is not None and not np.isnan(ms) else 'N/A'
+            report_lines.append('| {} | {:.1f}% | {} | {:.3f} | {:.3f} |'.format(c, lp, ms_str, cam_v, sd))
     report_lines.append('')
     report_lines.append('## Severity progression summary')
     report_lines.append(
@@ -842,6 +994,28 @@ def main():
     else:
         report_lines.append('  - CAM 유효성은 severity 증가에 따라 cam_valid_ratio가 하락')
     report_lines.append('  - Core 표의 Lead % / Avg Lead Steps는 **delta={:.2f}** 기준, corruption별 failure 이벤트 집계.'.format(DEFAULT_THRESHOLD))
+    report_lines.append('')
+    report_lines.append('## Severity progression by corruption (0-4)')
+    report_lines.append(
+        '*각 변조 유형별 severity 0-4에서 Avg Score / Score Drop Rate를 분리 집계. '
+        'Score Drop Rate는 **matched==1** 기준(`score_drop_rate_all_records`는 CSV 참고).*'
+    )
+    report_lines.append('| Corruption | Severity | Avg Score | Score Drop Rate |')
+    report_lines.append('|------------|----------|-----------|-----------------|')
+    if summary_by_corr_df is not None and len(summary_by_corr_df) > 0:
+        s = summary_by_corr_df.sort_values(['corruption', 'severity'])
+        for _, r in s.iterrows():
+            report_lines.append(
+                '| {} | {} | {:.3f} | {:.3f} |'.format(
+                    str(r['corruption']),
+                    int(r['severity']),
+                    float(r['avg_score']),
+                    float(r['score_drop_rate']),
+                )
+            )
+    else:
+        report_lines.append('| N/A | N/A | N/A | N/A |')
+    report_lines.extend(build_tiny_object_concept_section(results_root))
     report_lines.extend(build_gradcam_fastcav_report_section(results_root))
     report_lines.append('')
     report_lines.append('## Recommendation')

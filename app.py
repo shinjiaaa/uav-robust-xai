@@ -5,20 +5,23 @@ Run: python app.py
 Open: http://127.0.0.1:5000
 """
 
+import io
 from pathlib import Path
 import sys
+from urllib.parse import quote
 
 # Project root
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 try:
-    from flask import Flask, send_from_directory, jsonify, request, render_template_string
+    from flask import Flask, send_from_directory, send_file, jsonify, request, render_template_string
 except ImportError:
     print("Install Flask: pip install flask")
     sys.exit(1)
 
 from src.utils.io import load_yaml
+from src.utils import fastcav_app_helpers as fc_app
 
 app = Flask(__name__)
 
@@ -409,6 +412,81 @@ def api_metrics():
     return jsonify(get_metrics())
 
 
+@app.route("/fastcav")
+def fastcav_page():
+    """FastCAV concept scores on detection boxes (no heatmaps)."""
+    fc_app.load_fastcav_tables(ROOT)
+    if not fc_app.fastcav_available(ROOT):
+        return render_template_string(FASTCAV_UNAVAILABLE_HTML), 503
+    return render_template_string(FASTCAV_HTML)
+
+
+@app.route("/api/fastcav/status")
+def api_fastcav_status():
+    fc_app.load_fastcav_tables(ROOT)
+    return jsonify(ok=fc_app.fastcav_available(ROOT))
+
+
+@app.route("/api/fastcav/models")
+def api_fastcav_models():
+    fc_app.load_fastcav_tables(ROOT)
+    return jsonify(models=fc_app.list_models(ROOT))
+
+
+@app.route("/api/fastcav/models/<path:model>/corruptions")
+def api_fastcav_corruptions(model):
+    fc_app.load_fastcav_tables(ROOT)
+    return jsonify(corruptions=fc_app.list_corruptions(ROOT, model))
+
+
+@app.route("/api/fastcav/models/<path:model>/<path:corruption>/samples")
+def api_fastcav_samples(model, corruption):
+    fc_app.load_fastcav_tables(ROOT)
+    return jsonify(samples=fc_app.list_samples_intersection(ROOT, model, corruption))
+
+
+@app.route("/api/fastcav/models/<path:model>/<path:corruption>/sample/<path:image_id>")
+def api_fastcav_sample_severities(model, corruption, image_id):
+    fc_app.load_fastcav_tables(ROOT)
+    result = []
+    for sev in range(5):
+        q = (
+            f"model={quote(str(model), safe='')}"
+            f"&corruption={quote(str(corruption), safe='')}"
+            f"&severity={sev}"
+            f"&image_id={quote(str(image_id), safe='')}"
+        )
+        result.append({"severity": f"L{sev}", "url": f"/fastcav/render?{q}"})
+    return jsonify(severities=result)
+
+
+@app.route("/fastcav/render")
+def fastcav_render():
+    """PNG: bbox + class / conf / concept (on-the-fly from CSV + corrupted image)."""
+    model = request.args.get("model", "").strip()
+    corruption = request.args.get("corruption", "").strip()
+    image_id = request.args.get("image_id", "").strip()
+    if not model or not corruption or not image_id:
+        return "Bad request", 400
+    try:
+        severity = int(request.args.get("severity", "0"))
+    except ValueError:
+        return "Bad severity", 400
+    if severity < 0 or severity > 4:
+        return "Bad severity", 400
+    try:
+        thr = float(request.args.get("threshold", "0.3"))
+    except ValueError:
+        thr = 0.3
+    fc_app.load_fastcav_tables(ROOT)
+    data = fc_app.render_fastcav_png_bytes(
+        ROOT, model, corruption, severity, image_id, threshold=thr
+    )
+    if data is None:
+        return "Not found", 404
+    return send_file(io.BytesIO(data), mimetype="image/png")
+
+
 @app.route("/heatmaps/<path:filepath>")
 def serve_heatmap(filepath):
     """Serve a single image from heatmap_samples."""
@@ -422,6 +500,198 @@ def serve_heatmap(filepath):
         return "Not found", 404
     return send_from_directory(path.parent, path.name)
 
+
+FASTCAV_UNAVAILABLE_HTML = """<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><title>FastCAV</title>
+<style>body{font-family:system-ui;background:#0f1419;color:#e6edf3;padding:24px;}
+a{color:#00d4aa;}</style></head><body>
+<h1>FastCAV bbox 뷰어</h1>
+<p>데이터가 없습니다. <code>results/detection_records.csv</code>와
+<code>results/fastcav_tiny_concept_scores.csv</code> (또는 <code>fastcav_concept_scores.csv</code>)를 생성한 뒤 다시 시도하세요.</p>
+<p><a href="/">Heatmap Viewer로</a></p>
+</body></html>"""
+
+FASTCAV_HTML = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FastCAV · bbox 시각화</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --accent: #00d4aa;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --border: rgba(139,148,158,0.25);
+    }
+    * { box-sizing: border-box; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; line-height: 1.5; min-height: 100vh; }
+    .header { padding: 16px 24px; background: var(--card); border-bottom: 1px solid var(--border); }
+    .header h1 { font-size: 1.35rem; margin: 0 0 4px 0; color: var(--accent); }
+    .header .subtitle { color: var(--muted); font-size: 0.85rem; margin: 0; }
+    .header a { color: var(--accent); }
+    .layout { display: flex; padding: 0 24px 24px; gap: 20px; min-height: 60vh; }
+    .sidebar { width: 300px; flex-shrink: 0; background: var(--card); border-radius: 12px; border: 1px solid var(--border); display: flex; flex-direction: column; max-height: 75vh; }
+    .filters-inline { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+    .filters-inline label { color: var(--muted); font-size: 0.8rem; margin-right: 6px; }
+    .filters-inline select, .filters-inline input[type="number"] {
+      background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 0.9rem; min-width: 100px;
+    }
+    .sidebar-head { padding: 12px 14px; border-bottom: 1px solid var(--border); font-size: 0.85rem; color: var(--muted); }
+    .sample-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .sample-item { padding: 10px 12px; margin-bottom: 4px; border-radius: 8px; font-size: 0.75rem; cursor: pointer; word-break: break-all; color: var(--text); background: transparent; border: 1px solid transparent; width: 100%; text-align: left; }
+    .sample-item:hover { background: rgba(0,212,170,0.1); border-color: var(--border); }
+    .sample-item.active { background: rgba(0,212,170,0.2); border-color: var(--accent); color: var(--accent); }
+    .main { flex: 1; min-width: 0; background: var(--card); border-radius: 12px; border: 1px solid var(--border); padding: 20px; }
+    .sample-title { font-size: 0.85rem; color: var(--muted); margin-bottom: 16px; word-break: break-all; }
+    .severity-row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+    .severity-cell { flex: 1 1 140px; max-width: 240px; background: var(--bg); border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+    .severity-cell .sev-label { padding: 8px 10px; font-size: 0.75rem; font-weight: 600; color: var(--accent); border-bottom: 1px solid var(--border); }
+    .severity-cell img { width: 100%; height: auto; display: block; cursor: pointer; }
+    .empty-main { color: var(--muted); text-align: center; padding: 48px 24px; }
+    .hint { font-size: 0.8rem; color: var(--muted); margin-top: 12px; }
+    .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 100; align-items: center; justify-content: center; padding: 24px; }
+    .modal.show { display: flex; }
+    .modal img { max-width: 100%; max-height: 90vh; border-radius: 8px; }
+    .modal .close { position: absolute; top: 16px; right: 24px; color: #fff; font-size: 28px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>FastCAV · bbox 시각화</h1>
+    <p class="subtitle">개념 점수는 박스·텍스트로만 표시 (히트맵 없음). L0~L4 동일 <code>image_id</code> 비교.
+      <a href="/">Heatmap Viewer</a></p>
+  </div>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="filters-inline">
+        <div><label>모델</label><select id="model"><option value="">선택</option></select></div>
+        <div><label>Corruption</label><select id="corruption" disabled><option value="">선택</option></select></div>
+        <div><label>임계값</label><input type="number" id="threshold" value="0.3" step="0.05" min="0" max="1" title="가시성 등: 이 값 미만이면 붉은 쪽"></div>
+      </div>
+      <div class="sidebar-head">샘플 (L0~L4 모두 있는 image_id만)</div>
+      <div id="sampleList" class="sample-list"></div>
+    </aside>
+    <main class="main">
+      <div id="sampleTitle" class="sample-title" style="display:none;"></div>
+      <div id="severityRow" class="severity-row"></div>
+      <div id="emptyMain" class="empty-main">모델·Corruption을 선택한 뒤 샘플을 고르세요.</div>
+      <p class="hint">이미지는 <code>detection_records</code>의 경로에서 읽습니다. 임계값을 바꾼 뒤에는 샘플을 다시 클릭하면 반영됩니다.</p>
+    </main>
+  </div>
+  <div id="modal" class="modal">
+    <span class="close" onclick="document.getElementById('modal').classList.remove('show')">&times;</span>
+    <img id="modalImg" src="" alt="">
+  </div>
+  <script>
+    const modelEl = document.getElementById('model');
+    const corruptionEl = document.getElementById('corruption');
+    const thresholdEl = document.getElementById('threshold');
+    const sampleListEl = document.getElementById('sampleList');
+    const sampleTitleEl = document.getElementById('sampleTitle');
+    const severityRowEl = document.getElementById('severityRow');
+    const emptyMainEl = document.getElementById('emptyMain');
+    const modal = document.getElementById('modal');
+    const modalImg = document.getElementById('modalImg');
+
+    function thrParam() {
+      const t = parseFloat(thresholdEl.value);
+      return Number.isFinite(t) ? t : 0.3;
+    }
+
+    function withThreshold(url) {
+      const sep = url.indexOf('?') >= 0 ? '&' : '?';
+      return url + sep + 'threshold=' + encodeURIComponent(String(thrParam()));
+    }
+
+    fetch('/api/fastcav/models').then(r => r.json()).then(d => {
+      const list = d.models || [];
+      list.forEach(m => {
+        const o = document.createElement('option');
+        o.value = m; o.textContent = m;
+        modelEl.appendChild(o);
+      });
+      if (list.length === 1) { modelEl.value = list[0]; modelEl.dispatchEvent(new Event('change')); }
+    });
+
+    modelEl.addEventListener('change', () => {
+      corruptionEl.innerHTML = '<option value="">선택</option>';
+      corruptionEl.disabled = true;
+      sampleListEl.innerHTML = '';
+      severityRowEl.innerHTML = '';
+      emptyMainEl.style.display = 'block';
+      sampleTitleEl.style.display = 'none';
+      const m = modelEl.value;
+      if (!m) return;
+      fetch('/api/fastcav/models/' + encodeURIComponent(m) + '/corruptions').then(r => r.json()).then(d => {
+        (d.corruptions || []).forEach(c => {
+          const o = document.createElement('option');
+          o.value = c; o.textContent = c;
+          corruptionEl.appendChild(o);
+        });
+        corruptionEl.disabled = false;
+        if ((d.corruptions || []).length === 1) {
+          corruptionEl.value = d.corruptions[0];
+          corruptionEl.dispatchEvent(new Event('change'));
+        }
+      });
+    });
+
+    corruptionEl.addEventListener('change', () => {
+      sampleListEl.innerHTML = '';
+      severityRowEl.innerHTML = '';
+      emptyMainEl.style.display = 'block';
+      sampleTitleEl.style.display = 'none';
+      const m = modelEl.value, c = corruptionEl.value;
+      if (!m || !c) return;
+      fetch('/api/fastcav/models/' + encodeURIComponent(m) + '/' + encodeURIComponent(c) + '/samples')
+        .then(r => r.json()).then(d => {
+          sampleListEl.innerHTML = '';
+          const samples = d.samples || [];
+          samples.forEach(id => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'sample-item';
+            btn.textContent = id;
+            btn.dataset.sample = id;
+            btn.onclick = () => selectSample(m, c, id);
+            sampleListEl.appendChild(btn);
+          });
+          if (samples.length === 0)
+            sampleListEl.innerHTML = '<span style="color:var(--muted);font-size:0.85rem;">조건을 만족하는 샘플 없음</span>';
+        });
+    });
+
+    function selectSample(model, corruption, imageId) {
+      document.querySelectorAll('.sample-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.sample === imageId);
+      });
+      sampleTitleEl.textContent = imageId;
+      sampleTitleEl.style.display = 'block';
+      emptyMainEl.style.display = 'none';
+      severityRowEl.innerHTML = '';
+      fetch('/api/fastcav/models/' + encodeURIComponent(model) + '/' + encodeURIComponent(corruption) + '/sample/' + encodeURIComponent(imageId))
+        .then(r => r.json()).then(d => {
+          severityRowEl.innerHTML = '';
+          (d.severities || []).forEach(({ severity, url }) => {
+            const cell = document.createElement('div');
+            cell.className = 'severity-cell';
+            cell.innerHTML = '<div class="sev-label">' + severity + '</div>';
+            const img = document.createElement('img');
+            img.alt = severity;
+            img.loading = 'lazy';
+            img.src = withThreshold(url);
+            img.onclick = () => { modalImg.src = withThreshold(url); modal.classList.add('show'); };
+            cell.appendChild(img);
+            severityRowEl.appendChild(cell);
+          });
+        });
+    }
+  </script>
+</body>
+</html>"""
 
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="ko">
@@ -677,7 +947,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
   <div class="header">
     <h1>Heatmap Viewer</h1>
-    <p class="subtitle">XAI 방법(Grad-CAM / FastCAM) 선택 후 샘플별 변조 단계(L0~L4) 비교 · 지표·그래프</p>
+    <p class="subtitle">XAI 방법(Grad-CAM / FastCAM) 선택 후 샘플별 변조 단계(L0~L4) 비교 · 지표·그래프 · <a href="/fastcav" style="color:var(--accent);">FastCAV (bbox)</a></p>
   </div>
 
   <div id="metrics" class="metrics"></div>
@@ -1053,6 +1323,9 @@ def main():
         print("Run scripts/05_gradcam_failure_analysis.py first to generate heatmaps.")
     else:
         print(f"Heatmap root: {HEATMAP_DIR}")
+    fc_app.load_fastcav_tables(ROOT)
+    if fc_app.fastcav_available(ROOT):
+        print("FastCAV bbox viewer: http://127.0.0.1:5000/fastcav")
     print("Open http://127.0.0.1:5000")
     # host="127.0.0.1" = local only; use "0.0.0.0" to allow LAN access
     app.run(host="127.0.0.1", port=5000, debug=False)
