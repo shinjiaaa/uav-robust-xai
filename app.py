@@ -60,6 +60,18 @@ def get_xai_methods_from_config():
     return ["gradcam"]
 
 
+def xai_method_display_label(method: str) -> str:
+    """UI label; internal keys (paths, cam_records) stay gradcam / fastcam / layercam."""
+    m = (method or "").strip().lower()
+    if m in ("fastcam", "gradcampp"):
+        return "Grad-CAM++"
+    if m == "gradcam":
+        return "Grad-CAM"
+    if m == "layercam":
+        return "LayerCAM"
+    return str(method)
+
+
 def get_xai_methods():
     """XAI methods to show in UI: config list + existing heatmap subdirs (so FastCAM shows if in config)."""
     from_config = get_xai_methods_from_config()
@@ -112,15 +124,25 @@ def index():
             if p.is_dir() and not p.name.startswith("."):
                 existing.append(p.name)
     xai_methods = get_xai_methods()
+    xai_method_choices = [(m, xai_method_display_label(m)) for m in xai_methods]
     if existing and "gradcam" not in existing and "fastcam" not in existing:
         models = existing
-    return render_template_string(INDEX_HTML, models=models, heatmap_dir=str(HEATMAP_DIR), xai_methods=xai_methods)
+    return render_template_string(
+        INDEX_HTML,
+        models=models,
+        heatmap_dir=str(HEATMAP_DIR),
+        xai_method_choices=xai_method_choices,
+    )
 
 
 @app.route("/api/xai_methods")
 def api_xai_methods():
-    """List XAI method names from config + existing heatmap subdirs (so FastCAM shows if in config)."""
-    return jsonify(xai_methods=get_xai_methods())
+    """List XAI method ids + display labels (fastcam → Grad-CAM++ on the web UI)."""
+    methods = get_xai_methods()
+    return jsonify(
+        xai_methods=methods,
+        labels={m: xai_method_display_label(m) for m in methods},
+    )
 
 
 @app.route("/api/models")
@@ -947,7 +969,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
   <div class="header">
     <h1>Heatmap Viewer</h1>
-    <p class="subtitle">XAI 방법(Grad-CAM / FastCAM) 선택 후 샘플별 변조 단계(L0~L4) 비교 · 지표·그래프 · <a href="/fastcav" style="color:var(--accent);">FastCAV (bbox)</a></p>
+    <p class="subtitle">XAI 방법(Grad-CAM / Grad-CAM++) 선택 후 샘플별 변조 단계(L0~L4) 비교 · 지표·그래프 · <a href="/fastcav" style="color:var(--accent);">FastCAV (bbox)</a></p>
   </div>
 
   <div id="metrics" class="metrics"></div>
@@ -959,8 +981,8 @@ INDEX_HTML = """<!DOCTYPE html>
           <label>XAI 방법</label>
           <select id="xaiMethod">
             <option value="">선택</option>
-            {% for method in xai_methods %}
-            <option value="{{ method }}">{{ method }}</option>
+            {% for value, label in xai_method_choices %}
+            <option value="{{ value }}">{{ label }}</option>
             {% endfor %}
           </select>
         </div>
@@ -1144,7 +1166,7 @@ INDEX_HTML = """<!DOCTYPE html>
       try {
         const params = [];
         if (model) params.push('model=' + encodeURIComponent(model));
-        const q = qs().replace(/^\?/, '');
+        const q = qs().replace(/^\\?/, '');
         if (q) params.push(q);
         const url = '/api/aggregate/cam_metrics' + (params.length ? '?' + params.join('&') : '');
         const r = await fetch(url);
