@@ -13,7 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from src.user_study.pseudo_heatmap import generate_fastcav_pseudo_heatmap
 from src.utils.fastcav_bbox_viz import visualize_fastcav_bbox
+from src.utils.io import load_yaml
 
 # Cached DataFrames per process
 _DET_DF = None
@@ -259,6 +261,117 @@ def _bbox_from_detection(row: Any) -> Optional[Tuple[float, float, float, float]
             continue
         return (a, b, c, d)
     return None
+
+
+def get_fastcav_pseudo_gaussian_sigma(root: Path) -> float:
+    """Sobel prior blur for pseudo-heatmap; matches user_study.pseudo_heatmap in experiment.yaml."""
+    try:
+        cfg = load_yaml(root / "configs" / "experiment.yaml")
+        return float(cfg.get("user_study", {}).get("pseudo_heatmap", {}).get("gaussian_sigma", 4.0))
+    except Exception:
+        return 4.0
+
+
+def _frame_bgr_and_concepts_for_pseudo(
+    root: Path,
+    model_id: str,
+    corruption: str,
+    severity: int,
+    image_id: str,
+    object_uid: Optional[str] = None,
+) -> Optional[Tuple[Any, Dict[str, float]]]:
+    """
+    One corrupted frame (BGR) and concept dict for pseudo-heatmap (first object with concepts, or requested uid).
+    """
+    if not fastcav_available(root):
+        return None
+    det = _DET_DF
+    fc = _FC_DF
+    kind = _FC_KIND
+    mcol = _model_col(det)
+    sev = int(severity)
+    drows = det[
+        (det[mcol].astype(str) == str(model_id))
+        & (det["corruption"].astype(str) == str(corruption))
+        & (det["severity"].map(_severity_int) == sev)
+        & (det["image_id"].astype(str) == str(image_id))
+    ]
+    if len(drows) == 0:
+        return None
+
+    fsub = fc[fc["corruption"].astype(str) == str(corruption)].copy()
+    fsub["_sev"] = fsub["severity"].map(_severity_int)
+    fsub = fsub[fsub["_sev"] == sev]
+    if kind == "legacy" and "model" in fsub.columns:
+        fsub = fsub[fsub["model"].astype(str) == str(model_id)]
+
+    if kind == "tiny":
+        lut = _fc_lookup_tiny(fsub)
+        id_key = "object_uid"
+    else:
+        lut = _fc_lookup_legacy(fsub)
+        id_key = "object_id"
+
+    first_path = None
+    candidates: List[Tuple[Any, str, Dict[str, float]]] = []
+    for _, row in drows.iterrows():
+        if first_path is None:
+            first_path = _row_image_path(root, row)
+        oid = str(row.get(id_key, row.get("object_uid", row.get("object_id", ""))))
+        concepts = lut.get((str(image_id), sev, oid), {}) or {}
+        candidates.append((row, oid, concepts))
+
+    if first_path is None or not first_path.exists():
+        return None
+    chosen: Optional[Tuple[Any, str, Dict[str, float]]] = None
+    if object_uid is not None and str(object_uid).strip():
+        ou = str(object_uid).strip()
+        for row, oid, concepts in candidates:
+            if oid == ou:
+                chosen = (row, oid, concepts)
+                break
+    if chosen is None:
+        for row, oid, concepts in candidates:
+            if concepts:
+                chosen = (row, oid, concepts)
+                break
+    if chosen is None and candidates:
+        chosen = candidates[0]
+    if chosen is None:
+        return None
+    _, _, concepts = chosen
+
+    im_bgr = cv2.imread(str(first_path), cv2.IMREAD_COLOR)
+    if im_bgr is None:
+        return None
+    return (im_bgr, dict(concepts))
+
+
+def render_fastcav_pseudo_png_bytes(
+    root: Path,
+    model_id: str,
+    corruption: str,
+    severity: int,
+    image_id: str,
+    *,
+    object_uid: Optional[str] = None,
+    gaussian_sigma: Optional[float] = None,
+) -> Optional[bytes]:
+    """
+    FastCAV pseudo-heatmap overlay (Sobel prior × concept stress); NOT localization.
+    """
+    tup = _frame_bgr_and_concepts_for_pseudo(
+        root, model_id, corruption, severity, image_id, object_uid=object_uid
+    )
+    if tup is None:
+        return None
+    im_bgr, concepts = tup
+    sigma = float(gaussian_sigma) if gaussian_sigma is not None else get_fastcav_pseudo_gaussian_sigma(root)
+    ph = generate_fastcav_pseudo_heatmap(im_bgr, concepts, gaussian_sigma=sigma)
+    ok, buf = cv2.imencode(".png", ph["overlay_bgr"])
+    if not ok:
+        return None
+    return buf.tobytes()
 
 
 def render_fastcav_png_bytes(

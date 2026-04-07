@@ -259,12 +259,13 @@ def main():
         print(f"  Model on CPU (GPU not available)")
         print(f"  [WARN] CPU mode will use more RAM - ensure sufficient memory")
     
-    # Stage B: Initialize Grad-CAM (and FastCAM/Grad-CAM++) for multiple methods and layers
+    # Stage B: Initialize Grad-CAM / Grad-CAM++ / LayerCAM for multiple methods
     device_str = str(device) if 'device' in locals() else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    xai_methods = gradcam_config.get('xai_methods', ['gradcam'])  # e.g. gradcam, fastcam(gradcampp), layercam
+    raw_methods = gradcam_config.get('xai_methods', ['gradcam'])
+    # Legacy config key "fastcam" -> Grad-CAM++ folder id "gradcampp"
+    xai_methods = ["gradcampp" if str(m) == "fastcam" else str(m) for m in raw_methods]
     cam_class = {
         'gradcam': YOLOGradCAM,
-        'fastcam': YOLOGradCAMPP,   # legacy name = Grad-CAM++
         'gradcampp': YOLOGradCAMPP,
         'layercam': YOLOLayerCAM,
     }
@@ -679,7 +680,7 @@ def main():
                     (visdrone_bbox[0] + visdrone_bbox[2]) * img_width / orig_w,
                     (visdrone_bbox[1] + visdrone_bbox[3]) * img_height / orig_h,
                 )
-            # Extract CAMs per XAI method (Grad-CAM, FastCAM/Grad-CAM++) for 비교 분석
+            # Extract CAMs per XAI method (Grad-CAM, Grad-CAM++, LayerCAM) for 비교 분석
             for xai_method in xai_methods:
                 cam_results = extract_cam_multi_layer(
                     gradcam_instances[xai_method],
@@ -888,7 +889,7 @@ def main():
                         if save_overlays and cam is not None and letterbox_meta is not None:
                             heatmap_dir = Path(config['results'].get('heatmap_samples_dir', 'results/heatmap_samples'))
                             safe_uid = str(object_uid).replace('/', '_').replace('\\', '_')[:80]
-                            # Per XAI method so gradcam / fastcam(layercam++) / layercam do not overwrite each other
+                            # Per XAI method so gradcam / gradcampp / layercam do not overwrite each other
                             overlay_path = (
                                 heatmap_dir
                                 / str(xai_method)

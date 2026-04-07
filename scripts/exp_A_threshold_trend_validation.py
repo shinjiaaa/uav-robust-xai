@@ -133,6 +133,8 @@ def filter_cam_primary_xai(cam_df: pd.DataFrame, label: str) -> pd.DataFrame:
         return df
     if label == 'gradcam':
         return df[ser.isna() | (ser.astype(str) == 'gradcam')]
+    if label == 'gradcampp':
+        return df[ser.astype(str).isin(['gradcampp', 'fastcam'])]
     return df[ser.astype(str) == label]
 
 
@@ -1035,7 +1037,7 @@ def main():
     )
     report_lines.append(
         '- Grad-CAM++ / LayerCAM **선행성**: `configs/experiment.yaml`의 `gradcam.xai_methods`에 '
-        '`fastcam`(또는 `gradcampp`), `layercam` 포함 후 `python scripts/05_gradcam_failure_analysis.py` → 본 스크립트.'
+        '`gradcampp`, `layercam` 포함 후 `python scripts/05_gradcam_failure_analysis.py` → 본 스크립트. (레거시 CSV의 `fastcam` 행은 gradcampp와 동일 취급)'
     )
 
     report_path = results_root / 'report.md'

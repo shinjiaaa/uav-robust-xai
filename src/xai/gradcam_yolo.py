@@ -282,7 +282,7 @@ class YOLOGradCAM:
 class YOLOGradCAMPP(YOLOGradCAM):
     """
     Grad-CAM++ for YOLO: improved weighting (alpha) over spatial dimensions.
-    Same interface as YOLOGradCAM; use for FastCAM 비교 분석.
+    Same interface as YOLOGradCAM; Grad-CAM++ (gradcampp) 비교 분석용.
     """
 
     def _compute_cam(self, activations: torch.Tensor, gradients: torch.Tensor) -> torch.Tensor:

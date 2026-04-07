@@ -8,6 +8,7 @@ Open: http://127.0.0.1:5000
 import io
 from pathlib import Path
 import sys
+from typing import Optional
 from urllib.parse import quote
 
 # Project root
@@ -39,6 +40,19 @@ HEATMAP_DIR = get_heatmap_dir()
 RESULTS_DIR = ROOT / "results"
 
 
+def _canonical_xai_method(name: str) -> str:
+    """Legacy folder/config key ``fastcam`` → ``gradcampp`` (Grad-CAM++)."""
+    s = str(name).strip()
+    if s == "fastcam":
+        return "gradcampp"
+    return s
+
+
+def _is_fastcav_viewer(xai_method: Optional[str]) -> bool:
+    """Heatmap viewer: FastCAV pseudo-heatmap (no heatmap_samples folder)."""
+    return bool(xai_method) and str(xai_method).strip().lower() == "fastcav"
+
+
 def _print_results_path():
     """Print once at startup so you know which folder's results are being shown."""
     print(f"[app] Results dir (this folder's results): {RESULTS_DIR.resolve()}")
@@ -46,7 +60,7 @@ def _print_results_path():
 
 
 def get_xai_methods_from_config():
-    """Read gradcam.xai_methods from experiment.yaml so FastCAM etc. show even before folders exist."""
+    """Read gradcam.xai_methods from experiment.yaml (Grad-CAM / Grad-CAM++ / LayerCAM)."""
     config_path = ROOT / "configs" / "experiment.yaml"
     if not config_path.exists():
         return ["gradcam"]
@@ -54,32 +68,69 @@ def get_xai_methods_from_config():
         config = load_yaml(config_path)
         methods = config.get("gradcam", {}).get("xai_methods")
         if isinstance(methods, list) and methods:
-            return list(methods)
+            return [_canonical_xai_method(m) for m in methods]
     except Exception:
         pass
     return ["gradcam"]
 
 
 def get_xai_methods():
-    """XAI methods to show in UI: config list + existing heatmap subdirs (so FastCAM shows if in config)."""
+    """XAI method ids for UI/API: config + disk; legacy ``heatmap_samples/fastcam`` maps to ``gradcampp``."""
     from_config = get_xai_methods_from_config()
     existing = []
     if HEATMAP_DIR.exists():
         for p in sorted(HEATMAP_DIR.iterdir()):
             if p.is_dir() and not p.name.startswith("."):
-                existing.append(p.name)
+                existing.append(_canonical_xai_method(p.name))
     if not existing:
-        return from_config
-    if "gradcam" in existing or "fastcam" in existing:
-        return sorted(set(existing) | set(from_config))
-    return from_config
+        out = sorted(set(from_config))
+    elif "gradcam" in existing or "gradcampp" in existing:
+        out = sorted(set(existing) | set(from_config))
+    else:
+        out = sorted(set(from_config))
+    fc_app.load_fastcav_tables(ROOT)
+    if fc_app.fastcav_available(ROOT):
+        out = sorted(set(out) | {"fastcav"})
+    return out
 
 
 def get_heatmap_base(xai_method=None):
-    """Heatmap root for an XAI method. If xai_method is set and HEATMAP_DIR/xai_method exists, use it; else HEATMAP_DIR (legacy)."""
-    if xai_method and (HEATMAP_DIR / xai_method).exists() and (HEATMAP_DIR / xai_method).is_dir():
-        return HEATMAP_DIR / xai_method
-    return HEATMAP_DIR
+    """Directory HEATMAP_DIR/<method>/ for CAM PNGs. ``gradcampp`` falls back to legacy ``fastcam`` folder."""
+    if not xai_method:
+        return HEATMAP_DIR
+    xm = _canonical_xai_method(str(xai_method))
+    sub = Path(xm)
+    direct = HEATMAP_DIR / sub
+    if direct.exists() and direct.is_dir():
+        return direct
+    if xm == "gradcampp":
+        legacy = HEATMAP_DIR / "fastcam"
+        if legacy.exists() and legacy.is_dir():
+            return legacy
+    return HEATMAP_DIR / sub
+
+
+def _heatmap_url_prefix(xai_method: Optional[str]) -> str:
+    """Path segment under heatmap_samples for /heatmaps/... URLs (handles gradcampp → fastcam legacy)."""
+    if not xai_method:
+        return ""
+    base = get_heatmap_base(xai_method)
+    try:
+        rel = base.resolve().relative_to(HEATMAP_DIR.resolve())
+        return rel.as_posix() + "/"
+    except ValueError:
+        return f"{xai_method}/"
+
+
+def xai_method_ui_options():
+    """Dropdown labels: gradcampp → Grad-CAM++."""
+    labels = {
+        "gradcam": "Grad-CAM",
+        "gradcampp": "Grad-CAM++",
+        "layercam": "LayerCAM",
+        "fastcav": "FastCAV (pseudo heatmap)",
+    }
+    return [{"id": m, "label": labels.get(m, m)} for m in get_xai_methods()]
 
 
 def get_metrics():
@@ -111,22 +162,31 @@ def index():
         for p in sorted(HEATMAP_DIR.iterdir()):
             if p.is_dir() and not p.name.startswith("."):
                 existing.append(p.name)
-    xai_methods = get_xai_methods()
-    if existing and "gradcam" not in existing and "fastcam" not in existing:
+    if existing and "gradcam" not in existing and "gradcampp" not in existing:
         models = existing
-    return render_template_string(INDEX_HTML, models=models, heatmap_dir=str(HEATMAP_DIR), xai_methods=xai_methods)
+    return render_template_string(
+        INDEX_HTML,
+        models=models,
+        heatmap_dir=str(HEATMAP_DIR),
+        xai_methods=xai_method_ui_options(),
+    )
 
 
 @app.route("/api/xai_methods")
 def api_xai_methods():
-    """List XAI method names from config + existing heatmap subdirs (so FastCAM shows if in config)."""
+    """List XAI method ids (gradcam, gradcampp, layercam); legacy disk folder fastcam is reported as gradcampp."""
     return jsonify(xai_methods=get_xai_methods())
 
 
 @app.route("/api/models")
 def api_models():
-    """List model names. Optional query: xai_method (e.g. gradcam, fastcam)."""
+    """List model names. Optional query: xai_method (e.g. gradcam, gradcampp, fastcav)."""
     xai_method = request.args.get("xai_method", "").strip() or None
+    if _is_fastcav_viewer(xai_method):
+        fc_app.load_fastcav_tables(ROOT)
+        if not fc_app.fastcav_available(ROOT):
+            return jsonify(models=[])
+        return jsonify(models=fc_app.list_models(ROOT))
     base = get_heatmap_base(xai_method)
     models = []
     if base.exists():
@@ -140,6 +200,11 @@ def api_models():
 def api_corruptions(model):
     """List corruptions for a model. Optional query: xai_method. Tries HEATMAP_DIR/model if method subdir missing (legacy)."""
     xai_method = request.args.get("xai_method", "").strip() or None
+    if _is_fastcav_viewer(xai_method):
+        fc_app.load_fastcav_tables(ROOT)
+        if not fc_app.fastcav_available(ROOT):
+            return jsonify(corruptions=[]), 200
+        return jsonify(corruptions=fc_app.list_corruptions(ROOT, model))
     path = get_heatmap_base(xai_method) / model
     if not path.exists() or not path.is_dir():
         path = HEATMAP_DIR / model
@@ -187,6 +252,31 @@ def _load_ideal_trend_samples():
 def api_samples(model, corruption):
     """List sample IDs that have L0–L4 all present (intersection). ideal_only=1이면 이상적 추세만. Optional query: xai_method."""
     xai_method = request.args.get("xai_method", "").strip() or None
+    if _is_fastcav_viewer(xai_method):
+        fc_app.load_fastcav_tables(ROOT)
+        if not fc_app.fastcav_available(ROOT):
+            return jsonify(samples=[]), 404
+        samples = fc_app.list_samples_intersection(ROOT, model, corruption)
+        ideal_only = request.args.get("ideal_only", "").strip().lower() in ("1", "true", "yes")
+        if ideal_only:
+            ideal = _load_ideal_trend_samples()
+            if ideal and isinstance(ideal, dict):
+                ideal_list = ideal.get(str(model), {}).get(str(corruption))
+                if ideal_list:
+                    ideal_set = {str(x) for x in ideal_list}
+
+                    def _ideal_match(s: str) -> bool:
+                        s0 = str(s)
+                        base = s0.rsplit(".", 1)[0] if "." in s0 else s0
+                        return (
+                            s0 in ideal_set
+                            or base in ideal_set
+                            or (base + ".png") in ideal_set
+                            or (base + ".jpg") in ideal_set
+                        )
+
+                    samples = sorted(s for s in samples if _ideal_match(s))
+        return jsonify(samples=samples)
     base = get_heatmap_base(xai_method) / model / corruption
     if not base.exists() or not base.is_dir():
         return jsonify(samples=[]), 404
@@ -219,12 +309,34 @@ def api_samples(model, corruption):
 def api_sample_severities(model, corruption, sample_id):
     """For one sample (filename), return severities that have it and image URLs. Optional query: xai_method."""
     xai_method = request.args.get("xai_method", "").strip() or None
+    if _is_fastcav_viewer(xai_method):
+        fc_app.load_fastcav_tables(ROOT)
+        if not fc_app.fastcav_available(ROOT):
+            return jsonify(severities=[]), 404
+        image_id = str(sample_id)
+        if image_id.lower().endswith((".png", ".jpg", ".jpeg")):
+            image_id = image_id.rsplit(".", 1)[0]
+        result = []
+        for sev in range(5):
+            q = (
+                f"model={quote(str(model), safe='')}"
+                f"&corruption={quote(str(corruption), safe='')}"
+                f"&severity={sev}"
+                f"&image_id={quote(str(image_id), safe='')}"
+            )
+            result.append(
+                {
+                    "severity": f"L{sev}",
+                    "url": f"/fastcav/render_pseudo?{q}",
+                }
+            )
+        return jsonify(severities=result)
     base = get_heatmap_base(xai_method) / model / corruption
     if not base.exists() or not base.is_dir():
         return jsonify(severities=[]), 404
     if not (sample_id.endswith(".png") or sample_id.endswith(".jpg") or sample_id.endswith(".jpeg")):
         sample_id = sample_id + ".png"
-    prefix = f"{xai_method}/" if xai_method and (HEATMAP_DIR / xai_method).exists() else ""
+    prefix = _heatmap_url_prefix(xai_method) if xai_method else ""
     result = []
     for p in sorted(base.iterdir()):
         if p.is_dir() and p.name.startswith("L"):
@@ -262,13 +374,15 @@ CAM_METRIC_KEYS = [
 @app.route("/api/models/<model>/<corruption>/sample/<path:sample_id>/cam_metrics")
 def api_sample_cam_metrics(model, corruption, sample_id):
     """Return Grad-CAM metrics per severity (L0..L4) and change rate from L0 for one sample. Optional query: xai_method."""
+    xai_method = request.args.get("xai_method", "").strip() or None
+    if _is_fastcav_viewer(xai_method):
+        return jsonify(severities=[])
     sample_id_base = sample_id
     if sample_id_base.endswith(".png") or sample_id_base.endswith(".jpg") or sample_id_base.endswith(".jpeg"):
         sample_id_base = sample_id_base.rsplit(".", 1)[0]
     df = _load_cam_records_df()
     if df is None or len(df) == 0:
         return jsonify(severities=[])
-    xai_method = request.args.get("xai_method", "").strip() or None
     model_col = "model_id" if "model_id" in df.columns else "model"
     if model_col not in df.columns:
         return jsonify(severities=[])
@@ -278,9 +392,13 @@ def api_sample_cam_metrics(model, corruption, sample_id):
     ].copy()
     if "xai_method" in subset.columns:
         if xai_method:
-            subset = subset[subset["xai_method"].astype(str) == str(xai_method)]
+            xm = _canonical_xai_method(str(xai_method))
+            if xm == "gradcampp":
+                subset = subset[subset["xai_method"].astype(str).isin(["gradcampp", "fastcam"])]
+            else:
+                subset = subset[subset["xai_method"].astype(str) == str(xm)]
         else:
-            # 기본값: gradcam (fastcam이 먼저 있으면 0만 나오는 것 방지)
+            # 기본값: gradcam (gradcampp가 먼저 있으면 0만 나오는 것 방지)
             subset = subset[subset["xai_method"].astype(str) == "gradcam"]
     if "object_id" not in subset.columns:
         subset["_key"] = subset["image_id"].astype(str)
@@ -305,7 +423,7 @@ def api_sample_cam_metrics(model, corruption, sample_id):
         if len(rows) == 0:
             out.append({"severity": f"L{sev}", "metrics": None, "change_pct": None})
             continue
-        # 여러 행(예: gradcam+fastcam)이면 이미 xai_method로 필터됐으므로 첫 행 사용
+        # 여러 행(예: gradcam+gradcampp)이면 이미 xai_method로 필터됐으므로 첫 행 사용
         row = rows.iloc[0]
         metrics = {}
         for k in CAM_METRIC_KEYS:
@@ -349,11 +467,13 @@ AGGREGATE_METRIC_KEYS = [
 @app.route("/api/aggregate/cam_metrics")
 def api_aggregate_cam_metrics():
     """변조(corruption)별 전체 샘플 집계: L0~L4별 mean, std, n. Optional: model, xai_method."""
+    xai_method = request.args.get("xai_method", "").strip() or None
+    if _is_fastcav_viewer(xai_method):
+        return jsonify(corruptions=[])
     df = _load_cam_records_df()
     if df is None or len(df) == 0:
         return jsonify(corruptions=[])
     model = request.args.get("model", "").strip() or None
-    xai_method = request.args.get("xai_method", "").strip() or None
     model_col = "model_id" if "model_id" in df.columns else "model"
     if model_col not in df.columns:
         return jsonify(corruptions=[])
@@ -362,7 +482,11 @@ def api_aggregate_cam_metrics():
         subset = subset[subset[model_col].astype(str) == str(model)]
     if "xai_method" in subset.columns:
         if xai_method:
-            subset = subset[subset["xai_method"].astype(str) == str(xai_method)]
+            xm = _canonical_xai_method(str(xai_method))
+            if xm == "gradcampp":
+                subset = subset[subset["xai_method"].astype(str).isin(["gradcampp", "fastcam"])]
+            else:
+                subset = subset[subset["xai_method"].astype(str) == str(xm)]
         else:
             # gradcam만 있으면 gradcam, 없으면 전체 사용 (집계가 비지 않도록)
             subset_g = subset[subset["xai_method"].astype(str) == "gradcam"]
@@ -406,6 +530,55 @@ def api_aggregate_cam_metrics():
     return jsonify(corruptions=out_corruptions)
 
 
+@app.route("/api/user_study/llm_preview")
+def api_user_study_llm_preview():
+    """First user_study_bundles unit with explanation_*.txt (Grad-CAM / FastCAV LLM outputs)."""
+    bundle_root = RESULTS_DIR / "user_study_bundles"
+    if not bundle_root.is_dir():
+        return jsonify(
+            ok=False,
+            message="results/user_study_bundles 폴더가 없습니다. python scripts/12_user_study_export.py 를 실행하세요.",
+            gradcam=None,
+            fastcav=None,
+            unit_id=None,
+        )
+    max_chars = 12000
+    for unit_dir in sorted(bundle_root.iterdir()):
+        if not unit_dir.is_dir() or not unit_dir.name.startswith("unit_"):
+            continue
+        eg = unit_dir / "explanation_gradcam.txt"
+        ef = unit_dir / "explanation_fastcav.txt"
+        if not eg.exists() and not ef.exists():
+            continue
+        g_text = f_text = None
+        try:
+            if eg.exists():
+                g_text = eg.read_text(encoding="utf-8", errors="replace")
+                if len(g_text) > max_chars:
+                    g_text = g_text[:max_chars] + "\n… (truncated)"
+            if ef.exists():
+                f_text = ef.read_text(encoding="utf-8", errors="replace")
+                if len(f_text) > max_chars:
+                    f_text = f_text[:max_chars] + "\n… (truncated)"
+        except OSError:
+            continue
+        return jsonify(
+            ok=True,
+            message=None,
+            unit_id=unit_dir.name,
+            gradcam=g_text,
+            fastcav=f_text,
+        )
+    return jsonify(
+        ok=False,
+        message="explanation_gradcam.txt / explanation_fastcav.txt 가 없습니다. "
+        "OPENAI_API_KEY 설정 후 --skip-llm 없이 export 하세요.",
+        gradcam=None,
+        fastcav=None,
+        unit_id=None,
+    )
+
+
 @app.route("/api/metrics")
 def api_metrics():
     """Overall experiment metrics: lead_stats, dasc_summary."""
@@ -414,7 +587,7 @@ def api_metrics():
 
 @app.route("/fastcav")
 def fastcav_page():
-    """FastCAV concept scores on detection boxes (no heatmaps)."""
+    """FastCAV: bbox visualization + pseudo-heatmap overlay (same concepts)."""
     fc_app.load_fastcav_tables(ROOT)
     if not fc_app.fastcav_available(ROOT):
         return render_template_string(FASTCAV_UNAVAILABLE_HTML), 503
@@ -456,7 +629,13 @@ def api_fastcav_sample_severities(model, corruption, image_id):
             f"&severity={sev}"
             f"&image_id={quote(str(image_id), safe='')}"
         )
-        result.append({"severity": f"L{sev}", "url": f"/fastcav/render?{q}"})
+        result.append(
+            {
+                "severity": f"L{sev}",
+                "url": f"/fastcav/render?{q}",
+                "pseudo_url": f"/fastcav/render_pseudo?{q}",
+            }
+        )
     return jsonify(severities=result)
 
 
@@ -481,6 +660,43 @@ def fastcav_render():
     fc_app.load_fastcav_tables(ROOT)
     data = fc_app.render_fastcav_png_bytes(
         ROOT, model, corruption, severity, image_id, threshold=thr
+    )
+    if data is None:
+        return "Not found", 404
+    return send_file(io.BytesIO(data), mimetype="image/png")
+
+
+@app.route("/fastcav/render_pseudo")
+def fastcav_render_pseudo():
+    """PNG: FastCAV pseudo-heatmap overlay (Sobel prior × concept stress; not localization)."""
+    model = request.args.get("model", "").strip()
+    corruption = request.args.get("corruption", "").strip()
+    image_id = request.args.get("image_id", "").strip()
+    object_uid = request.args.get("object_uid", "").strip() or None
+    if not model or not corruption or not image_id:
+        return "Bad request", 400
+    try:
+        severity = int(request.args.get("severity", "0"))
+    except ValueError:
+        return "Bad severity", 400
+    if severity < 0 or severity > 4:
+        return "Bad severity", 400
+    gaussian_sigma = None
+    raw_sigma = request.args.get("sigma", "").strip()
+    if raw_sigma:
+        try:
+            gaussian_sigma = float(raw_sigma)
+        except ValueError:
+            return "Bad sigma", 400
+    fc_app.load_fastcav_tables(ROOT)
+    data = fc_app.render_fastcav_pseudo_png_bytes(
+        ROOT,
+        model,
+        corruption,
+        severity,
+        image_id,
+        object_uid=object_uid,
+        gaussian_sigma=gaussian_sigma,
     )
     if data is None:
         return "Not found", 404
@@ -516,7 +732,7 @@ FASTCAV_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FastCAV · bbox 시각화</title>
+  <title>FastCAV · bbox + pseudo heatmap</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -550,6 +766,8 @@ FASTCAV_HTML = """<!DOCTYPE html>
     .severity-cell { flex: 1 1 140px; max-width: 240px; background: var(--bg); border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
     .severity-cell .sev-label { padding: 8px 10px; font-size: 0.75rem; font-weight: 600; color: var(--accent); border-bottom: 1px solid var(--border); }
     .severity-cell img { width: 100%; height: auto; display: block; cursor: pointer; }
+    .dual-stack { display: flex; flex-direction: column; gap: 6px; padding: 6px; }
+    .mini-label { font-size: 0.65rem; color: var(--muted); font-weight: 600; }
     .empty-main { color: var(--muted); text-align: center; padding: 48px 24px; }
     .hint { font-size: 0.8rem; color: var(--muted); margin-top: 12px; }
     .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 100; align-items: center; justify-content: center; padding: 24px; }
@@ -560,8 +778,8 @@ FASTCAV_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <div class="header">
-    <h1>FastCAV · bbox 시각화</h1>
-    <p class="subtitle">개념 점수는 박스·텍스트로만 표시 (히트맵 없음). L0~L4 동일 <code>image_id</code> 비교.
+    <h1>FastCAV · bbox + pseudo heatmap</h1>
+    <p class="subtitle">위: 박스·개념 점수. 아래: pseudo-heatmap (고정 공간 prior × 개념 스트레스, localization 아님). L0~L4 동일 <code>image_id</code>.
       <a href="/">Heatmap Viewer</a></p>
   </div>
   <div class="layout">
@@ -675,16 +893,33 @@ FASTCAV_HTML = """<!DOCTYPE html>
       fetch('/api/fastcav/models/' + encodeURIComponent(model) + '/' + encodeURIComponent(corruption) + '/sample/' + encodeURIComponent(imageId))
         .then(r => r.json()).then(d => {
           severityRowEl.innerHTML = '';
-          (d.severities || []).forEach(({ severity, url }) => {
+          (d.severities || []).forEach(({ severity, url, pseudo_url }) => {
             const cell = document.createElement('div');
             cell.className = 'severity-cell';
             cell.innerHTML = '<div class="sev-label">' + severity + '</div>';
-            const img = document.createElement('img');
-            img.alt = severity;
-            img.loading = 'lazy';
-            img.src = withThreshold(url);
-            img.onclick = () => { modalImg.src = withThreshold(url); modal.classList.add('show'); };
-            cell.appendChild(img);
+            const stack = document.createElement('div');
+            stack.className = 'dual-stack';
+            const lb = document.createElement('div');
+            lb.className = 'mini-label';
+            lb.textContent = 'Bbox';
+            const imgB = document.createElement('img');
+            imgB.alt = severity + ' bbox';
+            imgB.loading = 'lazy';
+            imgB.src = withThreshold(url);
+            imgB.onclick = () => { modalImg.src = withThreshold(url); modal.classList.add('show'); };
+            const lp = document.createElement('div');
+            lp.className = 'mini-label';
+            lp.textContent = 'Pseudo heatmap';
+            const imgP = document.createElement('img');
+            imgP.alt = severity + ' pseudo';
+            imgP.loading = 'lazy';
+            imgP.src = pseudo_url || '';
+            imgP.onclick = () => { modalImg.src = pseudo_url || ''; modal.classList.add('show'); };
+            stack.appendChild(lb);
+            stack.appendChild(imgB);
+            stack.appendChild(lp);
+            stack.appendChild(imgP);
+            cell.appendChild(stack);
             severityRowEl.appendChild(cell);
           });
         });
@@ -942,12 +1177,47 @@ INDEX_HTML = """<!DOCTYPE html>
     .aggregate-corruption .agg-charts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 12px; }
     .aggregate-corruption .agg-chart-cell { height: 200px; background: var(--card); border-radius: 8px; border: 1px solid var(--border); padding: 10px; }
     .aggregate-corruption .agg-chart-cell .chart-title { font-size: 0.75rem; color: var(--accent); margin-bottom: 6px; }
+    hr.agg-sep {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 24px 0 16px 0;
+    }
+    .llm-preview-block { margin-top: 4px; }
+    .llm-preview-title { font-size: 0.95rem; color: var(--accent); margin: 0 0 8px 0; }
+    .llm-preview-cols {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 900px) {
+      .llm-preview-cols { grid-template-columns: 1fr; }
+    }
+    .llm-preview-col h4 {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin: 0 0 8px 0;
+      font-weight: 600;
+    }
+    pre.llm-pre {
+      margin: 0;
+      padding: 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.75rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 320px;
+      overflow-y: auto;
+      color: var(--text);
+    }
   </style>
 </head>
 <body>
   <div class="header">
     <h1>Heatmap Viewer</h1>
-    <p class="subtitle">XAI 방법(Grad-CAM / FastCAM) 선택 후 샘플별 변조 단계(L0~L4) 비교 · 지표·그래프 · <a href="/fastcav" style="color:var(--accent);">FastCAV (bbox)</a></p>
+    <p class="subtitle">XAI 방법에서 <strong>FastCAV (pseudo heatmap)</strong>을 고르면 동일 UI로 L0~L4 pseudo-heatmap을 봅니다. Grad-CAM / Grad-CAM++ / LayerCAM은 heatmap_samples 기준 · <a href="/fastcav" style="color:var(--accent);">전용 FastCAV 페이지</a>(bbox+pseudo)</p>
   </div>
 
   <div id="metrics" class="metrics"></div>
@@ -959,8 +1229,8 @@ INDEX_HTML = """<!DOCTYPE html>
           <label>XAI 방법</label>
           <select id="xaiMethod">
             <option value="">선택</option>
-            {% for method in xai_methods %}
-            <option value="{{ method }}">{{ method }}</option>
+            {% for m in xai_methods %}
+            <option value="{{ m.id }}">{{ m.label }}</option>
             {% endfor %}
           </select>
         </div>
@@ -988,7 +1258,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <main class="main">
       <div id="sampleTitle" class="sample-title" style="display:none;"></div>
       <div id="severityRow" class="severity-row"></div>
-      <div id="emptyMain" class="empty-main">모델을 선택하면 변조별 전체 통계가 표시됩니다. 샘플 선택 시 L0~L4 히트맵만 표시됩니다.</div>
+      <div id="emptyMain" class="empty-main">모델을 선택하면 변조별 전체 통계가 표시됩니다. 샘플 선택 시 L0~L4 시각화(Grad-CAM 계열 또는 FastCAV pseudo)가 표시됩니다.</div>
       <div id="loadingMain" class="loading" style="display:none;">로딩 중...</div>
 
       <div id="aggregateSection" class="aggregate-section">
@@ -1133,6 +1403,69 @@ INDEX_HTML = """<!DOCTYPE html>
 
     let aggregateChartInstances = [];
     const AGG_METRIC_KEYS = ['bbox_center_activation_distance', 'peak_bbox_distance', 'activation_spread', 'ring_energy_ratio'];
+
+    async function appendUserStudyLlmBlock(container) {
+      const prev = document.getElementById('userStudyLlmBlock');
+      if (prev) prev.remove();
+      const mount = document.createElement('div');
+      mount.id = 'userStudyLlmBlock';
+      const hr = document.createElement('hr');
+      hr.className = 'agg-sep';
+      mount.appendChild(hr);
+      const loading = document.createElement('p');
+      loading.className = 'llm-preview-loading';
+      loading.style.color = 'var(--muted)';
+      loading.style.fontSize = '0.85rem';
+      loading.textContent = 'LLM 해석 로딩 중…';
+      mount.appendChild(loading);
+      container.appendChild(mount);
+      try {
+        const r = await fetch('/api/user_study/llm_preview');
+        const d = await r.json();
+        loading.remove();
+        const block = document.createElement('div');
+        block.className = 'llm-preview-block';
+        const title = document.createElement('h3');
+        title.className = 'llm-preview-title';
+        title.textContent = 'LLM 해석 (user study export)';
+        block.appendChild(title);
+        const sub = document.createElement('p');
+        sub.style.color = 'var(--muted)';
+        sub.style.fontSize = '0.8rem';
+        sub.style.margin = '0 0 12px 0';
+        sub.textContent = (d.ok && d.unit_id)
+          ? '예시 유닛: ' + d.unit_id + ' — python scripts/12_user_study_export.py 로 생성'
+          : 'export 산출물이 없을 수 있습니다.';
+        block.appendChild(sub);
+        if (!d.ok || (!d.gradcam && !d.fastcav)) {
+          const p = document.createElement('p');
+          p.style.color = 'var(--muted)';
+          p.style.fontSize = '0.85rem';
+          p.textContent = d.message || 'LLM 설명 파일을 찾을 수 없습니다.';
+          block.appendChild(p);
+        } else {
+          const row = document.createElement('div');
+          row.className = 'llm-preview-cols';
+          [['Grad-CAM', d.gradcam], ['FastCAV', d.fastcav]].forEach(function(pair) {
+            const col = document.createElement('div');
+            col.className = 'llm-preview-col';
+            const h4 = document.createElement('h4');
+            h4.textContent = pair[0];
+            const pre = document.createElement('pre');
+            pre.className = 'llm-pre';
+            pre.textContent = pair[1] || '(비어 있음)';
+            col.appendChild(h4);
+            col.appendChild(pre);
+            row.appendChild(col);
+          });
+          block.appendChild(row);
+        }
+        mount.appendChild(block);
+      } catch (err) {
+        loading.textContent = 'LLM 해석 로드 실패';
+      }
+    }
+
     async function loadAggregateSection() {
       const aggSection = document.getElementById('aggregateSection');
       const aggContent = document.getElementById('aggregateContent');
@@ -1144,20 +1477,22 @@ INDEX_HTML = """<!DOCTYPE html>
       try {
         const params = [];
         if (model) params.push('model=' + encodeURIComponent(model));
-        const q = qs().replace(/^\?/, '');
+        const q = qs().replace(/^[?]/, '');
         if (q) params.push(q);
         const url = '/api/aggregate/cam_metrics' + (params.length ? '?' + params.join('&') : '');
         const r = await fetch(url);
         const data = r.ok ? await r.json() : { corruptions: [] };
         const corruptions = data.corruptions || [];
         if (corruptions.length === 0) {
-          aggContent.innerHTML = '<p style="color:var(--muted);">집계 데이터 없음 (cam_records.csv 확인)</p>';
+          const fc = xaiMethodEl && xaiMethodEl.value === 'fastcav';
+          aggContent.innerHTML = '<p style="color:var(--muted);">' + (fc ? 'FastCAV는 Grad-CAM 계열 지표(cam_records) 집계 대상이 아닙니다.' : '집계 데이터 없음 (cam_records.csv 확인)') + '</p>';
+          await appendUserStudyLlmBlock(aggContent);
           return;
         }
         aggContent.innerHTML = '';
         corruptions.forEach(function(cobj) {
           const corr = cobj.corruption;
-          const safeId = corr.replace(/\W/g, '_');
+          const safeId = corr.replace(/[^a-zA-Z0-9_]/g, '_');
           const bySev = cobj.by_severity || [];
           const card = document.createElement('div');
           card.className = 'aggregate-corruption';
@@ -1219,8 +1554,10 @@ INDEX_HTML = """<!DOCTYPE html>
             aggregateChartInstances.push(chart);
           });
         });
+        await appendUserStudyLlmBlock(aggContent);
       } catch (e) {
         aggContent.innerHTML = '<p style="color:var(--muted);">집계 로드 실패</p>';
+        await appendUserStudyLlmBlock(aggContent);
       }
     }
 
@@ -1325,7 +1662,7 @@ def main():
         print(f"Heatmap root: {HEATMAP_DIR}")
     fc_app.load_fastcav_tables(ROOT)
     if fc_app.fastcav_available(ROOT):
-        print("FastCAV bbox viewer: http://127.0.0.1:5000/fastcav")
+        print("FastCAV (bbox + pseudo heatmap): http://127.0.0.1:5000/fastcav")
     print("Open http://127.0.0.1:5000")
     # host="127.0.0.1" = local only; use "0.0.0.0" to allow LAN access
     app.run(host="127.0.0.1", port=5000, debug=False)

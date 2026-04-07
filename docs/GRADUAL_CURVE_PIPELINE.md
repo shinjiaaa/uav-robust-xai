@@ -82,7 +82,7 @@ Config: `configs/experiment.yaml` → `gradcam.layers.primary.name` = `model.8.c
 
 ### 5. Optional (already available)
 
-- **Grad-CAM++ (FastCAM)** in `configs/experiment.yaml`: `gradcam.xai_methods: ["gradcam", "fastcam"]` — broader activation, less extreme blob.
+- **Grad-CAM++** (`gradcampp`) in `configs/experiment.yaml`: `gradcam.xai_methods: ["gradcam", "gradcampp"]` — broader activation, less extreme blob.
 - **Multi-scale CAM** (e.g. primary + secondary layers and average) can be added later for further smoothing.
 
 ## Why E_bbox = 1.0 when bbox-only CAM is used

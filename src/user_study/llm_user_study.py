@@ -1,0 +1,342 @@
+"""Structured LLM prompts for user study (Grad-CAM vs FastCAV), strict I/O format."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Full instructions for the model (human evaluation; no hallucination).
+SYSTEM_PROMPT_STRICT = """You are generating structured explanations for a user study.
+
+IMPORTANT:
+
+* You must strictly follow the output format.
+* Do NOT add extra sentences.
+* Do NOT hallucinate or infer unseen information.
+* Only use the provided inputs.
+* If uncertain, explicitly say "uncertain".
+
+---
+
+## TASK
+
+Generate a structured explanation based on:
+
+* visualization summary (Grad-CAM or FastCAV pseudo-heatmap)
+* concept scores (if provided)
+* performance signals (confidence, miss trend, etc.)
+
+The explanation will be used for human evaluation.
+
+---
+
+## OUTPUT FORMAT (STRICT)
+
+You MUST follow this exact format:
+
+[Status] <one sentence describing what is happening>
+
+[Location] <describe where the main issue appears in the image>
+
+[Cause] <describe why the issue is happening based ONLY on given signals>
+
+[Risk] <describe what could go wrong>
+
+---
+
+## RULES
+
+1. DO NOT assume precise spatial localization for FastCAV
+   * Use cautious language like:
+     "around highlighted regions" or "central area"
+
+2. DO NOT invent causes not present in input
+
+3. Keep each field to ONE sentence
+
+4. Use simple and clear language
+
+5. No bullet points, no extra formatting in your output
+
+6. For Grad-CAM, do not claim finer detail than the visualization summary provides.
+
+---
+
+Respond only with the four labeled lines [Status] through [Risk], nothing else."""
+
+
+def build_strict_user_study_user_message(
+    *,
+    method: str,
+    visualization_summary: str,
+    concept_signals: Optional[str],
+    performance_signals: str,
+) -> str:
+    """
+    Variable part of the prompt: [Method], [Visualization Summary], [Concept Signals], [Performance Signals].
+    method must be exactly "Grad-CAM" or "FastCAV" for the study arms.
+    """
+    concept_block = (
+        concept_signals.strip()
+        if concept_signals and str(concept_signals).strip()
+        else "(none — not applicable or not provided)"
+    )
+    return (
+        f"[Method]\n{method}\n\n"
+        f"[Visualization Summary]\n{visualization_summary.strip()}\n\n"
+        f"[Concept Signals]\n{concept_block}\n\n"
+        f"[Performance Signals]\n{performance_signals.strip()}\n\n"
+        "Now generate the explanation for the input above."
+    )
+
+
+def format_performance_signals_block(
+    *,
+    confidence_trend: str,
+    miss_trend: str,
+    confidence_l0: Optional[float] = None,
+    confidence_current: Optional[float] = None,
+) -> str:
+    """One compact block; numbers only if provided (from data, not invented)."""
+    lines = [f"confidence trend: {confidence_trend}"]
+    if confidence_l0 is not None and confidence_current is not None:
+        lines.append(f"confidence values (severity 0 → current): {confidence_l0:.4f} → {confidence_current:.4f}")
+    lines.append(f"miss / detection-failure trend: {miss_trend}")
+    return "\n".join(lines)
+
+
+def _trend_numeric(v0: Optional[float], v1: Optional[float], *, eps: float = 1e-5) -> str:
+    if v0 is None or v1 is None:
+        return "uncertain"
+    try:
+        a, b = float(v0), float(v1)
+    except (TypeError, ValueError):
+        return "uncertain"
+    d = b - a
+    if abs(d) < eps * max(1.0, abs(a)):
+        return "stable"
+    return "increasing" if d > 0 else "decreasing"
+
+
+def _trend_miss(m0: Optional[bool], m1: Optional[bool]) -> str:
+    if m0 is None or m1 is None:
+        return "uncertain"
+    if m0 == m1:
+        return "stable"
+    if m1 and not m0:
+        return "increasing (miss or failure at current severity, not at severity 0)"
+    return "decreasing (failure at severity 0 resolved at current severity)"
+
+
+def format_concept_signals_with_trends(
+    concepts_current: Dict[str, float],
+    concepts_l0: Optional[Dict[str, float]],
+) -> str:
+    """Lines like: name: 0.05 (decreasing vs severity 0)."""
+    if not concepts_current:
+        return "(no concept scores in input)"
+    lines = []
+    keys = sorted(concepts_current.keys())
+    for k in keys:
+        v = concepts_current[k]
+        if concepts_l0 is None or k not in concepts_l0:
+            lines.append(f"{k}: {v:.4f} (trend vs severity 0: uncertain — no baseline)")
+            continue
+        tr = _trend_numeric(concepts_l0[k], v)
+        lines.append(f"{k}: {v:.4f} ({tr} vs severity 0)")
+    return "\n".join(lines)
+
+
+def narrate_gradcam_visualization_summary(
+    summary_current: Dict[str, Any],
+    summary_l0: Optional[Dict[str, Any]],
+    *,
+    severity: int = 0,
+) -> str:
+    """Single short paragraph from grid summaries only (no raw CAM)."""
+    peak = summary_current.get("peak_quadrant", "unknown")
+    conc = summary_current.get("concentration", "unknown")
+    t10 = summary_current.get("top10_mass_fraction", "n/a")
+    s1 = (
+        f"Overlay-based saliency emphasizes the {peak} area with {conc} concentration "
+        f"(top-10% mass fraction {t10})."
+    )
+    if int(severity) == 0:
+        return s1
+    if summary_l0 is None:
+        return s1 + " Change vs severity 0 overlay: uncertain (L0 overlay missing or unreadable)."
+    p0 = summary_l0.get("peak_quadrant", "unknown")
+    c0 = summary_l0.get("concentration", "unknown")
+    if p0 == peak and c0 == conc:
+        return s1 + " Compared to severity 0, the highlighted region pattern is unchanged."
+    return (
+        s1
+        + f" Compared to severity 0, emphasis shifted from {p0} ({c0} concentration) "
+        f"to {peak} ({conc} concentration)."
+    )
+
+
+def narrate_fastcav_visualization_summary(
+    summary_current: Dict[str, Any],
+    summary_l0: Optional[Dict[str, Any]],
+    stress_g: float,
+    stress_l0: Optional[float],
+    *,
+    severity: int = 0,
+) -> str:
+    """Explicit pseudo-heatmap disclaimer + optional change vs L0."""
+    peak = summary_current.get("peak_quadrant", "unknown")
+    conc = summary_current.get("concentration", "unknown")
+    t10 = summary_current.get("top10_mass_fraction", "n/a")
+    s1 = (
+        f"FastCAV pseudo-heatmap (not precise spatial localization) shows relative emphasis "
+        f"toward the {peak} area with {conc} concentration (top-10% mass fraction {t10}); "
+        f"global stress scalar g={float(stress_g):.4f}."
+    )
+    if int(severity) == 0:
+        return s1
+    if summary_l0 is None and stress_l0 is None:
+        return s1 + " Change vs severity 0: uncertain (no L0 pseudo baseline computed)."
+    parts = [s1]
+    if stress_l0 is not None:
+        tr = _trend_numeric(stress_l0, stress_g)
+        parts.append(f"Stress g vs severity 0: {float(stress_l0):.4f} → {float(stress_g):.4f} ({tr}).")
+    if summary_l0 is not None:
+        p0 = summary_l0.get("peak_quadrant", "unknown")
+        c0 = summary_l0.get("concentration", "unknown")
+        if p0 != peak or c0 != conc:
+            parts.append(
+                f"Pseudo spatial emphasis shifted vs severity 0 from {p0} ({c0}) to {peak} ({conc})."
+            )
+        else:
+            parts.append("Pseudo spatial emphasis pattern matches severity 0.")
+    return " ".join(parts)
+
+
+def generate_explanation_openai(
+    user_message: str,
+    *,
+    model: str = "gpt-4o-mini",
+    system_prompt: str = SYSTEM_PROMPT_STRICT,
+    temperature: float = 0.1,
+    client: Optional[OpenAI] = None,
+) -> str:
+    load_dotenv()
+    if client is None:
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def write_full_prompt_for_disk(system_prompt: str, user_message: str) -> str:
+    """Plain-text bundle for a unit folder (audit / reproducibility)."""
+    return (
+        "=== SYSTEM ===\n"
+        + system_prompt.strip()
+        + "\n\n=== USER ===\n"
+        + user_message.strip()
+        + "\n"
+    )
+
+
+# --- Legacy names (older exports / docs); thin wrappers ---
+
+def build_gradcam_method_block(heatmap_summary: Dict[str, object]) -> str:
+    return (
+        "Heatmap summary (class-discriminative saliency; approximate spatial cue):\n"
+        f"- peak_quadrant: {heatmap_summary.get('peak_quadrant', 'unknown')}\n"
+        f"- concentration: {heatmap_summary.get('concentration', 'unknown')}\n"
+        f"- top10_mass_fraction: {heatmap_summary.get('top10_mass_fraction', 'n/a')}\n"
+    )
+
+
+def build_fastcav_method_block(
+    concept_scores: Dict[str, float],
+    pseudo_summary: Dict[str, object],
+    stress_g: float,
+) -> str:
+    lines = [
+        "Concept scores (global, not pixel-level):",
+    ]
+    for k, v in sorted(concept_scores.items()):
+        if isinstance(v, (int, float)):
+            lines.append(f"- {k}: {float(v):.4f}")
+    lines.append(
+        "Pseudo-heatmap note: visualization = fixed spatial prior (image/Sobel) × global stress g; "
+        "NOT FastCAV localization."
+    )
+    lines.append(f"- stress_g (scalar applied to prior): {stress_g:.4f}")
+    lines.append(f"- pseudo_peak_quadrant: {pseudo_summary.get('peak_quadrant', 'unknown')}")
+    lines.append(f"- pseudo_concentration: {pseudo_summary.get('concentration', 'unknown')}")
+    return "\n".join(lines) + "\n"
+
+
+def build_explanation_prompt(
+    *,
+    method_label: str,
+    corruption: str,
+    severity: int,
+    pred_class: str,
+    pred_conf: float,
+    method_block: str,
+) -> str:
+    """Deprecated layout; prefer build_strict_user_study_user_message + SYSTEM_PROMPT_STRICT."""
+    return f"""Task: Explain the model behavior for ONE image.
+
+Inputs:
+- Corruption: {corruption}, Severity: {severity}
+- Detection (metadata only, no boxes): class={pred_class}, confidence={pred_conf:.4f}
+- Method: {method_label}
+
+Signals:
+{method_block}
+
+Output EXACTLY in this format (English):
+
+[Status]
+...
+
+[Location]
+...
+
+[Cause]
+...
+
+[Risk]
+...
+"""
+
+
+def write_evaluation_questionnaire(path: Path) -> None:
+    """Likert template for paper appendix / IRB packet."""
+    text = """User study — Likert (1=Strongly disagree … 5=Strongly agree)
+
+Spatial alignment
+Q1. The explanation’s described region matches where the visualization emphasizes activation.
+Q2. The explanation does not contradict what I see in the visualization.
+
+Interpretability
+Q3. The explanation is intuitive and easy to understand.
+Q4. The explanation uses clear language (not overly technical).
+
+Usefulness
+Q5. The explanation helps me understand why detection may be unreliable under this corruption.
+Q6. The explanation would help me decide whether to trust the detector in this situation.
+
+Manipulation check (FastCAV pseudo condition)
+Q7. I understand the second visualization is not claimed to show exact pixel-level causes of concept scores.
+
+(Optional) Open: What felt mismatched between text and image?
+"""
+    path.write_text(text, encoding="utf-8")

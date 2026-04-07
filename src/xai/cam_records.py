@@ -78,8 +78,8 @@ def create_cam_record(
     # RQ1: CAM target selection (for miss cases)
     cam_target_class_id: Optional[int] = None,  # Class ID used for CAM generation (may differ from GT class_id)
     cam_target_type: Optional[str] = None,  # "gt_class", "pred_class", "gt_class_miss"
-    # XAI method (Grad-CAM vs FastCAM/Grad-CAM++ 비교)
-    xai_method: Optional[str] = None  # "gradcam" | "fastcam" (default gradcam)
+    # XAI method (gradcam / gradcampp / layercam 비교)
+    xai_method: Optional[str] = None  # "gradcam" | "gradcampp" | "layercam" (레거시: fastcam = gradcampp)
 ) -> Dict:
     """Create a CAM record with standardized schema.
     

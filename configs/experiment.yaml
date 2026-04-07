@@ -154,8 +154,9 @@ collapse_detection:
 # cam_mode: full (all 0..4) | risk_window (onset-1..onset+1) | stratified (sample). Currently risk_events define window.
 gradcam:
   enabled: true
-  # XAI 방법 비교: gradcam | fastcam 또는 gradcampp(Grad-CAM++) | layercam — cam_records.xai_method·선행성 표에 반영
-  xai_methods: ["gradcam", "fastcam", "layercam"]
+  # XAI 방법 비교: gradcam | gradcampp(Grad-CAM++) | layercam — cam_records.xai_method·heatmap_samples 서브폴더명과 일치
+  # NOTE: gradcampp = Grad-CAM++ (YOLOGradCAMPP). NOT FastCAV. 레거시 폴더명 fastcam 은 앱에서 gradcampp 로 매핑됨.
+  xai_methods: ["gradcam", "gradcampp", "layercam"]
   # CAM 생성: 전체 이미지(full-image) 권장. bbox는 지표 계산용(측정 창)으로만 사용.
   # use_bbox_roi: true → bbox crop에만 CAM 씌우면 attention 이동/leakage를 못 봄, E_bbox≈1·distance 왜곡.
   use_bbox_roi: false
@@ -210,6 +211,15 @@ results:
   heatmap_samples_dir: "results/heatmap_samples"
   raw_cam_dir: "results/raw_cam"  # Full-image CAM .npy + _full.png (when gradcam.save_raw_cam: true)
   
+# User study export (scripts/12_user_study_export.py): FastCAV pseudo-heatmap overlay + LLM prompts; no model change
+user_study:
+  pseudo_heatmap:
+    gaussian_sigma: 4.0  # Sobel prior blur (pixels scale)
+  # Which heatmap_samples subfolder to copy as gradcam_overlay.png (gradcam | gradcampp | layercam)
+  gradcam_overlay_method: "gradcam"
+  llm:
+    model: "gpt-4o-mini"
+
 # LLM report
 llm_report:
   model: "gpt-4o-mini"
