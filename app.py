@@ -74,6 +74,18 @@ def get_xai_methods_from_config():
     return ["gradcam"]
 
 
+def xai_method_display_label(method: str) -> str:
+    """UI label; internal keys (paths, cam_records) stay gradcam / fastcam / layercam."""
+    m = (method or "").strip().lower()
+    if m in ("fastcam", "gradcampp"):
+        return "Grad-CAM++"
+    if m == "gradcam":
+        return "Grad-CAM"
+    if m == "layercam":
+        return "LayerCAM"
+    return str(method)
+
+
 def get_xai_methods():
     """XAI method ids for UI/API: config + disk; legacy ``heatmap_samples/fastcam`` maps to ``gradcampp``."""
     from_config = get_xai_methods_from_config()
@@ -162,20 +174,39 @@ def index():
         for p in sorted(HEATMAP_DIR.iterdir()):
             if p.is_dir() and not p.name.startswith("."):
                 existing.append(p.name)
+<<<<<<< HEAD
     if existing and "gradcam" not in existing and "gradcampp" not in existing:
+=======
+    xai_methods = get_xai_methods()
+    xai_method_choices = [(m, xai_method_display_label(m)) for m in xai_methods]
+    if existing and "gradcam" not in existing and "fastcam" not in existing:
+>>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
         models = existing
     return render_template_string(
         INDEX_HTML,
         models=models,
         heatmap_dir=str(HEATMAP_DIR),
+<<<<<<< HEAD
         xai_methods=xai_method_ui_options(),
+=======
+        xai_method_choices=xai_method_choices,
+>>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
     )
 
 
 @app.route("/api/xai_methods")
 def api_xai_methods():
+<<<<<<< HEAD
     """List XAI method ids (gradcam, gradcampp, layercam); legacy disk folder fastcam is reported as gradcampp."""
     return jsonify(xai_methods=get_xai_methods())
+=======
+    """List XAI method ids + display labels (fastcam → Grad-CAM++ on the web UI)."""
+    methods = get_xai_methods()
+    return jsonify(
+        xai_methods=methods,
+        labels={m: xai_method_display_label(m) for m in methods},
+    )
+>>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
 
 
 @app.route("/api/models")
@@ -1217,7 +1248,11 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
   <div class="header">
     <h1>Heatmap Viewer</h1>
+<<<<<<< HEAD
     <p class="subtitle">XAI 방법에서 <strong>FastCAV (pseudo heatmap)</strong>을 고르면 동일 UI로 L0~L4 pseudo-heatmap을 봅니다. Grad-CAM / Grad-CAM++ / LayerCAM은 heatmap_samples 기준 · <a href="/fastcav" style="color:var(--accent);">전용 FastCAV 페이지</a>(bbox+pseudo)</p>
+=======
+    <p class="subtitle">XAI 방법(Grad-CAM / Grad-CAM++) 선택 후 샘플별 변조 단계(L0~L4) 비교 · 지표·그래프 · <a href="/fastcav" style="color:var(--accent);">FastCAV (bbox)</a></p>
+>>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
   </div>
 
   <div id="metrics" class="metrics"></div>
@@ -1229,8 +1264,13 @@ INDEX_HTML = """<!DOCTYPE html>
           <label>XAI 방법</label>
           <select id="xaiMethod">
             <option value="">선택</option>
+<<<<<<< HEAD
             {% for m in xai_methods %}
             <option value="{{ m.id }}">{{ m.label }}</option>
+=======
+            {% for value, label in xai_method_choices %}
+            <option value="{{ value }}">{{ label }}</option>
+>>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
             {% endfor %}
           </select>
         </div>
@@ -1477,7 +1517,11 @@ INDEX_HTML = """<!DOCTYPE html>
       try {
         const params = [];
         if (model) params.push('model=' + encodeURIComponent(model));
+<<<<<<< HEAD
         const q = qs().replace(/^[?]/, '');
+=======
+        const q = qs().replace(/^\\?/, '');
+>>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
         if (q) params.push(q);
         const url = '/api/aggregate/cam_metrics' + (params.length ? '?' + params.join('&') : '');
         const r = await fetch(url);

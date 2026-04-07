@@ -37,9 +37,11 @@ visdrone:
 experiment:
   pilot_mode: false  # Full experiment mode: use standard severities [0,1,2,3,4]
   sample_size: 500   # Legacy: overridden by target_tiny_objects
-  target_tiny_objects: 500  # Tiny object sample size (full run)
+  target_tiny_objects: 500  # When use_all_tiny_objects is false: random cap (full run)
+  # true = every tiny object that passes tiny_objects rules (no random subsample). Then re-run 03, 11, etc.
+  use_all_tiny_objects: true
   max_images: null   # Max images to scan for tiny objects (null = no limit)
-  one_per_image: false  # Allow multiple tiny bboxes per image when sampling 500 objects
+  one_per_image: false  # If true: only one tiny per image before any cap (usually keep false with use_all)
   
 # Tiny object definition
 # Based on empirical testing: YOLO can detect 2500+ px² objects with >50% rate

@@ -48,8 +48,9 @@ def main():
     tiny_config = config['tiny_objects']
     experiment_config = config.get('experiment', {})
     one_per_image = experiment_config.get('one_per_image', False)
-    # Option A: 100 tiny objects fixed for reproducibility (100 × 3 × 5 = 1500 frames)
+    # Option A: cap tiny count for cost; or use_all_tiny_objects=True to keep every tiny under rules below
     target_tiny_objects = experiment_config.get('target_tiny_objects', 100)
+    use_all_tiny_objects = bool(experiment_config.get('use_all_tiny_objects', False))
     max_images = experiment_config.get('max_images')  # null = no limit
     image_list = image_files if max_images is None else image_files[:max_images]
     
@@ -134,22 +135,30 @@ def main():
         else:
             all_tiny_objects.extend(image_tiny_list)
     
-    print(f"   Found {len(all_tiny_objects)} tiny objects")
-    
-    # RQ1: Target target_tiny_objects (e.g. 461) or all available if less
-    actual_sample_size = min(target_tiny_objects, len(all_tiny_objects)) if target_tiny_objects else len(all_tiny_objects)
-    
-    if len(all_tiny_objects) > actual_sample_size:
-        random.seed(config['seed'])
-        all_tiny_objects = random.sample(all_tiny_objects, actual_sample_size)
-    
-    # Option A: assign object_uid, frame_id, clip_id for reproducibility
+    n_found = len(all_tiny_objects)
+    print(f"   Found {n_found} tiny objects")
+
+    if use_all_tiny_objects:
+        print("   use_all_tiny_objects=True: keeping all (no random subsample).")
+    else:
+        # Cap to target_tiny_objects (0 or None = treat as 'use all' for backward compat)
+        if not target_tiny_objects:
+            actual_sample_size = n_found
+        else:
+            actual_sample_size = min(int(target_tiny_objects), n_found)
+        if n_found > actual_sample_size:
+            random.seed(config['seed'])
+            all_tiny_objects = random.sample(all_tiny_objects, actual_sample_size)
+            print(f"   Subsampled to {len(all_tiny_objects)} (target_tiny_objects={target_tiny_objects})")
+
+    # Stable unique ids: global index i (reproducible given same input list)
     for i, obj in enumerate(all_tiny_objects):
         obj['object_uid'] = f"{obj['image_id']}_obj_{obj['class_id']}_{i}"
         obj['frame_id'] = obj['image_id']
         obj['clip_id'] = ""
-    
-    print(f"   Sampled {len(all_tiny_objects)} tiny objects (target: {target_tiny_objects or 'all'}, available: {len(all_tiny_objects)})")
+
+    mode = "all" if use_all_tiny_objects else f"cap={target_tiny_objects}"
+    print(f"   Final list: {len(all_tiny_objects)} tiny objects (mode: {mode}, scanned: {n_found})")
     
     # Save results
     print("\n2. Saving results...")
