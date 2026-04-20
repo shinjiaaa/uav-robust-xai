@@ -479,6 +479,128 @@ Output EXACTLY in this format (English):
 """
 
 
+SYSTEM_PROMPT_TRAJECTORY_KO = """You summarize how Grad-CAM attention and YOLO detection jointly degrade for ONE object as a perturbation severity sweeps from L0 to L4.
+
+Rules:
+* You will receive numeric trajectory tables (severity 0..4) for perturbation parameter, detection, and Grad-CAM.
+* Every sentence MUST cite at least one numeric value AND the severity index (or physical parameter value) from the tables. No generic prose.
+* Do NOT invent values. If a row is missing (e.g., cam_valid=0, NaN), say "cam invalid" or "결측" briefly.
+* Judge CAM–performance alignment as one of: 선행(lead) / 동시(coincident) / 지연(lag). Use the severity at which ring_energy_ratio crosses 0.5 vs the severity at which is_miss first becomes 1 or score drops >0.2 from L0.
+* Output EXACTLY 3 lines in Korean, in this exact format:
+
+[판정] <one sentence: the severity at which detection breaks, with physical parameter + score/IoU numbers>
+[CAM] <one sentence: CAM alignment label + 2 CAM numeric changes (L0→L4 or L0→break-point)>
+[경고] <one sentence: pre-deployment operational warning framed on the physical parameter threshold>
+
+No other text. No headings. No bullet points. No English unless quoting a variable name or unit."""
+
+
+def format_trajectory_block(
+    traj_rows: list,
+    cam_rows: list,
+    *,
+    corruption: str,
+    perturbation: dict,
+) -> str:
+    """Assemble 5-severity numeric tables for one (image, object, corruption) unit.
+
+    traj_rows: list of detection_records dicts sorted by severity (len 1..5).
+    cam_rows:  list of cam_records dicts sorted by severity (may contain None entries when missing).
+    perturbation: {"param_name": str, "values": [v0..v4]} from experiment.yaml.
+    """
+    def _col(rows, key, n=2):
+        out = []
+        for r in rows:
+            v = None if r is None else r.get(key)
+            if v is None or (isinstance(v, float) and v != v):
+                out.append("n/a")
+            else:
+                try:
+                    out.append(f"{float(v):.{n}f}")
+                except (TypeError, ValueError):
+                    out.append(str(v))
+        return ", ".join(out)
+
+    def _col_int(rows, key):
+        out = []
+        for r in rows:
+            v = None if r is None else r.get(key)
+            if v is None or (isinstance(v, float) and v != v):
+                out.append("n/a")
+            else:
+                try:
+                    out.append(str(int(float(v))))
+                except (TypeError, ValueError):
+                    out.append(str(v))
+        return ", ".join(out)
+
+    def _col_str(rows, key):
+        out = []
+        for r in rows:
+            v = None if r is None else r.get(key)
+            if v is None or (isinstance(v, float) and v != v) or str(v).strip() == "":
+                out.append("n/a")
+            else:
+                out.append(str(v))
+        return ", ".join(out)
+
+    severities = ", ".join(str(int(r.get("severity", i))) for i, r in enumerate(traj_rows))
+    p_name = perturbation.get("param_name", "param")
+    p_vals = ", ".join(
+        f"{float(v):.2f}" if isinstance(v, (int, float)) else str(v)
+        for v in perturbation.get("values", [])
+    )
+
+    lines = [
+        f"[Perturbation] corruption={corruption}",
+        f"severity:   {severities}",
+        f"{p_name}:   {p_vals}",
+        "",
+        "[Detection trajectory] (detection_records.csv)",
+        f"pred_score:    {_col(traj_rows, 'pred_score', 4)}",
+        f"match_iou:     {_col(traj_rows, 'match_iou', 4)}",
+        f"delta_score:   {_col(traj_rows, 'delta_score', 4)}",
+        f"delta_iou:     {_col(traj_rows, 'delta_iou', 4)}",
+        f"is_miss:       {_col_int(traj_rows, 'is_miss')}",
+        f"failure_type:  {_col_str(traj_rows, 'failure_type')}",
+        "",
+        "[Grad-CAM trajectory] (cam_records.csv, primary layer)",
+        f"bbox_center_dist:   {_col(cam_rows, 'bbox_center_activation_distance', 2)}",
+        f"peak_bbox_dist:     {_col(cam_rows, 'peak_bbox_distance', 2)}",
+        f"activation_spread:  {_col(cam_rows, 'activation_spread', 2)}",
+        f"ring_energy_ratio:  {_col(cam_rows, 'ring_energy_ratio', 4)}",
+        f"energy_in_bbox:     {_col(cam_rows, 'energy_in_bbox', 4)}",
+        f"entropy:            {_col(cam_rows, 'entropy', 2)}",
+        f"cam_status:         {_col_str(cam_rows, 'cam_status')}",
+        "",
+        "[Definitions]",
+        "- ring_energy_ratio > 0.5 = object-centric attention; < 0.5 = diffuse/off-object",
+        "- bbox_center_dist: pixel distance from CAM center-of-mass to GT bbox center",
+        "- is_miss=1 when YOLO fails a usable match to GT",
+    ]
+    return "\n".join(lines)
+
+
+def build_trajectory_user_message(
+    *,
+    image_id: str,
+    object_uid: str,
+    gt_class: str,
+    corruption: str,
+    trajectory_block: str,
+) -> str:
+    """Assemble the USER message for the trajectory prompt."""
+    return (
+        f"[Unit]\n"
+        f"image_id: {image_id}\n"
+        f"object_uid: {object_uid}\n"
+        f"gt_class: {gt_class}\n"
+        f"corruption: {corruption}\n\n"
+        f"{trajectory_block}\n\n"
+        "위 테이블만 사용해 정확히 3줄([판정]/[CAM]/[경고])로 요약."
+    )
+
+
 def write_evaluation_questionnaire(path: Path) -> None:
     """Likert template for paper appendix / IRB packet."""
     text = """User study — Likert (1=Strongly disagree … 5=Strongly agree)
