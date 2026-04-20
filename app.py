@@ -174,39 +174,24 @@ def index():
         for p in sorted(HEATMAP_DIR.iterdir()):
             if p.is_dir() and not p.name.startswith("."):
                 existing.append(p.name)
-<<<<<<< HEAD
     if existing and "gradcam" not in existing and "gradcampp" not in existing:
-=======
-    xai_methods = get_xai_methods()
-    xai_method_choices = [(m, xai_method_display_label(m)) for m in xai_methods]
-    if existing and "gradcam" not in existing and "fastcam" not in existing:
->>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
         models = existing
     return render_template_string(
         INDEX_HTML,
         models=models,
         heatmap_dir=str(HEATMAP_DIR),
-<<<<<<< HEAD
         xai_methods=xai_method_ui_options(),
-=======
-        xai_method_choices=xai_method_choices,
->>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
     )
 
 
 @app.route("/api/xai_methods")
 def api_xai_methods():
-<<<<<<< HEAD
-    """List XAI method ids (gradcam, gradcampp, layercam); legacy disk folder fastcam is reported as gradcampp."""
-    return jsonify(xai_methods=get_xai_methods())
-=======
-    """List XAI method ids + display labels (fastcam → Grad-CAM++ on the web UI)."""
+    """List XAI method ids + optional display labels (gradcampp → Grad-CAM++)."""
     methods = get_xai_methods()
     return jsonify(
         xai_methods=methods,
         labels={m: xai_method_display_label(m) for m in methods},
     )
->>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
 
 
 @app.route("/api/models")
@@ -390,6 +375,173 @@ def _load_cam_records_df():
         else:
             _load_cam_records_df._df = None
     return _load_cam_records_df._df
+
+
+def _sample_stem_from_sample_id(sample_id: str) -> str:
+    s = str(sample_id).strip()
+    if s.lower().endswith((".png", ".jpg", ".jpeg")):
+        return s.rsplit(".", 1)[0]
+    return s
+
+
+def _heatmap_png_stem(image_id: str, object_uid: str) -> str:
+    """Same stem as scripts/12_user_study_export.py Grad-CAM overlay filename (safe_uid[:80])."""
+    safe = str(object_uid).replace("/", "_").replace("\\", "_")[:80]
+    return f"{image_id}_{safe}"
+
+
+def _load_user_study_manifest_df():
+    """Export manifest: maps (model, corruption, severity, sample stem) → unit folder."""
+    if not hasattr(_load_user_study_manifest_df, "_df"):
+        p = RESULTS_DIR / "user_study_bundles" / "manifest.csv"
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                import pandas as pd
+                _load_user_study_manifest_df._df = pd.read_csv(p)
+            except Exception:
+                _load_user_study_manifest_df._df = None
+        else:
+            _load_user_study_manifest_df._df = None
+    return _load_user_study_manifest_df._df
+
+
+def _filter_manifest_by_xai_method(sub, xai_method: Optional[str]):
+    if sub is None or len(sub) == 0:
+        return sub
+    if not xai_method or _is_fastcav_viewer(xai_method):
+        return sub
+    if "gradcam_heatmap_subdir" not in sub.columns:
+        return sub
+    xm = _canonical_xai_method(str(xai_method))
+    sub2 = sub[sub["gradcam_heatmap_subdir"].astype(str) == str(xm)]
+    return sub2 if len(sub2) > 0 else sub
+
+
+def _read_user_study_explanation(unit_dir: Path, name: str, max_chars: int = 12000) -> Optional[str]:
+    p = unit_dir / name
+    if not p.is_file():
+        return None
+    try:
+        t = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if len(t) > max_chars:
+        return t[:max_chars] + "\n… (truncated)"
+    return t.strip() or None
+
+
+@app.route("/api/user_study/llm_by_sample")
+def api_user_study_llm_by_sample():
+    """Per-severity LLM explanations for the selected heatmap sample (user_study_bundles/manifest.csv)."""
+    model = request.args.get("model", "").strip()
+    corruption = request.args.get("corruption", "").strip()
+    sample_id = request.args.get("sample_id", "").strip()
+    xai_method = request.args.get("xai_method", "").strip() or None
+    if not model or not corruption or not sample_id:
+        return jsonify(
+            ok=False,
+            message="쿼리에 model, corruption, sample_id가 필요합니다.",
+            severities=[],
+        ), 400
+    stem = _sample_stem_from_sample_id(sample_id)
+    df = _load_user_study_manifest_df()
+    if df is None or len(df) == 0:
+        return jsonify(
+            ok=False,
+            message="results/user_study_bundles/manifest.csv 가 없습니다. "
+            "python scripts/12_user_study_export.py 로 생성하세요.",
+            severities=[],
+        )
+    mcol = "model_id" if "model_id" in df.columns else "model"
+    if mcol not in df.columns:
+        return jsonify(ok=False, message="manifest에 model/model_id 열이 없습니다.", severities=[]), 500
+    sub = df[
+        (df[mcol].astype(str) == str(model))
+        & (df["corruption"].astype(str) == str(corruption))
+    ].copy()
+    sub = _filter_manifest_by_xai_method(sub, xai_method)
+    if len(sub) == 0:
+        return jsonify(
+            ok=False,
+            message="manifest에서 해당 model/corruption(xai_method) 행이 없습니다.",
+            severities=[],
+        )
+    sub["_stem"] = sub.apply(
+        lambda r: _heatmap_png_stem(str(r.get("image_id", "")), str(r.get("object_uid", ""))),
+        axis=1,
+    )
+    exact = sub[sub["_stem"] == stem]
+    if len(exact) > 0:
+        match_df = exact
+        match_mode = "stem"
+    else:
+        match_df = sub[sub["image_id"].astype(str) == stem]
+        match_mode = "image_id"
+    if len(match_df) == 0:
+        return jsonify(
+            ok=False,
+            message="manifest에 이 샘플과 일치하는 image_id·파일 stem 행이 없습니다. "
+            "export에 포함됐는지, heatmap 파일명과 object_uid가 맞는지 확인하세요.",
+            severities=[],
+        )
+    bundle_root = RESULTS_DIR / "user_study_bundles"
+    out_sev = []
+    for sev in range(5):
+        rws = match_df[match_df["severity"].astype(int) == int(sev)]
+        if len(rws) == 0:
+            out_sev.append(
+                {
+                    "severity": f"L{sev}",
+                    "unit_id": None,
+                    "gradcam": None,
+                    "fastcav": None,
+                    "note": None,
+                }
+            )
+            continue
+        if match_mode == "stem":
+            row = rws.iloc[0]
+        else:
+            sort_cols = [c for c in ("object_uid", "unit_id") if c in rws.columns]
+            if not sort_cols:
+                sort_cols = [mcol]
+            row = rws.sort_values(by=sort_cols).iloc[0]
+        uid = str(row.get("unit_id", "")).strip()
+        if not uid:
+            out_sev.append(
+                {
+                    "severity": f"L{sev}",
+                    "unit_id": None,
+                    "gradcam": None,
+                    "fastcav": None,
+                    "note": "unit_id 비어 있음",
+                }
+            )
+            continue
+        udir = bundle_root / uid
+        note = None
+        if match_mode == "image_id" and len(rws) > 1:
+            note = f"image_id만 일치: object_uid={row.get('object_uid', '')} 기준 (동일 이미지 객체 {len(rws)}개)"
+        g = _read_user_study_explanation(udir, "explanation_gradcam.txt")
+        f = _read_user_study_explanation(udir, "explanation_fastcav.txt")
+        out_sev.append(
+            {
+                "severity": f"L{sev}",
+                "unit_id": uid,
+                "gradcam": g,
+                "fastcav": f,
+                "note": note,
+            }
+        )
+    any_text = any(
+        (s.get("gradcam") or s.get("fastcav")) for s in out_sev
+    )
+    return jsonify(
+        ok=True,
+        match_mode=match_mode,
+        message=None if any_text else "해당 샘플/심각도에 explanation_*.txt 가 없습니다. export 시 --skip-llm 을 빼세요.",
+        severities=out_sev,
+    )
 
 
 # Grad-CAM metrics to show (and compute change rate from L0)
@@ -1115,6 +1267,36 @@ INDEX_HTML = """<!DOCTYPE html>
       display: block;
       cursor: pointer;
     }
+    .severity-cell .llm-under {
+      margin-top: 8px;
+      padding: 0 8px 10px 8px;
+      border-top: 1px solid var(--border);
+    }
+    .severity-cell .llm-under .llm-arm-title {
+      font-size: 0.65rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin: 8px 0 4px 0;
+    }
+    .severity-cell .llm-under pre.llm-pre-cell {
+      margin: 0;
+      padding: 8px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 0.65rem;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 200px;
+      overflow-y: auto;
+      color: var(--text);
+    }
+    .severity-cell .llm-under .llm-miss {
+      font-size: 0.65rem;
+      color: var(--muted);
+      margin: 8px 0 0 0;
+    }
     .comparison-section {
       margin-top: 24px;
       padding-top: 20px;
@@ -1213,46 +1395,12 @@ INDEX_HTML = """<!DOCTYPE html>
       border-top: 1px solid var(--border);
       margin: 24px 0 16px 0;
     }
-    .llm-preview-block { margin-top: 4px; }
-    .llm-preview-title { font-size: 0.95rem; color: var(--accent); margin: 0 0 8px 0; }
-    .llm-preview-cols {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-    }
-    @media (max-width: 900px) {
-      .llm-preview-cols { grid-template-columns: 1fr; }
-    }
-    .llm-preview-col h4 {
-      font-size: 0.8rem;
-      color: var(--muted);
-      margin: 0 0 8px 0;
-      font-weight: 600;
-    }
-    pre.llm-pre {
-      margin: 0;
-      padding: 12px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      font-size: 0.75rem;
-      line-height: 1.45;
-      white-space: pre-wrap;
-      word-break: break-word;
-      max-height: 320px;
-      overflow-y: auto;
-      color: var(--text);
-    }
   </style>
 </head>
 <body>
   <div class="header">
     <h1>Heatmap Viewer</h1>
-<<<<<<< HEAD
     <p class="subtitle">XAI 방법에서 <strong>FastCAV (pseudo heatmap)</strong>을 고르면 동일 UI로 L0~L4 pseudo-heatmap을 봅니다. Grad-CAM / Grad-CAM++ / LayerCAM은 heatmap_samples 기준 · <a href="/fastcav" style="color:var(--accent);">전용 FastCAV 페이지</a>(bbox+pseudo)</p>
-=======
-    <p class="subtitle">XAI 방법(Grad-CAM / Grad-CAM++) 선택 후 샘플별 변조 단계(L0~L4) 비교 · 지표·그래프 · <a href="/fastcav" style="color:var(--accent);">FastCAV (bbox)</a></p>
->>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
   </div>
 
   <div id="metrics" class="metrics"></div>
@@ -1264,13 +1412,8 @@ INDEX_HTML = """<!DOCTYPE html>
           <label>XAI 방법</label>
           <select id="xaiMethod">
             <option value="">선택</option>
-<<<<<<< HEAD
             {% for m in xai_methods %}
             <option value="{{ m.id }}">{{ m.label }}</option>
-=======
-            {% for value, label in xai_method_choices %}
-            <option value="{{ value }}">{{ label }}</option>
->>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
             {% endfor %}
           </select>
         </div>
@@ -1444,68 +1587,6 @@ INDEX_HTML = """<!DOCTYPE html>
     let aggregateChartInstances = [];
     const AGG_METRIC_KEYS = ['bbox_center_activation_distance', 'peak_bbox_distance', 'activation_spread', 'ring_energy_ratio'];
 
-    async function appendUserStudyLlmBlock(container) {
-      const prev = document.getElementById('userStudyLlmBlock');
-      if (prev) prev.remove();
-      const mount = document.createElement('div');
-      mount.id = 'userStudyLlmBlock';
-      const hr = document.createElement('hr');
-      hr.className = 'agg-sep';
-      mount.appendChild(hr);
-      const loading = document.createElement('p');
-      loading.className = 'llm-preview-loading';
-      loading.style.color = 'var(--muted)';
-      loading.style.fontSize = '0.85rem';
-      loading.textContent = 'LLM 해석 로딩 중…';
-      mount.appendChild(loading);
-      container.appendChild(mount);
-      try {
-        const r = await fetch('/api/user_study/llm_preview');
-        const d = await r.json();
-        loading.remove();
-        const block = document.createElement('div');
-        block.className = 'llm-preview-block';
-        const title = document.createElement('h3');
-        title.className = 'llm-preview-title';
-        title.textContent = 'LLM 해석 (user study export)';
-        block.appendChild(title);
-        const sub = document.createElement('p');
-        sub.style.color = 'var(--muted)';
-        sub.style.fontSize = '0.8rem';
-        sub.style.margin = '0 0 12px 0';
-        sub.textContent = (d.ok && d.unit_id)
-          ? '예시 유닛: ' + d.unit_id + ' — python scripts/12_user_study_export.py 로 생성'
-          : 'export 산출물이 없을 수 있습니다.';
-        block.appendChild(sub);
-        if (!d.ok || (!d.gradcam && !d.fastcav)) {
-          const p = document.createElement('p');
-          p.style.color = 'var(--muted)';
-          p.style.fontSize = '0.85rem';
-          p.textContent = d.message || 'LLM 설명 파일을 찾을 수 없습니다.';
-          block.appendChild(p);
-        } else {
-          const row = document.createElement('div');
-          row.className = 'llm-preview-cols';
-          [['Grad-CAM', d.gradcam], ['FastCAV', d.fastcav]].forEach(function(pair) {
-            const col = document.createElement('div');
-            col.className = 'llm-preview-col';
-            const h4 = document.createElement('h4');
-            h4.textContent = pair[0];
-            const pre = document.createElement('pre');
-            pre.className = 'llm-pre';
-            pre.textContent = pair[1] || '(비어 있음)';
-            col.appendChild(h4);
-            col.appendChild(pre);
-            row.appendChild(col);
-          });
-          block.appendChild(row);
-        }
-        mount.appendChild(block);
-      } catch (err) {
-        loading.textContent = 'LLM 해석 로드 실패';
-      }
-    }
-
     async function loadAggregateSection() {
       const aggSection = document.getElementById('aggregateSection');
       const aggContent = document.getElementById('aggregateContent');
@@ -1517,11 +1598,7 @@ INDEX_HTML = """<!DOCTYPE html>
       try {
         const params = [];
         if (model) params.push('model=' + encodeURIComponent(model));
-<<<<<<< HEAD
         const q = qs().replace(/^[?]/, '');
-=======
-        const q = qs().replace(/^\\?/, '');
->>>>>>> 90d08d9e27efa9ab33e072809c9774ad5fd9f969
         if (q) params.push(q);
         const url = '/api/aggregate/cam_metrics' + (params.length ? '?' + params.join('&') : '');
         const r = await fetch(url);
@@ -1530,7 +1607,6 @@ INDEX_HTML = """<!DOCTYPE html>
         if (corruptions.length === 0) {
           const fc = xaiMethodEl && xaiMethodEl.value === 'fastcav';
           aggContent.innerHTML = '<p style="color:var(--muted);">' + (fc ? 'FastCAV는 Grad-CAM 계열 지표(cam_records) 집계 대상이 아닙니다.' : '집계 데이터 없음 (cam_records.csv 확인)') + '</p>';
-          await appendUserStudyLlmBlock(aggContent);
           return;
         }
         aggContent.innerHTML = '';
@@ -1598,10 +1674,8 @@ INDEX_HTML = """<!DOCTYPE html>
             aggregateChartInstances.push(chart);
           });
         });
-        await appendUserStudyLlmBlock(aggContent);
       } catch (e) {
         aggContent.innerHTML = '<p style="color:var(--muted);">집계 로드 실패</p>';
-        await appendUserStudyLlmBlock(aggContent);
       }
     }
 
@@ -1667,10 +1741,14 @@ INDEX_HTML = """<!DOCTYPE html>
       loadingMainEl.style.display = 'block';
       severityRowEl.innerHTML = '';
       const base = '/api/models/' + encodeURIComponent(model) + '/' + encodeURIComponent(corruption) + '/sample/' + encodeURIComponent(sampleId) + qs();
-      fetch(base).then(r => r.json()).then(d => {
+      const llmParams = 'model=' + encodeURIComponent(model)
+        + '&corruption=' + encodeURIComponent(corruption)
+        + '&sample_id=' + encodeURIComponent(sampleId);
+      fetch(base).then(r => r.json()).then(async (d) => {
         loadingMainEl.style.display = 'none';
         const sevs = d.severities || [];
         severityRowEl.innerHTML = '';
+        const cells = [];
         sevs.forEach(({ severity, url }) => {
           const cell = document.createElement('div');
           cell.className = 'severity-cell';
@@ -1681,11 +1759,69 @@ INDEX_HTML = """<!DOCTYPE html>
           img.loading = 'lazy';
           img.onclick = () => { modalImg.src = url; modal.classList.add('show'); };
           cell.appendChild(img);
+          const llmMount = document.createElement('div');
+          llmMount.className = 'llm-under';
+          llmMount.innerHTML = '<p class="llm-miss">LLM 해석 로딩…</p>';
+          cell.appendChild(llmMount);
           severityRowEl.appendChild(cell);
+          cells.push({ cell, severity, llmMount });
         });
         if (sevs.length === 0) {
           emptyMainEl.textContent = '이 샘플에 대한 이미지가 없습니다.';
           emptyMainEl.style.display = 'block';
+          return;
+        }
+        try {
+          const llmUrl = '/api/user_study/llm_by_sample' + qs(llmParams);
+          const lr = await fetch(llmUrl);
+          const ldata = await lr.json();
+          const bySev = {};
+          (ldata.severities || []).forEach(function(s) { bySev[s.severity] = s; });
+          const isFc = xaiMethodEl && xaiMethodEl.value === 'fastcav';
+          cells.forEach(function({ severity, llmMount }) {
+            llmMount.innerHTML = '';
+            const block = bySev[severity];
+            if (!ldata.ok || !block) {
+              llmMount.innerHTML = '<p class="llm-miss">' + (ldata.message || 'LLM 데이터 없음') + '</p>';
+              return;
+            }
+            if (block.note) {
+              const n = document.createElement('p');
+              n.className = 'llm-miss';
+              n.textContent = block.note;
+              llmMount.appendChild(n);
+            }
+            const g = block.gradcam;
+            const f = block.fastcav;
+            function addArm(label, text) {
+              if (!text) return;
+              const t = document.createElement('div');
+              t.className = 'llm-arm-title';
+              t.textContent = label;
+              llmMount.appendChild(t);
+              const pre = document.createElement('pre');
+              pre.className = 'llm-pre-cell';
+              pre.textContent = text;
+              llmMount.appendChild(pre);
+            }
+            if (isFc) {
+              addArm('FastCAV (LLM)', f);
+              if (g) addArm('Grad-CAM (LLM)', g);
+            } else {
+              addArm('Grad-CAM (LLM)', g);
+              if (f) addArm('FastCAV (LLM)', f);
+            }
+            if (!g && !f) {
+              const miss = document.createElement('p');
+              miss.className = 'llm-miss';
+              miss.textContent = ldata.message || ('unit ' + (block.unit_id || '') + ': explanation_*.txt 없음');
+              llmMount.appendChild(miss);
+            }
+          });
+        } catch (e) {
+          cells.forEach(function({ llmMount }) {
+            llmMount.innerHTML = '<p class="llm-miss">LLM 해석 요청 실패</p>';
+          });
         }
       }).catch(() => { loadingMainEl.style.display = 'none'; emptyMainEl.textContent = '로드 실패'; emptyMainEl.style.display = 'block'; });
     }

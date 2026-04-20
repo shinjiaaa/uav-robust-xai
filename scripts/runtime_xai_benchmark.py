@@ -10,7 +10,8 @@ Measures (per method):
 Pipeline:
   - Detector only: letterbox preprocess (384) + YOLO forward, no backward.
   - XAI methods: full generate_cam (forward + backward + CAM map) on same layer as 05 script.
-  - FastCAV: concept-score post-process only (no CAM generation).
+  - Detector + FastCAV: same detector forward as baseline, then concept-score post-process on a CAM-metrics row
+    (no extra backward/CAM generation in this timer; metrics come from cam_records.csv or a fallback row).
 
 Output:
   - results/runtime_benchmark.csv
@@ -384,7 +385,7 @@ def main():
         explainer.close()
         del explainer
 
-    # --- FastCAV (concept-score post-process only; CAM generation excluded) ---
+    # --- Detector + FastCAV: detector forward (same as baseline) + concept post-process ---
     idx_cycle["i"] = 0
     metric_rows = fastcav_norm.get("metric_rows", [])
     if not metric_rows:
@@ -397,17 +398,25 @@ def main():
         ]
     fastcav_idx = {"i": 0}
 
-    def run_fastcav():
+    def run_detector_plus_fastcav():
+        img, _, _, _ = next_sample()
+        dt_det = measure_detector_forward(torch_model, device, img, sync_fn=_cuda_sync)
         j = fastcav_idx["i"] % len(metric_rows)
         fastcav_idx["i"] += 1
-        return measure_fastcav_pipeline(
+        dt_fc = measure_fastcav_pipeline(
             metric_rows[j],
             fastcav_norm,
             sync_fn=_cuda_sync,
         )
+        return dt_det + dt_fc
 
     m_mean, m_std, m_max, m_fps, m_within = bench_method(
-        "Detector + FastCAV", run_fastcav, args.warmup, n_measure, _cuda_sync, args.deadline_ms
+        "Detector + FastCAV",
+        run_detector_plus_fastcav,
+        args.warmup,
+        n_measure,
+        _cuda_sync,
+        args.deadline_ms,
     )
     oh = (m_mean - det_mean) / det_mean * 100.0 if det_mean > 1e-9 else float("nan")
     rows_out.append(
@@ -436,7 +445,8 @@ def main():
         "latency_note": (
             "End-to-end wall time per iteration for the listed pipeline (batch=1, one bbox): "
             "detector = letterbox+forward only; Grad-CAM/Grad-CAM++/LayerCAM = full generate_cam; "
-            "FastCAV = concept-score post-process only (CAM generation excluded). "
+            "Detector+FastCAV = same detector forward + FastCAV concept post-process on a CAM-metrics row "
+            "(no Grad-CAM backward in this timer; CAM numbers from cam_records.csv or fallback). "
             "Interpret as time until explanation signal is available for that path."
         ),
         "methods": rows_out,

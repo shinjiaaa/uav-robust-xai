@@ -74,12 +74,16 @@ Export script does not enforce stratification; filter `detection_records` / merg
 Same system prompt and user template with **four sections** (English in code; translate for localized studies if needed):
 
 ```
-[Status]
-[Location]
-[Cause]
-[Risk]
+[Assessment]
+[Key Issue]
+[Reason]
+[Pre-Deployment Warning]
 ```
 
+- **Assessment:** overall detection reliability / trust in this condition.
+- **Key Issue:** how detection weakens (not a separate location slot—spatial hints only if woven here).
+- **Reason:** corruption vs. visual cues, from provided signals only.
+- **Pre-Deployment Warning:** risk before field use + validation need.
 - **Grad-CAM block:** approximate spatial summary from the saved overlay PNG (`summarize_heatmap_regions` on grayscale).
 - **FastCAV block:** concept scores + pseudo spatial summary + explicit non-localization note.
 
@@ -91,20 +95,20 @@ Same system prompt and user template with **four sections** (English in code; tr
 ### Example formatted output (illustrative)
 
 ```
-[Status]
-The detector reports class "pedestrian" with moderate confidence under fog corruption.
+[Assessment]
+Detection reliability is reduced under fog for the reported class.
 
-[Location]
-The saliency emphasis appears strongest in the upper-right quadrant of the frame.
+[Key Issue]
+Saliency emphasis is strongest in the upper-right quadrant but does not tightly pin a single object boundary.
 
-[Cause]
-Fog reduces contrast; the model may rely on diffuse edge patterns rather than crisp object boundaries.
+[Reason]
+Fog reduces contrast; the given signals suggest reliance on diffuse patterns rather than crisp edges.
 
-[Risk]
-Trusting this detection without verification could be unsafe if the object is small or partially occluded.
+[Pre-Deployment Warning]
+Treat similar fog as a missed-detection risk until validated on representative field imagery.
 ```
 
-(FastCAV arm would differ in [Location]/[Cause] to reflect global concepts + pseudo-heatmap disclaimer.)
+(FastCAV arm would differ in [Key Issue]/[Reason] to reflect global concepts + pseudo-heatmap disclaimer.)
 
 ---
 

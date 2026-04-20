@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -28,9 +28,10 @@ Generate a structured explanation based on:
 
 * visualization summary (Grad-CAM or FastCAV pseudo-heatmap)
 * concept scores (if provided)
-* performance signals (confidence, miss trend, etc.)
+* performance signals (confidence, miss trend, corruption, severity, predicted class, etc.)
+* when provided: detection record metrics (match / IoU / deltas) and Grad-CAM record metrics (spread, ring ratio, distances) — use these numbers; do not invent others
 
-The explanation will be used for human evaluation.
+The explanation supports human evaluation and **pre-deployment risk awareness** (validation before field use, not real-time piloting).
 
 ---
 
@@ -38,35 +39,38 @@ The explanation will be used for human evaluation.
 
 You MUST follow this exact format:
 
-[Status] <one sentence describing what is happening>
+[Assessment] <one sentence: overall detection reliability or trust in this condition>
 
-[Location] <describe where the main issue appears in the image>
+[Key Issue] <one sentence: how detection is failing or weakening—e.g. weak target evidence, diffuse attention. Do NOT use a separate location-only line; if helpful, weave spatial hints here>
 
-[Cause] <describe why the issue is happening based ONLY on given signals>
+[Reason] <one sentence: connect corruption/environment to weakened visual cues, based ONLY on given signals>
 
-[Risk] <describe what could go wrong>
+[Pre-Deployment Warning] <one sentence: operational risk before deployment and whether additional validation is needed for similar conditions>
 
 ---
 
 ## RULES
 
-1. DO NOT assume precise spatial localization for FastCAV
-   * Use cautious language like:
-     "around highlighted regions" or "central area"
+1. Do NOT use a standalone [Location] section. Any “where” detail belongs inside [Key Issue] if needed.
 
-2. DO NOT invent causes not present in input
+2. DO NOT assume precise spatial localization for FastCAV
+   * Use cautious language like "around highlighted regions", "diffuse support", "weak spatial concentration"
 
-3. Keep each field to ONE sentence
+3. DO NOT invent causes not present in input
 
-4. Use simple and clear language
+4. Keep each field to ONE sentence
 
-5. No bullet points, no extra formatting in your output
+5. Use simple and clear language
 
-6. For Grad-CAM, do not claim finer detail than the visualization summary provides.
+6. No bullet points, no extra formatting in your output
+
+7. For Grad-CAM, do not claim finer detail than the visualization summary provides.
+
+8. [Pre-Deployment Warning] must end on a **pre-field / validation** framing (missed detection risk, false trust, recheck similar weather or corruption)—not vague generic harm.
 
 ---
 
-Respond only with the four labeled lines [Status] through [Risk], nothing else."""
+Respond only with the four labeled lines [Assessment] through [Pre-Deployment Warning], nothing else."""
 
 
 def build_strict_user_study_user_message(
@@ -106,6 +110,163 @@ def format_performance_signals_block(
     if confidence_l0 is not None and confidence_current is not None:
         lines.append(f"confidence values (severity 0 → current): {confidence_l0:.4f} → {confidence_current:.4f}")
     lines.append(f"miss / detection-failure trend: {miss_trend}")
+    return "\n".join(lines)
+
+
+def _as_opt_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, str) and not v.strip():
+            return None
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if x != x:  # NaN
+        return None
+    return x
+
+
+def _as_opt_bool(v: Any) -> Optional[bool]:
+    if v is None or (isinstance(v, str) and not str(v).strip()):
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and v != v:
+            return None
+        if v == 0:
+            return False
+        if v == 1:
+            return True
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    return None
+
+
+def _fmt_float(v: Optional[float], nd: int = 4) -> str:
+    if v is None:
+        return "n/a"
+    return f"{v:.{nd}f}"
+
+
+def format_detection_quant_block(
+    row: Mapping[str, Any],
+    row_l0: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Per-frame detection metrics from detection_records (numeric only, no invention)."""
+    lines = [
+        "detection record (same frame as visualization):",
+    ]
+    matched = _as_opt_bool(row.get("matched"))
+    if matched is not None:
+        lines.append(f"  matched to GT tiny box: {matched}")
+    is_miss = _as_opt_bool(row.get("is_miss"))
+    if is_miss is None:
+        is_miss = _as_opt_bool(row.get("is_missed"))
+    if is_miss is not None:
+        lines.append(f"  is_miss (no usable match): {is_miss}")
+    miou = _as_opt_float(row.get("match_iou"))
+    if miou is None:
+        miou = _as_opt_float(row.get("best_iou"))
+    lines.append(f"  match IoU (best / matched): {_fmt_float(miou)}")
+    ps = _as_opt_float(row.get("pred_score"))
+    if ps is None:
+        ps = _as_opt_float(row.get("score"))
+    lines.append(f"  pred confidence: {_fmt_float(ps)}")
+    for label, key in (
+        ("delta_score vs severity-0 baseline", "delta_score"),
+        ("delta_iou vs severity-0 baseline", "delta_iou"),
+    ):
+        dv = _as_opt_float(row.get(key))
+        if dv is not None:
+            lines.append(f"  {label}: {_fmt_float(dv)}")
+    ft = row.get("failure_type")
+    if ft is not None and str(ft).strip() and str(ft).lower() not in ("nan", "none"):
+        lines.append(f"  failure_type (pipeline label): {ft}")
+    if row_l0 is not None:
+        lines.append("severity-0 reference (same object × corruption):")
+        m0 = _as_opt_bool(row_l0.get("matched"))
+        if m0 is not None:
+            lines.append(f"  matched@L0: {m0}")
+        miss0 = _as_opt_bool(row_l0.get("is_miss"))
+        if miss0 is None:
+            miss0 = _as_opt_bool(row_l0.get("is_missed"))
+        if miss0 is not None:
+            lines.append(f"  is_miss@L0: {miss0}")
+        i0 = _as_opt_float(row_l0.get("match_iou"))
+        if i0 is None:
+            i0 = _as_opt_float(row_l0.get("best_iou"))
+        lines.append(f"  match IoU@L0: {_fmt_float(i0)}")
+        p0 = _as_opt_float(row_l0.get("pred_score"))
+        if p0 is None:
+            p0 = _as_opt_float(row_l0.get("score"))
+        lines.append(f"  pred confidence@L0: {_fmt_float(p0)}")
+    lines.append(
+        "  note: corruption severity is a discrete pipeline level (0=reference, higher=stronger corruption in this study), not a physical weather SI unit."
+    )
+    return "\n".join(lines)
+
+
+def format_cam_record_quant_block(
+    cam: Optional[Mapping[str, Any]],
+    cam_l0: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Grad-CAM pipeline metrics from cam_records.csv (numeric; omit if file/row missing)."""
+    if not cam:
+        return "gradcam metrics record: (none — cam_records row not found or not merged)"
+    lines = ["gradcam metrics record (cam_records.csv, primary layer if filtered upstream):"]
+    st = cam.get("cam_status")
+    if st is not None and str(st).strip():
+        lines.append(f"  cam_status: {st}")
+    cv = cam.get("cam_valid")
+    if cv is not None and str(cv).strip():
+        lines.append(f"  cam_valid: {cv}")
+    keys = [
+        ("bbox_center_activation_distance", "bbox_center_activation_distance"),
+        ("peak_bbox_distance", "peak_bbox_distance"),
+        ("activation_spread", "activation_spread"),
+        ("ring_energy_ratio", "ring_energy_ratio"),
+        ("entropy", "entropy"),
+        ("energy_in_bbox_1_25x", "energy_in_bbox_1_25x"),
+    ]
+    for label, k in keys:
+        v = _as_opt_float(cam.get(k))
+        if v is not None:
+            lines.append(f"  {label}: {_fmt_float(v)}")
+    if cam_l0:
+        lines.append("  vs severity-0 CAM record (same keys):")
+        for label, k in keys:
+            v0 = _as_opt_float(cam_l0.get(k))
+            v1 = _as_opt_float(cam.get(k))
+            if v0 is not None and v1 is not None:
+                lines.append(f"    {label}: L0 {_fmt_float(v0)} → current {_fmt_float(v1)} (Δ {_fmt_float(v1 - v0)})")
+    return "\n".join(lines)
+
+
+def format_overlay_numeric_block(
+    grad_summary: Mapping[str, Any],
+    grad_summary_l0: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Numbers derived from saved Grad-CAM overlay PNG (proxy; same as visualization summary source)."""
+    t10 = _as_opt_float(grad_summary.get("top10_mass_fraction"))
+    lines = [
+        "gradcam overlay PNG proxy metrics:",
+        f"  peak_quadrant: {grad_summary.get('peak_quadrant', 'unknown')}",
+        f"  concentration label: {grad_summary.get('concentration', 'unknown')}",
+        f"  top10_mass_fraction: {_fmt_float(t10)}",
+    ]
+    if grad_summary_l0:
+        t0 = _as_opt_float(grad_summary_l0.get("top10_mass_fraction"))
+        t1 = _as_opt_float(grad_summary.get("top10_mass_fraction"))
+        if t0 is not None and t1 is not None:
+            lines.append(
+                f"  vs L0 overlay: top10_mass_fraction L0 {_fmt_float(t0)} → current {_fmt_float(t1)} "
+                f"(Δ {_fmt_float(t1 - t0)})"
+            )
     return "\n".join(lines)
 
 
@@ -304,16 +465,16 @@ Signals:
 
 Output EXACTLY in this format (English):
 
-[Status]
+[Assessment]
 ...
 
-[Location]
+[Key Issue]
 ...
 
-[Cause]
+[Reason]
 ...
 
-[Risk]
+[Pre-Deployment Warning]
 ...
 """
 

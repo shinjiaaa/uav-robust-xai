@@ -7,6 +7,7 @@ Does not modify training/inference pipelines. Reads results/*.csv and existing h
 Usage:
   python scripts/12_user_study_export.py --max-units 20
   python scripts/12_user_study_export.py --skip-llm --max-units 50
+  python scripts/12_user_study_export.py --image-id 0000022_00500_d_0000005 --out-dir results/user_study_test_one
 """
 
 from __future__ import annotations
@@ -30,7 +31,10 @@ from src.user_study.heatmap_summary import summarize_heatmap_regions
 from src.user_study.llm_user_study import (
     SYSTEM_PROMPT_STRICT,
     build_strict_user_study_user_message,
+    format_cam_record_quant_block,
     format_concept_signals_with_trends,
+    format_detection_quant_block,
+    format_overlay_numeric_block,
     format_performance_signals_block,
     generate_explanation_openai,
     narrate_fastcav_visualization_summary,
@@ -126,6 +130,52 @@ def _conf_trend_label(c0: float | None, c1: float | None) -> str:
     return "increasing" if d > 0 else "decreasing"
 
 
+def _prepare_cam_df_for_export(cam_full: pd.DataFrame | None, gradcam_xai: str) -> pd.DataFrame | None:
+    """Restrict cam_records to the same XAI arm as heatmap_samples + primary layer when possible."""
+    if cam_full is None or len(cam_full) == 0:
+        return None
+    df = cam_full
+    if "xai_method" in df.columns:
+        sub = df[df["xai_method"].astype(str) == str(gradcam_xai)]
+        if len(sub) > 0:
+            df = sub
+    if "layer_role" in df.columns:
+        sub = df[df["layer_role"].astype(str) == "primary"]
+        if len(sub) > 0:
+            df = sub
+    return df if len(df) > 0 else None
+
+
+def _cam_row_lookup(
+    cam_df: pd.DataFrame | None,
+    *,
+    image_id: str,
+    object_uid: str,
+    corruption: str,
+    severity: int,
+    model_name: str,
+) -> pd.Series | None:
+    if cam_df is None or len(cam_df) == 0:
+        return None
+    oid_col = "object_id" if "object_id" in cam_df.columns else None
+    if oid_col is None:
+        return None
+    mod_col = "model" if "model" in cam_df.columns else ("model_id" if "model_id" in cam_df.columns else None)
+    if mod_col is None:
+        return None
+    m = (
+        (cam_df["image_id"].astype(str) == str(image_id))
+        & (cam_df[oid_col].astype(str) == str(object_uid))
+        & (cam_df["corruption"].astype(str) == str(corruption))
+        & (cam_df["severity"].astype(int) == int(severity))
+        & (cam_df[mod_col].astype(str) == str(model_name))
+    )
+    sub = cam_df.loc[m]
+    if len(sub) == 0:
+        return None
+    return sub.iloc[0]
+
+
 def _row_for_severity(
     full: pd.DataFrame,
     image_id: str,
@@ -212,6 +262,12 @@ def main():
     )
     ap.add_argument("--skip-llm", action="store_true", help="Only write prompts, no API calls")
     ap.add_argument("--llm-model", type=str, default="gpt-4o-mini")
+    ap.add_argument(
+        "--image-id",
+        type=str,
+        default=None,
+        help="Only export rows with this image_id (all corruptions × severities × objects in merge). Folder names: {corruption}_L{sev}_{object_uid}.",
+    )
     args = ap.parse_args()
 
     cfg = load_yaml(ROOT / "configs" / "experiment.yaml")
@@ -221,6 +277,19 @@ def main():
     gaussian_sigma = float(us_cfg.get("pseudo_heatmap", {}).get("gaussian_sigma", 4.0))
     llm_model_cfg = us_cfg.get("llm", {}).get("model", args.llm_model)
     gradcam_xai = args.gradcam_xai or us_cfg.get("gradcam_overlay_method", "gradcam")
+
+    cam_path = results_root / "cam_records.csv"
+    cam_df: pd.DataFrame | None = None
+    if cam_path.exists():
+        cam_raw = pd.read_csv(cam_path)
+        cam_df = _prepare_cam_df_for_export(cam_raw, gradcam_xai)
+        n_cam = len(cam_df) if cam_df is not None else 0
+        print(
+            f"[export] cam_records.csv: {len(cam_raw)} rows → {n_cam} after xai_method={gradcam_xai!r} / primary layer",
+            flush=True,
+        )
+    else:
+        print("[export] cam_records.csv not found — LLM prompts omit CAM-record numerics", flush=True)
 
     det_path = results_root / "detection_records.csv"
     fc_path = results_root / "fastcav_tiny_concept_scores.csv"
@@ -245,12 +314,24 @@ def main():
         print("No rows after merge(det, fastcav_tiny_concept_scores)")
         sys.exit(1)
 
+    if args.image_id:
+        iid = str(args.image_id).strip()
+        full_merged = full_merged[full_merged["image_id"].astype(str) == iid]
+        if len(full_merged) == 0:
+            print(f"No merged rows for image_id={iid!r} (check detection_records + fastcav CSVs)")
+            sys.exit(1)
+        print(f"[export] filter image_id={iid!r} → {len(full_merged)} rows", flush=True)
+
     mcol = "model_id" if "model_id" in full_merged.columns else "model"
     export_df = (
         full_merged.head(int(args.max_units))
         if args.max_units
         else full_merged
     )
+    if args.image_id and len(export_df) > 0:
+        cols = [c for c in ("corruption", "severity", "object_uid") if c in export_df.columns]
+        if cols:
+            export_df = export_df.sort_values(cols).reset_index(drop=True)
 
     out_root = ROOT / args.out_dir
     out_root.mkdir(parents=True, exist_ok=True)
@@ -266,14 +347,17 @@ def main():
     )
 
     for uidx, (_, row) in enumerate(export_df.iterrows()):
-        unit_id = f"unit_{uidx:05d}"
-        udir = out_root / unit_id
-        udir.mkdir(parents=True, exist_ok=True)
-
         image_id = str(row["image_id"])
         object_uid = str(row["object_uid"])
         corruption = str(row["corruption"])
         severity = int(row["severity"])
+        safe_o = object_uid.replace("/", "_").replace("\\", "_").replace(":", "_")[:72]
+        if args.image_id:
+            unit_id = f"{corruption}_L{severity}_{safe_o}"
+        else:
+            unit_id = f"unit_{uidx:05d}"
+        udir = out_root / unit_id
+        udir.mkdir(parents=True, exist_ok=True)
         model_name = str(row.get(mcol, "yolo_generic"))
         pred_class = str(row.get("pred_class_name", row.get("gt_class_name", "?")))
         try:
@@ -366,6 +450,36 @@ def main():
             f"\ncorruption type: {corruption}\n"
             f"severity level index: {severity}\n"
             f"predicted class (metadata only): {pred_class}"
+        )
+        performance_block += "\n\n" + format_detection_quant_block(
+            row.to_dict(),
+            row_l0.to_dict() if row_l0 is not None else None,
+        )
+        performance_block += "\n\n" + format_overlay_numeric_block(
+            grad_summary,
+            grad_summary_l0,
+        )
+        cam_cur = _cam_row_lookup(
+            cam_df,
+            image_id=image_id,
+            object_uid=object_uid,
+            corruption=corruption,
+            severity=severity,
+            model_name=model_name,
+        )
+        cam_l0_row = None
+        if int(severity) != 0:
+            cam_l0_row = _cam_row_lookup(
+                cam_df,
+                image_id=image_id,
+                object_uid=object_uid,
+                corruption=corruption,
+                severity=0,
+                model_name=model_name,
+            )
+        performance_block += "\n\n" + format_cam_record_quant_block(
+            cam_cur.to_dict() if cam_cur is not None else None,
+            cam_l0_row.to_dict() if cam_l0_row is not None else None,
         )
 
         concepts_l0 = _concept_dict_from_row(row_l0) if row_l0 is not None else None
