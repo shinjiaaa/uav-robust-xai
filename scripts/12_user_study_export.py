@@ -241,6 +241,12 @@ def main():
         default=None,
         help="Only export rows with this image_id (all corruptions × severities × objects in merge). Folder names: {corruption}_L{sev}_{object_uid}.",
     )
+    ap.add_argument(
+        "--image-ids",
+        type=str,
+        default=None,
+        help="Comma-separated list of image_ids to restrict export to. Takes precedence over --max-images.",
+    )
     args = ap.parse_args()
 
     cfg = load_yaml(ROOT / "configs" / "experiment.yaml")
@@ -281,6 +287,19 @@ def main():
             print(f"No detection rows for image_id={iid!r}")
             sys.exit(1)
         print(f"[export] filter image_id={iid!r} → {len(det)} rows", flush=True)
+
+    if args.image_ids:
+        ids = [x.strip() for x in str(args.image_ids).split(",") if x.strip()]
+        ids_unique = list(dict.fromkeys(ids))
+        det = det[det["image_id"].astype(str).isin(ids_unique)]
+        if len(det) == 0:
+            print(f"No detection rows for image_ids={ids_unique!r}")
+            sys.exit(1)
+        present = sorted(set(det["image_id"].astype(str).tolist()))
+        missing = [i for i in ids_unique if i not in present]
+        print(f"[export] --image-ids → {len(present)}/{len(ids_unique)} image_ids matched, {len(det)} rows", flush=True)
+        if missing:
+            print(f"[export]   missing (not in detection_records): {missing}", flush=True)
 
     if args.max_images:
         keep_ids = list(dict.fromkeys(det["image_id"].astype(str).tolist()))[: int(args.max_images)]

@@ -176,12 +176,16 @@ def index():
                 existing.append(p.name)
     if existing and "gradcam" not in existing and "gradcampp" not in existing:
         models = existing
-    return render_template_string(
+    from flask import make_response
+    resp = make_response(render_template_string(
         INDEX_HTML,
         models=models,
         heatmap_dir=str(HEATMAP_DIR),
         xai_methods=xai_method_ui_options(),
-    )
+    ))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.route("/api/xai_methods")
@@ -318,6 +322,18 @@ def api_samples(model, corruption):
             if ideal_list:
                 ideal_set = set(ideal_list)
                 samples = sorted(s for s in samples if s in ideal_set)
+    only_with_llm = request.args.get("only_with_llm", "").strip().lower() in ("1", "true", "yes")
+    if only_with_llm:
+        df = _load_user_study_manifest_df()
+        if df is not None and len(df) > 0:
+            manifest_image_ids = set(df["image_id"].astype(str).unique())
+            def _sample_belongs_to_manifest(s: str) -> bool:
+                stem = s.rsplit(".", 1)[0] if "." in s else s
+                for iid in manifest_image_ids:
+                    if stem == iid or stem.startswith(f"{iid}_"):
+                        return True
+                return False
+            samples = [s for s in samples if _sample_belongs_to_manifest(s)]
     return jsonify(samples=samples)
 
 
@@ -408,17 +424,27 @@ def _cam_style_stem(image_id: str, object_uid: str) -> str:
 
 
 def _load_user_study_manifest_df():
-    """Export manifest: maps (model, corruption, severity, sample stem) → unit folder."""
-    if not hasattr(_load_user_study_manifest_df, "_df"):
-        p = RESULTS_DIR / "user_study_bundles" / "manifest.csv"
-        if p.exists() and p.stat().st_size > 0:
-            try:
-                import pandas as pd
-                _load_user_study_manifest_df._df = pd.read_csv(p)
-            except Exception:
-                _load_user_study_manifest_df._df = None
-        else:
+    """Export manifest: maps unit_id → (image_id, object_uid, corruption, ...).
+
+    Reloads automatically when results/user_study_bundles/manifest.csv mtime changes,
+    so re-running scripts/12_user_study_export.py while the server runs is picked up.
+    """
+    p = RESULTS_DIR / "user_study_bundles" / "manifest.csv"
+    if not p.exists() or p.stat().st_size == 0:
+        _load_user_study_manifest_df._df = None
+        _load_user_study_manifest_df._mtime = None
+        return None
+    mtime = p.stat().st_mtime
+    if (
+        not hasattr(_load_user_study_manifest_df, "_df")
+        or getattr(_load_user_study_manifest_df, "_mtime", None) != mtime
+    ):
+        try:
+            import pandas as pd
+            _load_user_study_manifest_df._df = pd.read_csv(p)
+        except Exception:
             _load_user_study_manifest_df._df = None
+        _load_user_study_manifest_df._mtime = mtime
     return _load_user_study_manifest_df._df
 
 
@@ -1483,6 +1509,10 @@ INDEX_HTML = """<!DOCTYPE html>
           <input type="checkbox" id="idealOnlyCheckbox" style="cursor:pointer;">
           <label for="idealOnlyCheckbox" style="margin:0;cursor:pointer;font-size:0.8rem;color:var(--muted);">이상적 추세만 보기</label>
         </div>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="onlyWithLLMCheckbox" style="cursor:pointer;" checked>
+          <label for="onlyWithLLMCheckbox" style="margin:0;cursor:pointer;font-size:0.8rem;color:var(--muted);">LLM 있는 샘플만 보기</label>
+        </div>
       </div>
       <div class="sidebar-head">샘플 목록 (선택 시 동일 이미지 L0~L4 표시)</div>
       <div id="sampleList" class="sample-list"></div>
@@ -1741,7 +1771,11 @@ INDEX_HTML = """<!DOCTYPE html>
       const c = corruptionEl.value;
       if (!m || !c) return;
       const idealOnly = document.getElementById('idealOnlyCheckbox').checked;
-      const url = '/api/models/' + encodeURIComponent(m) + '/' + encodeURIComponent(c) + '/samples' + qs(idealOnly ? 'ideal_only=1' : '');
+      const onlyWithLLM = document.getElementById('onlyWithLLMCheckbox') && document.getElementById('onlyWithLLMCheckbox').checked;
+      const extraParams = [];
+      if (idealOnly) extraParams.push('ideal_only=1');
+      if (onlyWithLLM) extraParams.push('only_with_llm=1');
+      const url = '/api/models/' + encodeURIComponent(m) + '/' + encodeURIComponent(c) + '/samples' + qs(extraParams.join('&'));
       fetch(url).then(r => r.json()).then(d => {
         sampleListEl.innerHTML = '';
         const samples = d.samples || [];
@@ -1767,6 +1801,10 @@ INDEX_HTML = """<!DOCTYPE html>
       loadSampleList();
     });
     document.getElementById('idealOnlyCheckbox').addEventListener('change', () => {
+      if (modelEl.value && corruptionEl.value) loadSampleList();
+    });
+    const _onlyLlmEl = document.getElementById('onlyWithLLMCheckbox');
+    if (_onlyLlmEl) _onlyLlmEl.addEventListener('change', () => {
       if (modelEl.value && corruptionEl.value) loadSampleList();
     });
     // On load: if single xai_method (non-empty value), select it and load models → then Corruption loads if single model
