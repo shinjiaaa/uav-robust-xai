@@ -547,8 +547,7 @@ def api_user_study_llm_by_sample():
             sort_cols = [mcol]
         row = match_df.sort_values(by=sort_cols).iloc[0]
         note = (
-            f"heatmap이 클래스 단위(cam_object_id)인데 detection은 인스턴스 단위(object_uid)라, "
-            f"object_uid={row.get('object_uid', '')} 기준으로 1건 선택 (총 {len(match_df)}개 중)"
+            f"동일 클래스의 여러 인스턴스 중 1개 기준으로 요약 (총 {len(match_df)}개)"
         ) if len(match_df) > 1 else None
     else:
         sort_cols = [c for c in ("object_uid", "unit_id") if c in match_df.columns]
@@ -1522,7 +1521,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div id="sampleTitle" class="sample-title" style="display:none;"></div>
       <div id="severityRow" class="severity-row"></div>
       <div id="trajectoryLLM" class="trajectory-llm" style="display:none;">
-        <div class="trajectory-llm-title">Grad-CAM trajectory 요약 (L0 → L4 통합)</div>
+        <div class="trajectory-llm-title">운영자용 요약 (정상 → 변조 최대)</div>
         <div id="trajectoryLLMNote" class="llm-miss" style="display:none;"></div>
         <pre id="trajectoryLLMBody" class="llm-pre-cell"></pre>
       </div>

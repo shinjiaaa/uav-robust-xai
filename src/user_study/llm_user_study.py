@@ -479,20 +479,467 @@ Output EXACTLY in this format (English):
 """
 
 
-SYSTEM_PROMPT_TRAJECTORY_KO = """You summarize how Grad-CAM attention and YOLO detection jointly degrade for ONE object as a perturbation severity sweeps from L0 to L4.
+SYSTEM_PROMPT_TRAJECTORY_KO = """역할: UAV 영상 검증 결과를 운영자에게 보고하는 분석가
+독자: 코드·통계 배경이 없는 항공 인증 검증자
+
+규칙:
+1. 변수명, 코드명, 기술 약어(CAM, IoU, severity, alpha, gamma, kernel, ring_energy 등) 사용 금지.
+2. 숫자·소수점 값은 절대 출력하지 않는다. 입력에 이미 변환된 등급 표현과 단계 번호만 사용.
+3. 객체 ID, 파일명 언급 금지.
+4. 입력에 제공된 "성능 붕괴 단계", "시각적 주의 변화 시작 단계", "선행 관계" 값을 반드시 인용하여 서술한다.
+5. 출력 형식은 정확히 아래 세 섹션, 총 3~4문장:
+
+[성능 붕괴] 변조가 몇 단계에서 탐지 신뢰도가 어떻게 떨어졌는지 한 문장. 단계 번호와 탐지 등급을 반드시 포함.
+[조기 신호] 모델의 시각적 주의가 몇 단계에서 변화하기 시작했는지 한 문장. 단계 번호를 반드시 포함.
+[해석] 설명이 성능보다 몇 단계 먼저/나중에/동시에 변화했는지 한 문장, 그리고 이 객체에서 시각적 설명이 조기 경보로 활용 가능한지 한 문장. (총 두 문장)
+
+예시 입력:
+- 변조 종류: 안개
+- 정상 영상 탐지: 안정적으로 인식
+- 변조 최대 영상 탐지: 거의 인식 못함
+- 성능 붕괴 단계: 3단계 (짙은 안개)
+- 시각적 주의 변화 시작 단계: 1단계 (옅은 안개)
+- 선행 관계: 설명이 성능 저하보다 2단계 먼저 변화
+- 조기 경보 활용 가능성: 가능
+
+예시 출력:
+[성능 붕괴] 안개가 3단계에 도달했을 때 탐지 신뢰도가 안정 수준에서 거의 인식 못함으로 떨어졌습니다.
+[조기 신호] 모델의 시각적 주의는 1단계에서 이미 객체에서 벗어나기 시작했습니다.
+[해석] 설명이 성능 저하보다 두 단계 먼저 변화를 보였습니다. 이 객체에 대해서는 시각적 설명이 조기 경보로 활용 가능합니다.
+
+다른 출력은 금지. 설명·머리말·부연 없음. 위 세 섹션만."""
+
+
+SYSTEM_PROMPT_TRAJECTORY_EN = """Role: An analyst reporting UAV imagery validation results to operators.
+Audience: Aviation certification validators without a coding or statistics background.
 
 Rules:
-* You will receive numeric trajectory tables (severity 0..4) for perturbation parameter, detection, and Grad-CAM.
-* Every sentence MUST cite at least one numeric value AND the severity index (or physical parameter value) from the tables. No generic prose.
-* Do NOT invent values. If a row is missing (e.g., cam_valid=0, NaN), say "cam invalid" or "결측" briefly.
-* Judge CAM–performance alignment as one of: 선행(lead) / 동시(coincident) / 지연(lag). Use the severity at which ring_energy_ratio crosses 0.5 vs the severity at which is_miss first becomes 1 or score drops >0.2 from L0.
-* Output EXACTLY 3 lines in Korean, in this exact format:
+1. Do NOT use variable names, code identifiers, or technical abbreviations (CAM, IoU, severity, alpha, gamma, kernel, ring_energy, etc.).
+2. NEVER output raw numeric or decimal values. Use only the pre-converted grade labels and stage numbers provided in the input.
+3. Do NOT mention object IDs or filenames.
+4. You MUST cite the "Performance collapse stage", "Visual attention change onset stage", and "Lead relationship" values from the input.
+5. Output must follow exactly the three sections below, in 3-4 total sentences:
 
-[판정] <one sentence: the severity at which detection breaks, with physical parameter + score/IoU numbers>
-[CAM] <one sentence: CAM alignment label + 2 CAM numeric changes (L0→L4 or L0→break-point)>
-[경고] <one sentence: pre-deployment operational warning framed on the physical parameter threshold>
+[Performance Collapse] One sentence on the stage at which detection confidence degraded and how. Must include the stage number and the detection grade.
+[Early Signal] One sentence on the stage at which the model's visual attention began to change. Must include the stage number.
+[Interpretation] One sentence on whether the explanation changed before, after, or simultaneously with performance, and one sentence on whether visual explanation can serve as an early warning for this object. (Two sentences total.)
 
-No other text. No headings. No bullet points. No English unless quoting a variable name or unit."""
+Example input:
+- Corruption type: fog
+- Detection on clean image: stably detected
+- Detection at maximum corruption: barely detected
+- Performance collapse stage: stage 3 (dense fog)
+- Visual attention change onset stage: stage 1 (light fog)
+- Lead relationship: explanation changed two stages earlier than performance degradation
+- Early warning usability: possible
+
+Example output:
+[Performance Collapse] When fog reached stage 3, detection confidence dropped from a stable level to barely detected.
+[Early Signal] The model's visual attention had already begun drifting away from the object at stage 1.
+[Interpretation] The explanation changed two stages earlier than performance degradation. For this object, visual explanation can be used as an early warning.
+
+No other output. No headings. No preamble or commentary. Only the three sections above."""
+
+
+# --- humanization helpers (value → grade string, lang-aware) ---
+
+_NA_LABEL = {"ko": "값 없음", "en": "no value"}
+_UNK_LABEL = {"ko": "알 수 없음", "en": "unknown"}
+
+_SCORE_GRADES = {
+    "ko": ("거의 인식 못함", "약하게 인식", "안정적으로 인식", "확실히 인식"),
+    "en": ("barely detected", "weakly detected", "stably detected", "confidently detected"),
+}
+_FOG_GRADES = {
+    "ko": ("정상 (안개 없음)", "옅은 안개", "중간 농도 안개", "짙은 안개", "매우 짙은 안개"),
+    "en": ("clear (no fog)", "light fog", "moderate fog", "dense fog", "very dense fog"),
+}
+_LOWLIGHT_GRADES = {
+    "ko": ("정상 조도", "약간 어두움", "어두움", "매우 어두움", "거의 암흑"),
+    "en": ("normal lighting", "slightly dark", "dark", "very dark", "near darkness"),
+}
+_MOTION_GRADES = {
+    "ko": ("정상 (흔들림 없음)", "약간 흔들림", "보통 흔들림", "심한 흔들림", "매우 심한 흔들림"),
+    "en": ("normal (no blur)", "slight motion blur", "moderate motion blur", "severe motion blur", "very severe motion blur"),
+}
+_CHANGE_PCT_GRADES = {
+    "ko": ("변화 알 수 없음", "변화 없음", "약간 변화", "크게 변화"),
+    "en": ("change unknown", "no change", "slight change", "large change"),
+}
+_ATTENTION_SHIFT = {
+    "ko": {
+        "unknown": "주의 변화 알 수 없음",
+        "none": "변화 없음",
+        "diffuse_strong": "객체 밖으로 크게 분산",
+        "diffuse_weak": "객체 주변으로 약간 분산",
+        "focus_more": "객체 쪽으로 더 집중",
+        "slight": "약간 변화",
+    },
+    "en": {
+        "unknown": "attention change unknown",
+        "none": "no change",
+        "diffuse_strong": "strongly diffused outside the object",
+        "diffuse_weak": "slightly diffused around the object",
+        "focus_more": "more focused on the object",
+        "slight": "slight change",
+    },
+}
+
+
+def humanize_score(score, lang: str = "ko") -> str:
+    """Detection confidence grade."""
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return _NA_LABEL[lang]
+    if s != s:  # NaN
+        return _NA_LABEL[lang]
+    g = _SCORE_GRADES[lang]
+    if s < 0.2:
+        return g[0]
+    if s < 0.5:
+        return g[1]
+    if s < 0.8:
+        return g[2]
+    return g[3]
+
+
+def humanize_fog(alpha, lang: str = "ko") -> str:
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError):
+        return _UNK_LABEL[lang]
+    g = _FOG_GRADES[lang]
+    if a <= 0.01:
+        return g[0]
+    if a <= 0.25:
+        return g[1]
+    if a <= 0.50:
+        return g[2]
+    if a <= 0.75:
+        return g[3]
+    return g[4]
+
+
+def humanize_lowlight(brightness, lang: str = "ko") -> str:
+    """brightness = 1.0 (normal) → 0.2 (very dark)."""
+    try:
+        b = float(brightness)
+    except (TypeError, ValueError):
+        return _UNK_LABEL[lang]
+    g = _LOWLIGHT_GRADES[lang]
+    if b >= 0.95:
+        return g[0]
+    if b >= 0.70:
+        return g[1]
+    if b >= 0.45:
+        return g[2]
+    if b >= 0.25:
+        return g[3]
+    return g[4]
+
+
+def humanize_motion(kernel, lang: str = "ko") -> str:
+    try:
+        k = float(kernel)
+    except (TypeError, ValueError):
+        return _UNK_LABEL[lang]
+    g = _MOTION_GRADES[lang]
+    if k <= 0.5:
+        return g[0]
+    if k <= 5:
+        return g[1]
+    if k <= 10:
+        return g[2]
+    if k <= 15:
+        return g[3]
+    return g[4]
+
+
+def humanize_corruption(corruption: str, value, lang: str = "ko") -> str:
+    c = str(corruption).lower()
+    if c == "fog":
+        return humanize_fog(value, lang=lang)
+    if c == "lowlight":
+        return humanize_lowlight(value, lang=lang)
+    if c == "motion_blur":
+        return humanize_motion(value, lang=lang)
+    return str(value)
+
+
+def humanize_change_pct(v_new, v_old, lang: str = "ko") -> str:
+    """Percent-change classifier. Uses absolute relative change."""
+    g = _CHANGE_PCT_GRADES[lang]
+    try:
+        a, b = float(v_new), float(v_old)
+    except (TypeError, ValueError):
+        return g[0]
+    if a != a or b != b:
+        return g[0]
+    denom = max(abs(b), 1e-6)
+    pct = abs(a - b) / denom
+    if pct < 0.10:
+        return g[1]
+    if pct < 0.30:
+        return g[2]
+    return g[3]
+
+
+def humanize_attention_shift(ring_l0, ring_l4, lang: str = "ko") -> str:
+    """Ring energy ratio measures object-centric focus. Drop = attention diffused away from object."""
+    s = _ATTENTION_SHIFT[lang]
+    try:
+        r0, r4 = float(ring_l0), float(ring_l4)
+    except (TypeError, ValueError):
+        return s["unknown"]
+    if r0 != r0 or r4 != r4:
+        return s["unknown"]
+    drop = r0 - r4
+    if abs(drop) < 0.05:
+        return s["none"]
+    if drop > 0.30:
+        return s["diffuse_strong"]
+    if drop > 0.10:
+        return s["diffuse_weak"]
+    if drop < -0.10:
+        return s["focus_more"]
+    return s["slight"]
+
+
+def _first_last_numeric(rows, key):
+    """Return (baseline_value, worst_value) where baseline = first row's key, worst = last non-nan."""
+    base = None
+    last = None
+    for r in rows:
+        if r is None:
+            continue
+        v = r.get(key)
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv != fv:
+            continue
+        if base is None:
+            base = fv
+        last = fv
+    return base, last
+
+
+def _detect_performance_collapse_stage(traj_rows, collapse_score_threshold: float = 0.2):
+    """First severity index where detection is no longer acceptable.
+
+    Criteria (whichever fires first):
+    - is_miss == 1 (no usable GT match)
+    - pred_score < collapse_score_threshold (below "거의 인식 못함" grade)
+
+    Returns int severity index 1..4, or None if detection holds across all stages.
+    L0 (severity 0) is skipped since it's the baseline.
+    """
+    for r in traj_rows:
+        if r is None:
+            continue
+        try:
+            sev = int(r.get("severity", -1))
+        except (TypeError, ValueError):
+            continue
+        if sev <= 0:
+            continue
+        is_miss = r.get("is_miss")
+        try:
+            if int(float(is_miss)) == 1:
+                return sev
+        except (TypeError, ValueError):
+            pass
+        ps = r.get("pred_score")
+        try:
+            if float(ps) < collapse_score_threshold:
+                return sev
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _detect_cam_change_stage(cam_rows, min_relative_change: float = 0.10):
+    """First severity index where ring_energy_ratio deviates materially from L0 baseline.
+
+    min_relative_change: threshold on |ring(sev) - ring(L0)| / max(|ring(L0)|, ε).
+    Returns int severity index 1..4, or None if CAM attention stays stable.
+    """
+    base_ring = None
+    for r in cam_rows:
+        if r is None:
+            continue
+        try:
+            sev = int(r.get("severity", -1))
+        except (TypeError, ValueError):
+            continue
+        if sev != 0:
+            continue
+        try:
+            base_ring = float(r.get("ring_energy_ratio"))
+            break
+        except (TypeError, ValueError):
+            continue
+    if base_ring is None or base_ring != base_ring:
+        return None
+
+    for r in cam_rows:
+        if r is None:
+            continue
+        try:
+            sev = int(r.get("severity", -1))
+        except (TypeError, ValueError):
+            continue
+        if sev <= 0:
+            continue
+        try:
+            cur = float(r.get("ring_energy_ratio"))
+        except (TypeError, ValueError):
+            continue
+        if cur != cur:
+            continue
+        rel = abs(cur - base_ring) / max(abs(base_ring), 1e-6)
+        if rel >= min_relative_change:
+            return sev
+    return None
+
+
+_NO_CHANGE_LABEL = {"ko": "변화 없음", "en": "no change"}
+
+
+def _stage_label(sev, lang: str = "ko") -> str:
+    if sev is None:
+        return _NO_CHANGE_LABEL[lang]
+    try:
+        s = int(sev)
+    except (TypeError, ValueError):
+        return _NO_CHANGE_LABEL[lang]
+    return f"{s}단계" if lang == "ko" else f"stage {s}"
+
+
+def _corruption_stage_grade(corruption: str, perturbation_values, sev, lang: str = "ko") -> str:
+    """For a given severity index, return humanized grade label of the corruption parameter."""
+    if sev is None or not perturbation_values:
+        return ""
+    try:
+        idx = int(sev)
+        if idx < 0 or idx >= len(perturbation_values):
+            return ""
+        return humanize_corruption(corruption, perturbation_values[idx], lang=lang)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _lead_relation(t_perf, t_cam) -> tuple:
+    """Return (relation_label, lead_steps_or_None).
+
+    relation: 'lead' (CAM ahead), 'coincident', 'lag' (CAM behind), 'unknown'.
+    """
+    if t_perf is None and t_cam is None:
+        return ("no_change", None)
+    if t_perf is None:
+        return ("perf_stable", None)
+    if t_cam is None:
+        return ("cam_stable", None)
+    lead = int(t_perf) - int(t_cam)
+    if lead > 0:
+        return ("lead", lead)
+    if lead == 0:
+        return ("coincident", 0)
+    return ("lag", lead)
+
+
+_KO_STEP_WORD = {1: "한", 2: "두", 3: "세", 4: "네"}
+_EN_STEP_WORD = {1: "one", 2: "two", 3: "three", 4: "four"}
+
+
+def _step_count_word(n: int, lang: str = "ko") -> str:
+    if n is None:
+        return ""
+    try:
+        i = int(n)
+    except (TypeError, ValueError):
+        return ""
+    table = _KO_STEP_WORD if lang == "ko" else _EN_STEP_WORD
+    return table.get(i, f"{i}")
+
+
+# Back-compat alias for legacy callers.
+def _korean_step_count(n: int) -> str:
+    return _step_count_word(n, lang="ko")
+
+
+_USABILITY = {
+    "ko": {"possible": "가능", "limited": "제한적", "not_possible": "불가", "n_a": "해당 없음"},
+    "en": {"possible": "possible", "limited": "limited", "not_possible": "not possible", "n_a": "not applicable"},
+}
+
+
+def _humanize_lead_relation(relation: str, steps, lang: str = "ko") -> tuple:
+    """Return (relation_phrase, early_warning_usability)."""
+    u = _USABILITY[lang]
+    if relation == "lead":
+        k = _step_count_word(steps, lang=lang)
+        if lang == "ko":
+            phrase = f"설명이 성능 저하보다 {k} 단계 먼저 변화"
+        else:
+            stage_word = "stage" if str(k) == "1" or k == "one" else "stages"
+            phrase = f"explanation changed {k} {stage_word} earlier than performance degradation"
+        return (phrase, u["possible"])
+    if relation == "coincident":
+        if lang == "ko":
+            return ("설명과 성능이 같은 단계에서 변화", u["limited"])
+        return ("explanation and performance changed at the same stage", u["limited"])
+    if relation == "lag":
+        k = _step_count_word(abs(steps), lang=lang) if steps is not None else ""
+        if lang == "ko":
+            phrase = f"설명이 성능 저하보다 {k} 단계 늦게 변화"
+        else:
+            stage_word = "stage" if str(k) == "1" or k == "one" else "stages"
+            phrase = f"explanation changed {k} {stage_word} later than performance degradation"
+        return (phrase, u["not_possible"])
+    if relation == "perf_stable":
+        if lang == "ko":
+            return ("변조 최대까지 탐지 성능이 유지됨", u["n_a"])
+        return ("detection performance held through maximum corruption", u["n_a"])
+    if relation == "cam_stable":
+        if lang == "ko":
+            return ("시각적 주의에 의미 있는 변화가 없음", u["not_possible"])
+        return ("no meaningful change in visual attention", u["not_possible"])
+    if lang == "ko":
+        return ("판단 불가", u["not_possible"])
+    return ("cannot determine", u["not_possible"])
+
+
+_TRAJ_LABELS = {
+    "ko": {
+        "corruption_type": "변조 종류",
+        "clean_detection": "정상 영상 탐지",
+        "max_corruption_detection": "변조 최대 영상 탐지",
+        "perf_collapse_stage": "성능 붕괴 단계",
+        "cam_onset_stage": "시각적 주의 변화 시작 단계",
+        "lead_relationship": "선행 관계",
+        "early_warning_usability": "조기 경보 활용 가능성",
+        "perf_held": "변조 최대까지 탐지 성능 유지",
+        "cam_no_change": "변조 최대까지 시각적 주의 변화 없음",
+        "input_header": "[입력]",
+        "instruction": "위 정보만 사용해 정확히 3섹션([성능 붕괴] / [조기 신호] / [해석])으로 요약.",
+    },
+    "en": {
+        "corruption_type": "Corruption type",
+        "clean_detection": "Detection on clean image",
+        "max_corruption_detection": "Detection at maximum corruption",
+        "perf_collapse_stage": "Performance collapse stage",
+        "cam_onset_stage": "Visual attention change onset stage",
+        "lead_relationship": "Lead relationship",
+        "early_warning_usability": "Early warning usability",
+        "perf_held": "detection performance held through maximum corruption",
+        "cam_no_change": "no visual attention change through maximum corruption",
+        "input_header": "[Input]",
+        "instruction": "Using only the information above, summarize in exactly three sections ([Performance Collapse] / [Early Signal] / [Interpretation]).",
+    },
+}
 
 
 def format_trajectory_block(
@@ -501,84 +948,71 @@ def format_trajectory_block(
     *,
     corruption: str,
     perturbation: dict,
+    lang: str = "ko",
 ) -> str:
-    """Assemble 5-severity numeric tables for one (image, object, corruption) unit.
+    """Humanized trajectory summary with pre-computed collapse/early-warning stages.
 
-    traj_rows: list of detection_records dicts sorted by severity (len 1..5).
-    cam_rows:  list of cam_records dicts sorted by severity (may contain None entries when missing).
-    perturbation: {"param_name": str, "values": [v0..v4]} from experiment.yaml.
+    The LLM receives pre-analyzed stage numbers + lead relation so it only has to
+    narrate, never infer from raw numerics.
     """
-    def _col(rows, key, n=2):
-        out = []
-        for r in rows:
-            v = None if r is None else r.get(key)
-            if v is None or (isinstance(v, float) and v != v):
-                out.append("n/a")
-            else:
-                try:
-                    out.append(f"{float(v):.{n}f}")
-                except (TypeError, ValueError):
-                    out.append(str(v))
-        return ", ".join(out)
+    p_values = perturbation.get("values", [])
+    L = _TRAJ_LABELS[lang]
+    na = _NA_LABEL[lang]
 
-    def _col_int(rows, key):
-        out = []
-        for r in rows:
-            v = None if r is None else r.get(key)
-            if v is None or (isinstance(v, float) and v != v):
-                out.append("n/a")
-            else:
-                try:
-                    out.append(str(int(float(v))))
-                except (TypeError, ValueError):
-                    out.append(str(v))
-        return ", ".join(out)
+    # 1. detection confidence grade (clean vs max)
+    score_base, score_last = _first_last_numeric(traj_rows, "pred_score")
+    score_base_grade = humanize_score(score_base, lang=lang) if score_base is not None else na
+    score_last_grade = humanize_score(score_last, lang=lang) if score_last is not None else na
 
-    def _col_str(rows, key):
-        out = []
-        for r in rows:
-            v = None if r is None else r.get(key)
-            if v is None or (isinstance(v, float) and v != v) or str(v).strip() == "":
-                out.append("n/a")
-            else:
-                out.append(str(v))
-        return ", ".join(out)
-
-    severities = ", ".join(str(int(r.get("severity", i))) for i, r in enumerate(traj_rows))
-    p_name = perturbation.get("param_name", "param")
-    p_vals = ", ".join(
-        f"{float(v):.2f}" if isinstance(v, (int, float)) else str(v)
-        for v in perturbation.get("values", [])
+    # 2. performance collapse stage
+    t_perf = _detect_performance_collapse_stage(traj_rows)
+    t_perf_label = _stage_label(t_perf, lang=lang) if t_perf is not None else (
+        "성능 유지됨" if lang == "ko" else "performance held"
     )
+    t_perf_grade = _corruption_stage_grade(corruption, p_values, t_perf, lang=lang)
+    if t_perf is not None and t_perf_grade:
+        t_perf_full = f"{t_perf_label} ({t_perf_grade})"
+    elif t_perf is not None:
+        t_perf_full = t_perf_label
+    else:
+        t_perf_full = L["perf_held"]
+
+    # 3. visual attention change onset stage
+    t_cam = _detect_cam_change_stage(cam_rows)
+    t_cam_label = _stage_label(t_cam, lang=lang) if t_cam is not None else _NO_CHANGE_LABEL[lang]
+    t_cam_grade = _corruption_stage_grade(corruption, p_values, t_cam, lang=lang)
+    if t_cam is not None and t_cam_grade:
+        t_cam_full = f"{t_cam_label} ({t_cam_grade})"
+    elif t_cam is not None:
+        t_cam_full = t_cam_label
+    else:
+        t_cam_full = L["cam_no_change"]
+
+    # 4. lead relationship
+    relation, steps = _lead_relation(t_perf, t_cam)
+    relation_phrase, usability = _humanize_lead_relation(relation, steps, lang=lang)
 
     lines = [
-        f"[Perturbation] corruption={corruption}",
-        f"severity:   {severities}",
-        f"{p_name}:   {p_vals}",
-        "",
-        "[Detection trajectory] (detection_records.csv)",
-        f"pred_score:    {_col(traj_rows, 'pred_score', 4)}",
-        f"match_iou:     {_col(traj_rows, 'match_iou', 4)}",
-        f"delta_score:   {_col(traj_rows, 'delta_score', 4)}",
-        f"delta_iou:     {_col(traj_rows, 'delta_iou', 4)}",
-        f"is_miss:       {_col_int(traj_rows, 'is_miss')}",
-        f"failure_type:  {_col_str(traj_rows, 'failure_type')}",
-        "",
-        "[Grad-CAM trajectory] (cam_records.csv, primary layer)",
-        f"bbox_center_dist:   {_col(cam_rows, 'bbox_center_activation_distance', 2)}",
-        f"peak_bbox_dist:     {_col(cam_rows, 'peak_bbox_distance', 2)}",
-        f"activation_spread:  {_col(cam_rows, 'activation_spread', 2)}",
-        f"ring_energy_ratio:  {_col(cam_rows, 'ring_energy_ratio', 4)}",
-        f"energy_in_bbox:     {_col(cam_rows, 'energy_in_bbox', 4)}",
-        f"entropy:            {_col(cam_rows, 'entropy', 2)}",
-        f"cam_status:         {_col_str(cam_rows, 'cam_status')}",
-        "",
-        "[Definitions]",
-        "- ring_energy_ratio > 0.5 = object-centric attention; < 0.5 = diffuse/off-object",
-        "- bbox_center_dist: pixel distance from CAM center-of-mass to GT bbox center",
-        "- is_miss=1 when YOLO fails a usable match to GT",
+        f"- {L['corruption_type']}: {humanize_corruption_name(corruption, lang=lang)}",
+        f"- {L['clean_detection']}: {score_base_grade}",
+        f"- {L['max_corruption_detection']}: {score_last_grade}",
+        f"- {L['perf_collapse_stage']}: {t_perf_full}",
+        f"- {L['cam_onset_stage']}: {t_cam_full}",
+        f"- {L['lead_relationship']}: {relation_phrase}",
+        f"- {L['early_warning_usability']}: {usability}",
     ]
     return "\n".join(lines)
+
+
+_CORRUPTION_NAMES = {
+    "ko": {"fog": "안개", "lowlight": "저조도", "motion_blur": "카메라 흔들림"},
+    "en": {"fog": "fog", "lowlight": "low light", "motion_blur": "camera motion blur"},
+}
+
+
+def humanize_corruption_name(corruption: str, lang: str = "ko") -> str:
+    c = str(corruption).lower()
+    return _CORRUPTION_NAMES[lang].get(c, c)
 
 
 def build_trajectory_user_message(
@@ -588,16 +1022,13 @@ def build_trajectory_user_message(
     gt_class: str,
     corruption: str,
     trajectory_block: str,
+    lang: str = "ko",
 ) -> str:
-    """Assemble the USER message for the trajectory prompt."""
+    """Humanized USER message: no IDs, no codes. Only grade labels."""
+    L = _TRAJ_LABELS[lang]
     return (
-        f"[Unit]\n"
-        f"image_id: {image_id}\n"
-        f"object_uid: {object_uid}\n"
-        f"gt_class: {gt_class}\n"
-        f"corruption: {corruption}\n\n"
-        f"{trajectory_block}\n\n"
-        "위 테이블만 사용해 정확히 3줄([판정]/[CAM]/[경고])로 요약."
+        f"{L['input_header']}\n{trajectory_block}\n\n"
+        f"{L['instruction']}"
     )
 
 

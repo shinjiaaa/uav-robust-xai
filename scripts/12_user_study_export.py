@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.utils.io import load_yaml
 from src.user_study.llm_user_study import (
+    SYSTEM_PROMPT_TRAJECTORY_EN,
     SYSTEM_PROMPT_TRAJECTORY_KO,
     build_trajectory_user_message,
     format_trajectory_block,
@@ -222,6 +223,40 @@ def _perturbation_for_corruption(cfg: dict, corruption: str) -> dict:
     return {"param_name": "severity_index", "values": [0, 1, 2, 3, 4]}
 
 
+def _rebuild_manifest_from_folders(out_root: Path, gradcam_xai: str) -> pd.DataFrame:
+    """Scan every subfolder containing trajectory_table.json and rebuild manifest rows.
+
+    Used to preserve previously generated bundles across selective re-runs. Folders
+    without a valid trajectory_table.json are ignored.
+    """
+    rows = []
+    if not out_root.exists():
+        return pd.DataFrame(rows)
+    for sub in sorted(out_root.iterdir()):
+        if not sub.is_dir():
+            continue
+        traj_path = sub / "trajectory_table.json"
+        if not traj_path.exists():
+            continue
+        try:
+            with open(traj_path, "r", encoding="utf-8") as f:
+                tt = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        rows.append(
+            {
+                "unit_id": sub.name,
+                "image_id": tt.get("image_id", ""),
+                "object_uid": tt.get("object_uid", ""),
+                "corruption": tt.get("corruption", ""),
+                "model_id": tt.get("model_id", ""),
+                "gradcam_heatmap_subdir": gradcam_xai,
+                "n_severities_present": len(tt.get("severities", []) or []),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def main():
     ap = argparse.ArgumentParser(description="User study export bundles")
     ap.add_argument("--max-units", type=int, default=None, help="Max (image,object,corruption) units to export")
@@ -236,6 +271,13 @@ def main():
     ap.add_argument("--skip-llm", action="store_true", help="Only write prompts, no API calls")
     ap.add_argument("--llm-model", type=str, default="gpt-4o-mini")
     ap.add_argument(
+        "--lang",
+        type=str,
+        choices=["en", "ko"],
+        default="en",
+        help="Output language for the LLM trajectory explanation (default: en).",
+    )
+    ap.add_argument(
         "--image-id",
         type=str,
         default=None,
@@ -246,6 +288,13 @@ def main():
         type=str,
         default=None,
         help="Comma-separated list of image_ids to restrict export to. Takes precedence over --max-images.",
+    )
+    ap.add_argument(
+        "--corruption",
+        type=str,
+        choices=["fog", "lowlight", "motion_blur"],
+        default=None,
+        help="Restrict to a single corruption type (e.g. 'fog'). Combine with --image-ids to target a specific subset.",
     )
     args = ap.parse_args()
 
@@ -306,6 +355,13 @@ def main():
         det = det[det["image_id"].astype(str).isin(keep_ids)]
         print(f"[export] --max-images {args.max_images} → {len(keep_ids)} image_ids, {len(det)} rows", flush=True)
 
+    if args.corruption:
+        det = det[det["corruption"].astype(str) == args.corruption]
+        if len(det) == 0:
+            print(f"No detection rows for corruption={args.corruption!r} after other filters")
+            sys.exit(1)
+        print(f"[export] filter corruption={args.corruption!r} → {len(det)} rows", flush=True)
+
     mcol = "model_id" if "model_id" in det.columns else "model"
 
     # One unit = (image_id, object_uid, corruption); each unit covers severities 0..4 in a single LLM call.
@@ -340,7 +396,7 @@ def main():
             continue
 
         safe_o = object_uid.replace("/", "_").replace("\\", "_").replace(":", "_")[:72]
-        if args.image_id:
+        if args.image_id or args.image_ids:
             unit_id = f"{corruption}_{safe_o}"
         else:
             unit_id = f"unit_{uidx:05d}"
@@ -384,6 +440,7 @@ def main():
         perturbation = _perturbation_for_corruption(cfg, corruption)
         traj_block = format_trajectory_block(
             traj_rows, cam_rows, corruption=corruption, perturbation=perturbation,
+            lang=args.lang,
         )
         user_msg = build_trajectory_user_message(
             image_id=image_id,
@@ -391,9 +448,13 @@ def main():
             gt_class=gt_class,
             corruption=corruption,
             trajectory_block=traj_block,
+            lang=args.lang,
+        )
+        system_prompt = (
+            SYSTEM_PROMPT_TRAJECTORY_EN if args.lang == "en" else SYSTEM_PROMPT_TRAJECTORY_KO
         )
         (udir / "prompt_gradcam.txt").write_text(
-            write_full_prompt_for_disk(SYSTEM_PROMPT_TRAJECTORY_KO, user_msg),
+            write_full_prompt_for_disk(system_prompt, user_msg),
             encoding="utf-8",
         )
         (udir / "trajectory_table.json").write_text(
@@ -415,20 +476,25 @@ def main():
             encoding="utf-8",
         )
 
+        expl_path = udir / "explanation_gradcam.txt"
         expl = ""
         if not args.skip_llm:
             try:
                 expl = generate_explanation_openai(
                     user_msg,
                     model=llm_model_cfg,
-                    system_prompt=SYSTEM_PROMPT_TRAJECTORY_KO,
+                    system_prompt=system_prompt,
                 )
             except Exception as e:
                 expl = f"[LLM error] {e}"
-        (udir / "explanation_gradcam.txt").write_text(
-            expl or "(empty — use --skip-llm or set OPENAI_API_KEY)",
-            encoding="utf-8",
-        )
+        if expl:
+            expl_path.write_text(expl, encoding="utf-8")
+        elif not expl_path.exists():
+            # First-time --skip-llm: write placeholder so the file exists.
+            expl_path.write_text(
+                "(empty — use --skip-llm or set OPENAI_API_KEY)", encoding="utf-8"
+            )
+        # else: --skip-llm and an existing explanation is on disk — preserve it.
 
         manifest.append(
             {
@@ -445,19 +511,37 @@ def main():
         if completed % 10 == 0 or completed == 1:
             print(f"[export] completed {completed}/{total_units} (last {unit_id})", flush=True)
 
-    pd.DataFrame(manifest).to_csv(out_root / "manifest.csv", index=False)
+    # Merge with existing valid bundle folders so prior runs in other languages
+    # are not dropped from the manifest.
+    new_df = pd.DataFrame(manifest)
+    rebuilt = _rebuild_manifest_from_folders(out_root, gradcam_xai)
+    if len(new_df) > 0:
+        rebuilt = rebuilt[~rebuilt["unit_id"].isin(new_df["unit_id"])]
+        merged = pd.concat([rebuilt, new_df], ignore_index=True)
+    else:
+        merged = rebuilt
+    merged.sort_values("unit_id", inplace=True)
+    merged.to_csv(out_root / "manifest.csv", index=False)
+    print(f"[export] manifest rows: {len(merged)} (this run: {len(new_df)}, preserved: {len(rebuilt)})", flush=True)
     write_evaluation_questionnaire(out_root / "evaluation_questions_likert.txt")
+    if args.lang == "en":
+        sections = "[Performance Collapse] / [Early Signal] / [Interpretation]"
+        prompt_note = "(English humanized 3-section trajectory format)"
+    else:
+        sections = "[성능 붕괴] / [조기 신호] / [해석]"
+        prompt_note = "(Korean humanized 3-section trajectory format)"
     readme = f"""User study bundles (Grad-CAM trajectory, severity 0..4 in one LLM call)
 
 Per unit folder = ONE (image_id, object_uid, corruption) combo:
 - original_L{{0..4}}.png        — corrupted frames at each severity
 - gradcam_overlay_L{{0..4}}.png — Grad-CAM family overlay from heatmap_samples/{gradcam_xai}/...
 - trajectory_table.json         — exact numeric tables fed to the LLM
-- prompt_gradcam.txt            — full SYSTEM+USER prompt (Korean 3-line trajectory format)
-- explanation_gradcam.txt       — LLM output (3 lines: [판정] / [CAM] / [경고])
+- prompt_gradcam.txt            — full SYSTEM+USER prompt {prompt_note}
+- explanation_gradcam.txt       — LLM output (3 sections: {sections})
 
 Notes:
 - One LLM call per unit (was per-severity × 2 methods previously). FastCAV arm removed.
+- Output language: {args.lang}
 - See evaluation_questions_likert.txt for Likert items.
 """
     (out_root / "README_user_study.txt").write_text(readme, encoding="utf-8")
